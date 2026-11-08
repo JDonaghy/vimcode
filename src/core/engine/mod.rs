@@ -5114,6 +5114,16 @@ pub struct Engine {
     pub ext_panel_help_open: bool,
     /// Extension panel help bindings: panel_name -> [(key, description)]
     pub ext_panel_help_bindings: HashMap<String, Vec<(String, String)>>,
+    /// Plugin (file-stem) names loaded from each installed extension's
+    /// directory, keyed by extension name — e.g. `"sql-tool" ->
+    /// ["sql_tool"]`. Captured by `Engine::plugin_init` as the exact slice
+    /// of `PluginManager::plugins` that one extension's
+    /// `mgr.load_plugins_dir(&ext_dir, ...)` call appended, so it is
+    /// correct regardless of whether a script's file-stem matches the
+    /// extension's own name. Used by `Engine::ext_contributions_markdown`
+    /// to attribute commands/keymaps/panels/views back to the extension
+    /// that declared them.
+    pub ext_plugin_names: HashMap<String, Vec<String>>,
     /// The `AppShellLayout::sidebar_content_bounds` rect `render_ext_panel` was
     /// last painted into — i.e. its own `area` parameter, verbatim, *before*
     /// subtracting the panel's own header/search chrome. Originally read by click
@@ -5959,6 +5969,7 @@ impl Engine {
             ext_panel_context_menu_pending: None,
             ext_panel_help_open: false,
             ext_panel_help_bindings: HashMap::new(),
+            ext_plugin_names: HashMap::new(),
             ext_panel_content_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
             ext_panel_tree_layout: std::cell::RefCell::new(None),
             ext_panel_toolbar_hits: std::cell::RefCell::new(Vec::new()),

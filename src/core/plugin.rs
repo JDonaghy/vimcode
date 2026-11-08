@@ -1063,14 +1063,38 @@ pub struct PluginManager {
     command_meta: HashMap<String, PluginCommandMeta>,
     /// Registered `(mode, key)` → Lua function.
     keymaps: HashMap<(String, String), LuaRegistryKey>,
+    /// Owning plugin (file-stem) name for each entry in `keymaps`, keyed
+    /// the same way. Populated by `load_one_plugin` alongside the
+    /// registration itself, so a lookup here never predates the
+    /// registration it describes. Read by `Engine`'s Extensions-panel
+    /// "Provides" listing to attribute a legacy `vimcode.keymap(mode,
+    /// key, fn)` binding to the extension that declared it.
+    legacy_keymap_sources: HashMap<(String, String), String>,
     /// Registered `event` → list of Lua functions.
     hooks: HashMap<String, Vec<LuaRegistryKey>>,
     /// Extension panel registrations harvested from plugin scripts.
     pub panels: HashMap<String, PanelRegistration>,
+    /// Owning plugin (file-stem) name for each entry in `panels`, keyed by
+    /// panel name. See `legacy_keymap_sources`'s doc for why this exists.
+    panel_sources: HashMap<String, String>,
     /// Extension panel help bindings harvested from plugin scripts.
     pub help_bindings: HashMap<String, Vec<(String, String)>>,
     /// `vimcode.ui.register_view` registrations, by view name.
     views: HashMap<String, StoredView>,
+    /// Owning plugin (file-stem) name for each entry in `views`, keyed by
+    /// view name. See `legacy_keymap_sources`'s doc for why this exists.
+    view_sources: HashMap<String, String>,
+    /// Owning plugin (file-stem) name for each entry in `commands`, keyed
+    /// by command name. See `legacy_keymap_sources`'s doc for why this
+    /// exists.
+    command_sources: HashMap<String, String>,
+    /// Owning plugin (file-stem) name for each `vimcode.keymap.set`
+    /// registration, keyed by the id [`Self::register_lua_keymap`] assigned
+    /// it — stable across the leader-expansion/merge into `Engine::
+    /// user_keymaps` that consumes `raw_lua_keymaps`, unlike a lookup keyed
+    /// on `(mode, lhs)` would be. See `legacy_keymap_sources`'s doc for why
+    /// this exists.
+    lua_keymap_sources: HashMap<u64, String>,
     /// `vimcode.keymap.set` registrations harvested at load time,
     /// leader-expanded and merged into `Engine::user_keymaps` by
     /// `Engine::set_plugin_manager` (via [`Self::take_raw_lua_keymaps`]) so
@@ -1472,6 +1496,33 @@ pub struct PluginCommandEntry {
     pub category: Option<String>,
     pub menu: Option<String>,
     pub context_menu: Option<String>,
+    /// File-stem name of the plugin script that registered this command
+    /// (e.g. `"sql_tool"` for an extension's `sql_tool.lua`). `None` only
+    /// if the command predates `command_sources` tracking somehow leaving
+    /// no entry — not reachable through `load_one_plugin`'s harvest path.
+    pub source: Option<String>,
+}
+
+/// One plugin's worth of user-facing contributions, as surfaced by
+/// [`PluginManager::contributions_for_plugin`] in the Extensions panel's
+/// "Provides" listing.
+#[derive(Debug, Clone, Default)]
+pub struct PluginContributions {
+    /// Commands this plugin registered, sorted by name (same rows
+    /// [`PluginManager::command_entries`] returns, pre-filtered to this
+    /// plugin).
+    pub commands: Vec<PluginCommandEntry>,
+    /// `(mode, lhs, desc)` for every legacy `vimcode.keymap(mode, key, fn)`
+    /// keymap this plugin registered. `desc` is always `None` — the legacy
+    /// call form has no `opts.desc`.
+    pub keymaps: Vec<(String, String, Option<String>)>,
+    /// Display titles of activity-bar panels this plugin registered
+    /// (`vimcode.panel.register` and sidebar-visible `vimcode.ui.
+    /// register_view` views alike).
+    pub panels: Vec<String>,
+    /// Display titles of every `vimcode.ui.register_view` view this
+    /// plugin registered, sidebar-visible or tab-only.
+    pub views: Vec<String>,
 }
 
 // ─── Internal registration accumulator ───────────────────────────────────────
@@ -1929,11 +1980,16 @@ impl PluginManager {
             plugins: Vec::new(),
             commands: HashMap::new(),
             command_meta: HashMap::new(),
+            command_sources: HashMap::new(),
             keymaps: HashMap::new(),
+            legacy_keymap_sources: HashMap::new(),
             hooks: HashMap::new(),
             panels: HashMap::new(),
+            panel_sources: HashMap::new(),
             help_bindings: HashMap::new(),
             views: HashMap::new(),
+            view_sources: HashMap::new(),
+            lua_keymap_sources: HashMap::new(),
             raw_lua_keymaps: Vec::new(),
             lua_keymap_callbacks: RefCell::new(HashMap::new()),
             lua_keymap_next_id: Cell::new(0),
@@ -2013,18 +2069,24 @@ impl PluginManager {
         // Harvest whatever was registered before any error.
         if let Some(reg) = self.lua.remove_app_data::<PluginRegistrations>() {
             for (cmd_name, key) in reg.commands {
+                self.command_sources
+                    .insert(cmd_name.clone(), name.to_string());
                 self.commands.insert(cmd_name, key);
             }
             for (cmd_name, meta) in reg.command_meta {
                 self.command_meta.insert(cmd_name, meta);
             }
             for (km, key) in reg.keymaps {
+                self.legacy_keymap_sources
+                    .insert(km.clone(), name.to_string());
                 self.keymaps.insert(km, key);
             }
             for (event, keys) in reg.hooks {
                 self.hooks.entry(event).or_default().extend(keys);
             }
             for panel in reg.panels {
+                self.panel_sources
+                    .insert(panel.name.clone(), name.to_string());
                 self.panels.insert(panel.name.clone(), panel);
             }
             for (panel_name, bindings) in reg.help_bindings {
@@ -2038,13 +2100,17 @@ impl PluginManager {
             // `views`: `open_view` still works, but there is no activity-bar
             // panel to click into.
             for view in reg.views {
-                let name = view.panel.name.clone();
+                let view_name = view.panel.name.clone();
                 let title = view.panel.title.clone();
+                self.view_sources
+                    .insert(view_name.clone(), name.to_string());
                 if view.sidebar {
-                    self.panels.insert(name.clone(), view.panel);
+                    self.panel_sources
+                        .insert(view_name.clone(), name.to_string());
+                    self.panels.insert(view_name.clone(), view.panel);
                 }
                 self.views.insert(
-                    name,
+                    view_name,
                     StoredView {
                         render: view.render,
                         on_event: view.on_event,
@@ -2056,9 +2122,13 @@ impl PluginManager {
             // each an id now (needs `&mut self`, unavailable from inside the
             // Lua closure that ran during `exec()` above) and stash the
             // resulting `UserKeymap` for `Engine::set_plugin_manager` to
-            // leader-expand and merge into `user_keymaps`.
+            // leader-expand and merge into `user_keymaps`. `lua_keymap_sources`
+            // is keyed by this same id (not `(mode, lhs)`), so it stays valid
+            // after that merge consumes `raw_lua_keymaps` and leader-expands
+            // the lhs.
             for pending in reg.lua_keymaps {
                 let id = self.register_lua_keymap(pending.callback, pending.expr);
+                self.lua_keymap_sources.insert(id, name.to_string());
                 self.raw_lua_keymaps.push(UserKeymap {
                     mode: pending.mode,
                     noremap: true,
@@ -2129,6 +2199,7 @@ impl PluginManager {
                     category: meta.and_then(|m| m.category.clone()),
                     menu: meta.and_then(|m| m.menu.clone()),
                     context_menu: meta.and_then(|m| m.context_menu.clone()),
+                    source: self.command_sources.get(name).cloned(),
                 }
             })
             .collect();
@@ -3041,6 +3112,60 @@ impl PluginManager {
     /// entry) should use this instead of `panels.get(name)`.
     pub fn view_title(&self, name: &str) -> Option<&str> {
         self.views.get(name).map(|v| v.title.as_str())
+    }
+
+    /// The plugin (file-stem) name that registered `vimcode.keymap.set`
+    /// keymap `id` (the id [`Self::register_lua_keymap`] assigned it),
+    /// looked up by `Engine::ext_panel_contributions` to attribute a merged
+    /// `Engine::user_keymaps` entry — whose lhs may already be leader-
+    /// expanded — back to the extension that declared it.
+    pub fn lua_keymap_source(&self, id: u64) -> Option<&str> {
+        self.lua_keymap_sources.get(&id).map(String::as_str)
+    }
+
+    /// Every command/legacy-keymap/panel/view this plugin (file-stem `name`)
+    /// registered, for the Extensions panel's "Provides" listing.
+    ///
+    /// Deliberately excludes `vimcode.keymap.set` keymaps: those are
+    /// leader-expanded and merged into `Engine::user_keymaps` at load time
+    /// (see `Engine::set_plugin_manager`), so the authoritative lhs lives
+    /// there, not in `self.raw_lua_keymaps` (emptied by that merge). A
+    /// caller that wants those too combines this with `user_keymaps`
+    /// filtered by [`Self::lua_keymap_source`].
+    pub fn contributions_for_plugin(&self, plugin_name: &str) -> PluginContributions {
+        let commands: Vec<PluginCommandEntry> = self
+            .command_entries()
+            .into_iter()
+            .filter(|e| e.source.as_deref() == Some(plugin_name))
+            .collect();
+        let keymaps: Vec<(String, String, Option<String>)> = self
+            .legacy_keymap_sources
+            .iter()
+            .filter(|(_, src)| src.as_str() == plugin_name)
+            .map(|((mode, lhs), _)| (mode.clone(), lhs.clone(), None))
+            .collect();
+        let mut panels: Vec<String> = self
+            .panel_sources
+            .iter()
+            .filter(|(_, src)| src.as_str() == plugin_name)
+            .filter_map(|(panel_name, _)| self.panels.get(panel_name))
+            .map(|p| p.title.clone())
+            .collect();
+        panels.sort();
+        let mut views: Vec<String> = self
+            .view_sources
+            .iter()
+            .filter(|(_, src)| src.as_str() == plugin_name)
+            .filter_map(|(view_name, _)| self.view_title(view_name))
+            .map(str::to_string)
+            .collect();
+        views.sort();
+        PluginContributions {
+            commands,
+            keymaps,
+            panels,
+            views,
+        }
     }
 
     /// Run a view's `render` callback and parse the widget tree it returns.

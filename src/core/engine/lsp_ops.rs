@@ -398,7 +398,8 @@ impl Engine {
             .join(name)
             .join("README.md");
         if let Ok(content) = std::fs::read_to_string(&readme_path) {
-            self.open_markdown_preview_in_tab(&content, display);
+            let combined = self.ext_readme_with_contributions(name, &content);
+            self.open_markdown_preview_in_tab(&combined, display);
             return;
         }
         if base_url.is_empty() {
@@ -441,7 +442,8 @@ impl Engine {
         let show_missing_message = self.ext_readme_show_missing_message;
         match maybe_content {
             Some(content) => {
-                self.open_markdown_preview_in_tab(&content, &display);
+                let combined = self.ext_readme_with_contributions(&name, &content);
+                self.open_markdown_preview_in_tab(&combined, &display);
             }
             None if show_missing_message => {
                 self.message = format!("No README available for '{name}'. Press i to install.");
@@ -1055,6 +1057,103 @@ impl Engine {
             if group.pending == 0 {
                 self.tool_acquire_groups.remove(&ext_name);
             }
+        }
+    }
+
+    /// Build a markdown "## Provides" section listing `ext_name`'s
+    /// commands (with palette titles), keymaps, panels and views,
+    /// for prefixing onto its README. `None` when there is nothing to
+    /// show — the extension isn't installed/loaded, or loaded with no
+    /// registrations — so an available-but-not-installed extension's
+    /// README is shown unmodified.
+    pub(crate) fn ext_contributions_markdown(&self, ext_name: &str) -> Option<String> {
+        let pm = self.plugin_manager.as_ref()?;
+        let plugin_names = self.ext_plugin_names.get(ext_name)?;
+
+        let mut commands: Vec<crate::core::plugin::PluginCommandEntry> = Vec::new();
+        let mut keymaps: Vec<(String, String, Option<String>)> = Vec::new();
+        let mut panels: Vec<String> = Vec::new();
+        let mut views: Vec<String> = Vec::new();
+        for plugin_name in plugin_names {
+            let c = pm.contributions_for_plugin(plugin_name);
+            commands.extend(c.commands);
+            keymaps.extend(c.keymaps);
+            panels.extend(c.panels);
+            views.extend(c.views);
+        }
+        // `vimcode.keymap.set` keymaps are leader-expanded and merged into
+        // `user_keymaps` at load time (`Engine::set_plugin_manager`), so the
+        // authoritative lhs lives there — `PluginManager::contributions_for_
+        // plugin` only covers the legacy `vimcode.keymap(mode, key, fn)` form.
+        for km in &self.user_keymaps {
+            if let UserKeymapAction::Lua(id) = km.action {
+                let owned = plugin_names
+                    .iter()
+                    .any(|p| pm.lua_keymap_source(id) == Some(p.as_str()));
+                if owned {
+                    keymaps.push((km.mode.clone(), km.keys.join(""), km.desc.clone()));
+                }
+            }
+        }
+
+        if commands.is_empty() && keymaps.is_empty() && panels.is_empty() && views.is_empty() {
+            return None;
+        }
+
+        commands.sort_by(|a, b| a.name.cmp(&b.name));
+        keymaps.sort();
+        panels.sort();
+        panels.dedup();
+        views.sort();
+        views.dedup();
+
+        let mut md = String::from("## Provides\n\n");
+        if !commands.is_empty() {
+            md.push_str("**Commands**\n\n");
+            for c in &commands {
+                let label = match (&c.category, &c.title) {
+                    (Some(cat), Some(title)) => format!("{cat}: {title}"),
+                    (None, Some(title)) => title.clone(),
+                    _ => c.name.clone(),
+                };
+                md.push_str(&format!("- `:{}` — {label}\n", c.name));
+            }
+            md.push('\n');
+        }
+        if !keymaps.is_empty() {
+            md.push_str("**Keymaps**\n\n");
+            for (mode, lhs, desc) in &keymaps {
+                match desc {
+                    Some(d) => md.push_str(&format!("- `{mode}` `{lhs}` — {d}\n")),
+                    None => md.push_str(&format!("- `{mode}` `{lhs}`\n")),
+                }
+            }
+            md.push('\n');
+        }
+        if !panels.is_empty() {
+            md.push_str("**Panels**\n\n");
+            for p in &panels {
+                md.push_str(&format!("- {p}\n"));
+            }
+            md.push('\n');
+        }
+        if !views.is_empty() {
+            md.push_str("**Views**\n\n");
+            for v in &views {
+                md.push_str(&format!("- {v}\n"));
+            }
+            md.push('\n');
+        }
+        Some(md)
+    }
+
+    /// Prefix `readme` with `ext_name`'s "## Provides" section (if any),
+    /// for the combined content `ext_show_readme_or_fetch_async`/
+    /// `poll_ext_readme` open in the README preview tab.
+    pub(crate) fn ext_readme_with_contributions(&self, ext_name: &str, readme: &str) -> String {
+        match self.ext_contributions_markdown(ext_name) {
+            Some(provides) => format!("{provides}\n{readme}"),
+            None => readme.to_string(),
         }
     }
 

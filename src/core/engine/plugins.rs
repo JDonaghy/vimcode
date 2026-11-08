@@ -2263,6 +2263,10 @@ impl Engine {
                 // only the Lua scripts are gated here.
                 let manifests = self.ext_available_manifests();
                 let mut skipped_incompatible: Vec<String> = Vec::new();
+                // Rebuilt fresh on every `plugin_init()` call (a reload after
+                // install/uninstall/enable/disable included) — stale entries
+                // for an extension that is no longer loaded must not survive.
+                self.ext_plugin_names.clear();
                 if has_extensions {
                     if let Ok(entries) = std::fs::read_dir(&extensions_dir) {
                         let mut dirs: Vec<_> = entries
@@ -2302,7 +2306,18 @@ impl Engine {
                                     continue;
                                 }
                             }
+                            // Capture exactly the plugin (file-stem) names
+                            // this extension's own directory just contributed
+                            // to `mgr.plugins` — not `manifest.scripts`,
+                            // which only names what the registry *declared*
+                            // and can drift from what is actually on disk.
+                            let before = mgr.plugins.len();
                             mgr.load_plugins_dir(&ext_dir, &self.settings.disabled_plugins);
+                            let loaded: Vec<String> = mgr.plugins[before..]
+                                .iter()
+                                .map(|p| p.name.clone())
+                                .collect();
+                            self.ext_plugin_names.insert(ext_name, loaded);
                         }
                     }
                 }
@@ -4261,6 +4276,154 @@ mod requires_vimcode_loader_gate_tests {
             "a compatible extension must never be reported skipped; got: {:?}",
             engine.message
         );
+
+        drop(_home_guard);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+/// Extensions panel "Provides" listing: an installed extension's
+/// commands, keymaps, panels and views, surfaced by prefixing them onto
+/// its README when it's opened (Enter/double-click in the sidebar, or
+/// `ext_open_selected_readme`). Verifies the plugin (file-stem) name
+/// tracking survives the exact path a real extension takes: a script
+/// filename that does *not* match the extension's own name (mirroring
+/// `sql-tool`'s `sql_tool.lua`), loaded through `Engine::plugin_init`'s
+/// real extensions-directory loop rather than a shortcut.
+#[cfg(test)]
+mod ext_contributions_tests {
+    use crate::core::engine::Engine;
+
+    /// Write `extensions/<ext_name>/{manifest.toml, README.md,
+    /// <script_name>.lua}` under an isolated `$HOME`, mark the extension
+    /// installed, and return the engine plus the isolated-home guard (the
+    /// caller must keep it alive for the duration of the test).
+    fn install_fixture_extension_with_script(
+        home: &std::path::Path,
+        ext_name: &str,
+        script_name: &str,
+        lua_code: &str,
+        readme_body: &str,
+    ) -> Engine {
+        let ext_dir = home
+            .join(".config")
+            .join("vimcode")
+            .join("extensions")
+            .join(ext_name);
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        std::fs::write(
+            ext_dir.join("manifest.toml"),
+            format!("name = \"{ext_name}\"\ndisplay_name = \"2142 Fixture\"\n"),
+        )
+        .unwrap();
+        std::fs::write(ext_dir.join("README.md"), readme_body).unwrap();
+        std::fs::write(ext_dir.join(format!("{script_name}.lua")), lua_code).unwrap();
+
+        let mut engine = Engine::new();
+        engine.extension_state.mark_installed(ext_name);
+        engine
+    }
+
+    const FIXTURE_LUA: &str = r#"
+        vimcode.command("SqlNewConnection", function(_) end, {
+            title = "New Connection",
+            category = "SQL",
+        })
+        vimcode.keymap.set("n", "<leader>r", function(_) end, {
+            desc = "Run query",
+        })
+        vimcode.panel.register("sql", {
+            title = "SQL",
+            sections = {"Connections"},
+        })
+        vimcode.ui.register_view("sql_conn", {
+            title = "SQL Connection",
+            render = function() return { fields = {} } end,
+        })
+    "#;
+
+    /// `Engine::ext_plugin_names` must capture the loaded script's own
+    /// file-stem (`"sql_tool"`), not the extension's name (`"sql-tool"`) —
+    /// they deliberately differ here, the same way a real extension's
+    /// script filename need not match its own package name.
+    #[test]
+    fn plugin_init_records_the_loaded_script_name_under_the_extension_name() {
+        let home = std::env::temp_dir().join(format!(
+            "vimcode_test_2142_plugin_names_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let _home_guard = crate::core::paths::set_test_home(&home);
+
+        let mut engine = install_fixture_extension_with_script(
+            &home,
+            "sql-tool",
+            "sql_tool",
+            FIXTURE_LUA,
+            "A database connection tool.",
+        );
+        engine.plugin_init();
+
+        assert_eq!(
+            engine.ext_plugin_names.get("sql-tool"),
+            Some(&vec!["sql_tool".to_string()]),
+            "ext_plugin_names: {:?}",
+            engine.ext_plugin_names
+        );
+
+        drop(_home_guard);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The combined content `ext_show_readme_or_fetch_async` opens in the
+    /// README preview tab must list the extension's command (with its
+    /// palette title/category), its leader keymap (lhs expanded, desc
+    /// included), its panel and its view — *and* still contain the
+    /// original README body beneath that listing.
+    #[test]
+    fn opening_the_readme_lists_commands_keymaps_panels_and_views() {
+        let home = std::env::temp_dir().join(format!(
+            "vimcode_test_2142_readme_provides_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let _home_guard = crate::core::paths::set_test_home(&home);
+
+        let mut engine = install_fixture_extension_with_script(
+            &home,
+            "sql-tool",
+            "sql_tool",
+            FIXTURE_LUA,
+            "A database connection tool.",
+        );
+        // A visible, non-whitespace leader so the expanded `<leader>r`
+        // lhs is legible in the assertion below (the default leader is a
+        // literal space, which `<leader>r` would expand into " r").
+        engine.settings.leader = ',';
+        engine.plugin_init();
+
+        engine.ext_show_readme_or_fetch_async("sql-tool", "SQL Tool", "", true);
+        let content = engine
+            .buffer_manager
+            .get(engine.active_buffer_id())
+            .map(|s| s.buffer.content.to_string())
+            .unwrap_or_default();
+
+        for expected in [
+            "Provides",
+            "SQL: New Connection",
+            ",r",
+            "Run query",
+            "SQL Connection",
+            "database connection tool",
+        ] {
+            assert!(
+                content.contains(expected),
+                "expected tab content to contain {expected:?}; got:\n{content}"
+            );
+        }
 
         drop(_home_guard);
         let _ = std::fs::remove_dir_all(&home);
