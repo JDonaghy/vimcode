@@ -1098,21 +1098,35 @@ three optional keys:
 
 - `variant`: `"primary"`, `"secondary"`, `"icon"`, `"danger"` or `"warning"`
   — any other string is a Lua error naming the bad value. Omit it for
-  today's plain look. The TUI backend only tints `"danger"`
-  (`theme.error_fg`) and `"warning"` (`theme.warning_fg`); every other
-  variant, including `"primary"`, paints the same foreground as no variant
-  at all.
+  today's plain look. **The intent colour is TUI-only.** The TUI backend
+  tints `"danger"` (`theme.error_fg`) and `"warning"` (`theme.warning_fg`)
+  and paints every other variant, including `"primary"`, the same
+  foreground as no variant at all. GTK, macOS and Windows paint every
+  variant identically (the plain hover/focus button chrome) — `variant` has
+  no visible effect there yet. `"icon"` additionally asks quadraui's
+  `ButtonRow` paint for bracket-less chrome on the TUI's plain `tui::button`
+  path, but the `ButtonRow`/toolbar paint path this vocabulary actually goes
+  through always draws the bracketed `[ label ]` chrome regardless of
+  variant, so `"icon"` is indistinguishable from no variant there too.
 - `icon`: a codicon name (e.g. `"trash"`, `"save"`, `"gear"`) from
-  quadraui's bundled set — an unrecognised name is a Lua error naming the
-  key. There is no separate fallback text to declare; the name itself is
-  what paints on a backend with no icon font loaded.
-- `tooltip`: hover text.
+  quadraui's bundled set — an unrecognised *multi-character* name is a Lua
+  error naming the key. A single-character value (e.g. `"⟳"`, `"+"`) is
+  accepted unvalidated as a legacy literal glyph, for a `toolbar` declared
+  before this vocabulary existed. There is no separate fallback text to
+  declare; on every backend the name itself is what paints — there is no
+  nerd-font-aware icon-font swap on this path.
+- `tooltip`: hover text. No backend paints a form-row tooltip today, so this
+  key has no visible effect yet; it exists so plugin code and its target UI
+  don't have to change twice.
 
-A `"button"` field with none of the three set keeps rendering through
-quadraui's plain `< label >` chrome exactly as before this vocabulary
-existed. Setting any one of them switches it to the bracketed `[ label ]`
-chrome a styled `"buttons"` row entry already uses, so the intent colour
-has somewhere to paint.
+A `"button"` field with neither `variant` nor `icon` set keeps rendering
+through quadraui's plain `< label >` chrome exactly as before this
+vocabulary existed. Setting either one switches it to the bracketed
+`[ label ]` chrome a styled `"buttons"` row entry already uses (on the TUI;
+GTK/macOS/Windows paint a filled rect either way), so the intent colour has
+somewhere to paint. Setting only `tooltip` does **not** switch the chrome —
+since no backend shows a row tooltip, there would be nothing to show for the
+layout change.
 
 Every field also accepts `label`, `hint`, `disabled`, `error` and `warning`
 (`error` / `warning` render an indicator plus the message instead of the hint).

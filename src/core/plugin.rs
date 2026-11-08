@@ -249,6 +249,17 @@ fn lua_codicon_name(row: &LuaTable, key: &str, context: &str) -> LuaResult<Optio
     else {
         return Ok(None);
     };
+    // A single Unicode scalar (e.g. `"⟳"`, `"+"`) is the legacy literal-glyph
+    // shape `toolbar.buttons[].icon` accepted before this vocabulary existed
+    // (see `vimcode.panel.register`'s own toolbar docs) — `resolve_view_icon`
+    // already paints an unresolved name verbatim via `Icon::new(name, name)`,
+    // so accept it unvalidated rather than breaking an existing plugin's
+    // toolbar. Only a multi-character name is held to the codicon table:
+    // that shape is reachable only by asking for a *named* icon, so an
+    // unrecognised one is almost certainly a typo worth a loud error.
+    if raw.chars().count() == 1 {
+        return Ok(Some(raw));
+    }
     if quadraui::Icon::codicon(&raw, "").is_none() {
         return Err(LuaError::RuntimeError(format!(
             "{context}: unknown codicon name {raw:?} for `{key}`"
@@ -7071,6 +7082,35 @@ mod tests {
             err.contains("icon") && err.contains("not-a-real-icon"),
             "the error must name the offending key and value: {err}"
         );
+    }
+
+    #[test]
+    fn a_single_character_toolbar_icon_is_accepted_as_a_legacy_literal_glyph() {
+        // A toolbar `icon` declared before this vocabulary existed is a
+        // single literal glyph (e.g. `"⟳"`), painted verbatim — not a
+        // codicon name. Validating it against the codicon table would be a
+        // compat break for every existing plugin using that shape.
+        let pm = pm_with_view(
+            "legacy_toolbar_icon",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return { fields = {
+                        { type = "toolbar", id = "tbr", label = "Tools",
+                          buttons = { { id = "go", label = "Go", icon = "⟳" } } },
+                    } }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let view = view.expect("a single-character icon must parse without a codicon lookup");
+        match &view.fields[0].kind {
+            crate::core::plugin_ui::ViewFieldKind::Toolbar { buttons } => {
+                assert_eq!(buttons[0].icon.as_deref(), Some("⟳"));
+            }
+            other => panic!("expected a toolbar field, got {other:?}"),
+        }
     }
 
     #[test]
