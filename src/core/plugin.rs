@@ -5344,6 +5344,33 @@ impl PluginManager {
             })?,
         )?;
 
+        // vimcode.ui.close_view(name) -> bool. Closes every tab, split
+        // window and dock slot currently showing a view opened via
+        // `vimcode.ui.open_view` — a form's Cancel button, or a successful
+        // submit that should dismiss its own dialog, has something to call.
+        // `false` when `name` was registered but not open anywhere; the
+        // editor's own "never close the very last window" guard
+        // (`Engine::close_window`) applies, so this can never quit vimcode.
+        // Errors if `name` is not a registered view, matching
+        // `vimcode.ui.open_view`'s "fail loudly at the Lua/Rust boundary"
+        // convention.
+        //
+        // Immediate ("live engine") API like `vimcode.ui.open_view`:
+        // closing a window/tab/dock is a structural engine mutation, not
+        // queued `PluginCallContext` output.
+        ui_tbl.set(
+            "close_view",
+            lua.create_function(|_, name: String| {
+                let closed =
+                    live_engine("vimcode.ui.close_view", move |e| e.close_plugin_view(&name))?;
+                closed.ok_or_else(|| {
+                    LuaError::RuntimeError(
+                        "vimcode.ui.close_view: name is not a registered view".to_string(),
+                    )
+                })
+            })?,
+        )?;
+
         // vimcode.ui.toast{title=, body=, severity=} → integer toast id.
         //
         // Pushes a transient notification onto the same bottom-right toast

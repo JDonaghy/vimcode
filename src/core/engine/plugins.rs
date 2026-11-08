@@ -519,6 +519,59 @@ impl Engine {
         true
     }
 
+    /// Close every tab, split window and dock slot currently showing `name`
+    /// (a `vimcode.ui.register_view` view), the way `vimcode.ui.close_view(
+    /// name)` is wired.
+    ///
+    /// `None` when `name` isn't a registered view at all — the Lua wrapper
+    /// turns that into a loud error, matching `vimcode.ui.open_view`'s "fail
+    /// loudly at the Lua/Rust boundary" convention. `Some(false)` when `name`
+    /// is registered but not currently open as a tab, split, or dock.
+    ///
+    /// Each matching editor-area window is closed via `Engine::close_window`
+    /// — the same path `<C-w>c`/`:q` use — so its "refuse to close the very
+    /// last window in the very last tab of the very last group" guard
+    /// applies here too: a plugin cannot use this to quit vimcode. Closing a
+    /// window that is the sole window of its tab therefore closes the tab,
+    /// matching `Engine::open_plugin_view_tab`'s doc ("closes like any
+    /// tab").
+    pub fn close_plugin_view(&mut self, name: &str) -> Option<bool> {
+        if !self.is_plugin_view(name) {
+            return None;
+        }
+        let mut closed = false;
+        if let BottomPanelKind::Plugin(dock_name) = &self.bottom_panel_kind {
+            if self.bottom_panel_open && dock_name == name {
+                self.bottom_panel_open = false;
+                closed = true;
+            }
+        }
+        // One window at a time, re-scanning after each close: `close_window`
+        // mutates `self.windows` and the active tab's layout (and may remove
+        // a whole tab), so holding an iterator across it would be invalid.
+        loop {
+            let windows = &self.windows;
+            let buffer_manager = &self.buffer_manager;
+            let next = windows.iter().find_map(|(&wid, w)| {
+                buffer_manager
+                    .get(w.buffer_id)
+                    .filter(|s| s.plugin_view.as_deref() == Some(name))
+                    .map(|_| wid)
+            });
+            let Some(window_id) = next else { break };
+            self.activate_window(window_id);
+            if self.close_window() {
+                closed = true;
+            } else {
+                // Only fails when this is the editor's one remaining window
+                // overall — further attempts would just loop forever on the
+                // same window.
+                break;
+            }
+        }
+        Some(closed)
+    }
+
     /// Handle a scroll event on the bottom panel's docked plugin view
     /// (`"plugin_dock"`'s scroll surface). No-op when the bottom panel
     /// isn't currently showing a `BottomPanelKind::Plugin`, or that view
