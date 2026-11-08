@@ -268,6 +268,92 @@ fn lua_codicon_name(row: &LuaTable, key: &str, context: &str) -> LuaResult<Optio
     Ok(Some(raw))
 }
 
+/// Parse a `label_position = "left"|"top"|"inline"|"hidden"` Lua key into a
+/// [`crate::core::plugin_ui::ViewLabelPosition`]. `None` when the key is
+/// absent. An unrecognised string is a loud Lua error naming the key, the
+/// same convention [`lua_button_variant`] uses.
+fn lua_label_position(
+    row: &LuaTable,
+    key: &str,
+    context: &str,
+) -> LuaResult<Option<crate::core::plugin_ui::ViewLabelPosition>> {
+    use crate::core::plugin_ui::ViewLabelPosition;
+    let Some(raw) = row.get::<_, Option<String>>(key)? else {
+        return Ok(None);
+    };
+    match raw.as_str() {
+        "left" => Ok(Some(ViewLabelPosition::Left)),
+        "top" => Ok(Some(ViewLabelPosition::Top)),
+        "inline" => Ok(Some(ViewLabelPosition::Inline)),
+        "hidden" => Ok(Some(ViewLabelPosition::Hidden)),
+        other => Err(LuaError::RuntimeError(format!(
+            "{context}: unsupported `{key}` {other:?} (expected \"left\", \"top\", \
+             \"inline\" or \"hidden\")"
+        ))),
+    }
+}
+
+/// Parse a `label_align = "start"|"center"|"end"` Lua key into a
+/// [`crate::core::plugin_ui::ViewLabelAlign`]. `None` when the key is
+/// absent. An unrecognised string is a loud Lua error naming the key.
+fn lua_label_align(
+    row: &LuaTable,
+    key: &str,
+    context: &str,
+) -> LuaResult<Option<crate::core::plugin_ui::ViewLabelAlign>> {
+    use crate::core::plugin_ui::ViewLabelAlign;
+    let Some(raw) = row.get::<_, Option<String>>(key)? else {
+        return Ok(None);
+    };
+    match raw.as_str() {
+        "start" => Ok(Some(ViewLabelAlign::Start)),
+        "center" => Ok(Some(ViewLabelAlign::Center)),
+        "end" => Ok(Some(ViewLabelAlign::End)),
+        other => Err(LuaError::RuntimeError(format!(
+            "{context}: unsupported `{key}` {other:?} (expected \"start\", \"center\" or \"end\")"
+        ))),
+    }
+}
+
+/// Parse a `control_width = "fill"|"content"|{ fixed = n }` Lua key into a
+/// [`crate::core::plugin_ui::ViewControlWidth`]. `None` when the key is
+/// absent. An unrecognised string, or a table missing a numeric `fixed`
+/// key, is a loud Lua error naming the key.
+fn lua_control_width(
+    row: &LuaTable,
+    key: &str,
+    context: &str,
+) -> LuaResult<Option<crate::core::plugin_ui::ViewControlWidth>> {
+    use crate::core::plugin_ui::ViewControlWidth;
+    let value: LuaValue = match row.get(key) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    match value {
+        LuaValue::Nil => Ok(None),
+        LuaValue::String(s) => match s.to_str()? {
+            "fill" => Ok(Some(ViewControlWidth::Fill)),
+            "content" => Ok(Some(ViewControlWidth::Content)),
+            other => Err(LuaError::RuntimeError(format!(
+                "{context}: unsupported `{key}` {other:?} (expected \"fill\", \"content\" \
+                 or {{ fixed = n }})"
+            ))),
+        },
+        LuaValue::Table(t) => {
+            let fixed: f64 = t.get("fixed").map_err(|_| {
+                LuaError::RuntimeError(format!(
+                    "{context}: `{key}` table requires a numeric `fixed` key"
+                ))
+            })?;
+            Ok(Some(ViewControlWidth::Fixed(fixed as f32)))
+        }
+        other => Err(LuaError::RuntimeError(format!(
+            "{context}: unsupported `{key}` value {other:?} (expected \"fill\", \"content\" \
+             or {{ fixed = n }})"
+        ))),
+    }
+}
+
 /// Parse the table a view's `render()` returned into a
 /// [`crate::core::plugin_ui::PluginView`].
 ///
@@ -290,6 +376,18 @@ fn lua_table_to_view(tbl: &LuaTable) -> LuaResult<crate::core::plugin_ui::Plugin
     }
     let id: String = tbl.get("id").unwrap_or_default();
 
+    // Form-wide layout knobs, parsed on the render's top-level table.
+    // `None` for every one of these leaves `plugin_view_to_form` building a
+    // `quadraui::Form` with its own defaults — byte-for-byte today's
+    // behaviour for a view that declares none of them.
+    let label_position = lua_label_position(tbl, "label_position", "view")?;
+    let label_align = lua_label_align(tbl, "label_align", "view")?;
+    let label_width: Option<f32> = tbl.get::<_, Option<f64>>("label_width")?.map(|w| w as f32);
+    let control_width = lua_control_width(tbl, "control_width", "view")?;
+    let min_control_width: Option<f32> = tbl
+        .get::<_, Option<f64>>("min_control_width")?
+        .map(|w| w as f32);
+
     // A `kind = "list"/"tree"/"table"/"text_view"/"chart"/"message_list"/
     // "image"` table is a single `ViewBody` widget, not a field stack —
     // parse it and return early,
@@ -302,6 +400,11 @@ fn lua_table_to_view(tbl: &LuaTable) -> LuaResult<crate::core::plugin_ui::Plugin
             schema_version,
             fields: Vec::new(),
             body: Some(body),
+            label_position,
+            label_align,
+            label_width,
+            control_width,
+            min_control_width,
         });
     }
 
@@ -314,6 +417,19 @@ fn lua_table_to_view(tbl: &LuaTable) -> LuaResult<crate::core::plugin_ui::Plugin
             let label: String = row.get("label").unwrap_or_default();
             let hint: String = row.get("hint").unwrap_or_default();
             let disabled: bool = row.get("disabled").unwrap_or(false);
+            // Per-field layout knob overrides — see the form-wide parse
+            // above for what each one means. `None` defers to the
+            // form-wide default (or quadraui's own, if that is also
+            // unset), exactly as before these keys existed.
+            let field_ctx = format!("view field {} (id {field_id:?})", idx + 1);
+            let field_label_position = lua_label_position(&row, "label_position", &field_ctx)?;
+            let field_label_align = lua_label_align(&row, "label_align", &field_ctx)?;
+            let field_label_width: Option<f32> =
+                row.get::<_, Option<f64>>("label_width")?.map(|w| w as f32);
+            let field_control_width = lua_control_width(&row, "control_width", &field_ctx)?;
+            let field_min_control_width: Option<f32> = row
+                .get::<_, Option<f64>>("min_control_width")?
+                .map(|w| w as f32);
             let error: Option<String> =
                 row.get::<_, String>("error").ok().filter(|s| !s.is_empty());
             let warning: Option<String> = row
@@ -489,6 +605,11 @@ fn lua_table_to_view(tbl: &LuaTable) -> LuaResult<crate::core::plugin_ui::Plugin
                 error,
                 warning,
                 kind,
+                label_position: field_label_position,
+                label_align: field_label_align,
+                label_width: field_label_width,
+                control_width: field_control_width,
+                min_control_width: field_min_control_width,
             });
         }
     }
@@ -498,6 +619,11 @@ fn lua_table_to_view(tbl: &LuaTable) -> LuaResult<crate::core::plugin_ui::Plugin
         schema_version,
         fields,
         body: None,
+        label_position,
+        label_align,
+        label_width,
+        control_width,
+        min_control_width,
     })
 }
 
@@ -7127,6 +7253,194 @@ mod tests {
         assert!(
             err.contains("icon") && err.contains("not-a-real-icon"),
             "the error must name the offending key and value: {err}"
+        );
+    }
+
+    // ── Form layout knobs (`label_position`/`label_align`/`label_width`/
+    // `control_width`/`min_control_width`) ──────────────────────────────
+
+    #[test]
+    fn form_wide_layout_knobs_round_trip_into_the_view() {
+        use crate::core::plugin_ui::{ViewControlWidth, ViewLabelAlign, ViewLabelPosition};
+        let pm = pm_with_view(
+            "layout_knobs",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return {
+                        label_position = "top",
+                        label_align = "end",
+                        label_width = 12,
+                        control_width = { fixed = 40 },
+                        min_control_width = 20,
+                        fields = {
+                            { type = "text", id = "name", label = "Name" },
+                        },
+                    }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let view = view.expect("render must succeed");
+        assert_eq!(view.label_position, Some(ViewLabelPosition::Top));
+        assert_eq!(view.label_align, Some(ViewLabelAlign::End));
+        assert_eq!(view.label_width, Some(12.0));
+        assert_eq!(view.control_width, Some(ViewControlWidth::Fixed(40.0)));
+        assert_eq!(view.min_control_width, Some(20.0));
+    }
+
+    #[test]
+    fn control_width_accepts_fill_and_content_string_tags() {
+        use crate::core::plugin_ui::ViewControlWidth;
+        let pm = pm_with_view(
+            "control_width_tags",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return {
+                        control_width = "content",
+                        fields = {
+                            { type = "text", id = "a", control_width = "fill" },
+                        },
+                    }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let view = view.expect("render must succeed");
+        assert_eq!(view.control_width, Some(ViewControlWidth::Content));
+        assert_eq!(view.fields[0].control_width, Some(ViewControlWidth::Fill));
+    }
+
+    #[test]
+    fn a_field_level_layout_knob_overrides_the_form_wide_default() {
+        use crate::core::plugin_ui::ViewLabelPosition;
+        let pm = pm_with_view(
+            "field_override",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return {
+                        label_position = "left",
+                        fields = {
+                            { type = "text", id = "name", label = "Name",
+                              label_position = "top" },
+                            { type = "text", id = "email", label = "Email" },
+                        },
+                    }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let view = view.expect("render must succeed");
+        assert_eq!(view.label_position, Some(ViewLabelPosition::Left));
+        assert_eq!(view.fields[0].label_position, Some(ViewLabelPosition::Top));
+        assert_eq!(view.fields[1].label_position, None);
+    }
+
+    #[test]
+    fn absent_layout_knobs_keep_todays_behaviour_as_none() {
+        let pm = pm_with_view(
+            "no_layout_knobs",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return { fields = { { type = "text", id = "a" } } }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let view = view.expect("render must succeed");
+        assert_eq!(view.label_position, None);
+        assert_eq!(view.label_align, None);
+        assert_eq!(view.label_width, None);
+        assert_eq!(view.control_width, None);
+        assert_eq!(view.min_control_width, None);
+        assert_eq!(view.fields[0].label_position, None);
+        assert_eq!(view.fields[0].control_width, None);
+    }
+
+    #[test]
+    fn an_unknown_label_position_is_an_error_naming_the_key() {
+        let pm = pm_with_view(
+            "bad_label_position",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return { label_position = "sideways", fields = {} }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let err = view.expect_err("an unrecognised label_position must not be silently accepted");
+        assert!(
+            err.contains("label_position") && err.contains("sideways"),
+            "the error must name the offending key and value: {err}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_label_align_is_an_error_naming_the_key() {
+        let pm = pm_with_view(
+            "bad_label_align",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return { label_align = "middle", fields = {} }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let err = view.expect_err("an unrecognised label_align must not be silently accepted");
+        assert!(
+            err.contains("label_align") && err.contains("middle"),
+            "the error must name the offending key and value: {err}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_control_width_string_is_an_error_naming_the_key() {
+        let pm = pm_with_view(
+            "bad_control_width_string",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return { control_width = "huge", fields = {} }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let err = view.expect_err("an unrecognised control_width must not be silently accepted");
+        assert!(
+            err.contains("control_width") && err.contains("huge"),
+            "the error must name the offending key and value: {err}"
+        );
+    }
+
+    #[test]
+    fn a_control_width_table_missing_fixed_is_an_error() {
+        let pm = pm_with_view(
+            "bad_control_width_table",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return { control_width = { not_fixed = 10 }, fields = {} }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let err = view.expect_err("a control_width table missing `fixed` must not parse");
+        assert!(
+            err.contains("control_width") && err.contains("fixed"),
+            "the error must name the offending key: {err}"
         );
     }
 

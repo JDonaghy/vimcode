@@ -117,6 +117,32 @@ pub struct PluginView {
     /// shape; additive and does not require a schema version bump.
     #[serde(default)]
     pub body: Option<ViewBody>,
+    /// Form-wide default for where a field's label renders — see
+    /// [`ViewLabelPosition`]. `None` keeps quadraui's own default
+    /// (`Left`, today's only behaviour) exactly as before this key
+    /// existed. A [`ViewField::label_position`] override, when set,
+    /// wins over this per field.
+    #[serde(default)]
+    pub label_position: Option<ViewLabelPosition>,
+    /// Form-wide default alignment for `Left`-positioned labels — see
+    /// [`ViewLabelAlign`]. `None` keeps quadraui's own default (`Start`).
+    #[serde(default)]
+    pub label_align: Option<ViewLabelAlign>,
+    /// Form-wide fixed label-column width, surface-native units (cells on
+    /// TUI, pixels on GTK/macOS/Windows). `None` lets the backend size the
+    /// column to the widest label, as it does today.
+    #[serde(default)]
+    pub label_width: Option<f32>,
+    /// Form-wide default for how a field's control column is sized — see
+    /// [`ViewControlWidth`]. `None` keeps quadraui's own default (`Fill`,
+    /// today's only behaviour: every control stretches to the row's right
+    /// edge).
+    #[serde(default)]
+    pub control_width: Option<ViewControlWidth>,
+    /// Form-wide floor under which a field's resolved control column never
+    /// shrinks, surface-native units. `None` applies no floor.
+    #[serde(default)]
+    pub min_control_width: Option<f32>,
 }
 
 impl Default for PluginView {
@@ -126,6 +152,11 @@ impl Default for PluginView {
             schema_version: VIEW_SCHEMA_VERSION,
             fields: Vec::new(),
             body: None,
+            label_position: None,
+            label_align: None,
+            label_width: None,
+            control_width: None,
+            min_control_width: None,
         }
     }
 }
@@ -555,6 +586,90 @@ pub struct ViewTableRow {
     pub cells: Vec<String>,
 }
 
+/// Where a field's label renders relative to its input. Mirrors
+/// `quadraui::LabelPosition` without depending on quadraui from this
+/// module's types directly (same reasoning as [`ViewImageFit`]), settable
+/// form-wide on [`PluginView::label_position`] or per field on
+/// [`ViewField::label_position`]; see [`Self::into_quadraui`] for the one
+/// place that translation happens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewLabelPosition {
+    /// Label beside the input, on the same row. Today's only behaviour.
+    #[default]
+    Left,
+    /// Label on its own row above the input.
+    Top,
+    /// Label and input share a line with no reserved label column.
+    Inline,
+    /// The label is not rendered; the input takes the full row.
+    Hidden,
+}
+
+impl ViewLabelPosition {
+    /// Translate to the quadraui primitive this paints through.
+    pub fn into_quadraui(self) -> quadraui::LabelPosition {
+        match self {
+            ViewLabelPosition::Left => quadraui::LabelPosition::Left,
+            ViewLabelPosition::Top => quadraui::LabelPosition::Top,
+            ViewLabelPosition::Inline => quadraui::LabelPosition::Inline,
+            ViewLabelPosition::Hidden => quadraui::LabelPosition::Hidden,
+        }
+    }
+}
+
+/// Horizontal alignment of a `Left`-positioned label inside its label
+/// column. Mirrors `quadraui::LabelAlign`; settable form-wide on
+/// [`PluginView::label_align`] or per field on [`ViewField::label_align`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewLabelAlign {
+    #[default]
+    Start,
+    Center,
+    End,
+}
+
+impl ViewLabelAlign {
+    /// Translate to the quadraui primitive this paints through.
+    pub fn into_quadraui(self) -> quadraui::LabelAlign {
+        match self {
+            ViewLabelAlign::Start => quadraui::LabelAlign::Start,
+            ViewLabelAlign::Center => quadraui::LabelAlign::Center,
+            ViewLabelAlign::End => quadraui::LabelAlign::End,
+        }
+    }
+}
+
+/// How a field's control column (the checkbox / input / slider / dropdown
+/// etc., as opposed to its label) is sized. Mirrors `quadraui::ControlWidth`;
+/// settable form-wide on [`PluginView::control_width`] or per field on
+/// [`ViewField::control_width`]. The Lua-facing shape is `"fill"`,
+/// `"content"`, or `{ fixed = n }` (surface-native units — cells on TUI,
+/// pixels on GTK/macOS/Windows) — see `plugin::lua_control_width`.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub enum ViewControlWidth {
+    /// Stretch the control to fill the row's remaining width. Today's only
+    /// behaviour.
+    #[default]
+    Fill,
+    /// Size the control to its own natural content.
+    Content,
+    /// An exact width, surface-native units.
+    Fixed(f32),
+}
+
+impl ViewControlWidth {
+    /// Translate to the quadraui primitive this paints through.
+    pub fn into_quadraui(self) -> quadraui::ControlWidth {
+        match self {
+            ViewControlWidth::Fill => quadraui::ControlWidth::Fill,
+            ViewControlWidth::Content => quadraui::ControlWidth::Content,
+            ViewControlWidth::Fixed(w) => quadraui::ControlWidth::Fixed(w),
+        }
+    }
+}
+
 /// A single row: a label plus an input.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ViewField {
@@ -572,6 +687,45 @@ pub struct ViewField {
     #[serde(default)]
     pub warning: Option<String>,
     pub kind: ViewFieldKind,
+    /// Overrides [`PluginView::label_position`] for this field only.
+    /// `None` defers to the form-wide default.
+    #[serde(default)]
+    pub label_position: Option<ViewLabelPosition>,
+    /// Overrides [`PluginView::label_align`] for this field only. `None`
+    /// defers to the form-wide default.
+    #[serde(default)]
+    pub label_align: Option<ViewLabelAlign>,
+    /// Overrides [`PluginView::label_width`] for this field only. `None`
+    /// defers to the form-wide default.
+    #[serde(default)]
+    pub label_width: Option<f32>,
+    /// Overrides [`PluginView::control_width`] for this field only.
+    /// `None` defers to the form-wide default.
+    #[serde(default)]
+    pub control_width: Option<ViewControlWidth>,
+    /// Overrides [`PluginView::min_control_width`] for this field only.
+    /// `None` defers to the form-wide default.
+    #[serde(default)]
+    pub min_control_width: Option<f32>,
+}
+
+impl Default for ViewField {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            label: String::new(),
+            hint: String::new(),
+            disabled: false,
+            error: None,
+            warning: None,
+            kind: ViewFieldKind::Label,
+            label_position: None,
+            label_align: None,
+            label_width: None,
+            control_width: None,
+            min_control_width: None,
+        }
+    }
 }
 
 impl ViewField {
@@ -1281,25 +1435,26 @@ mod tests {
                 ViewField {
                     id: "url".into(),
                     label: "URL".into(),
-                    hint: String::new(),
-                    disabled: false,
-                    error: None,
-                    warning: None,
                     kind: ViewFieldKind::Text {
                         value: "https://example.com".into(),
                         placeholder: "https://".into(),
                     },
+                    label_position: Some(ViewLabelPosition::Top),
+                    control_width: Some(ViewControlWidth::Fixed(40.0)),
+                    ..Default::default()
                 },
                 ViewField {
                     id: "send".into(),
                     label: "Send".into(),
-                    hint: String::new(),
-                    disabled: false,
-                    error: None,
-                    warning: None,
                     kind: ViewFieldKind::plain_button(),
+                    ..Default::default()
                 },
             ],
+            label_position: Some(ViewLabelPosition::Left),
+            label_align: Some(ViewLabelAlign::End),
+            label_width: Some(12.0),
+            control_width: Some(ViewControlWidth::Content),
+            min_control_width: Some(20.0),
         };
         let json = serde_json::to_string(&view).expect("serialize");
         let back: PluginView = serde_json::from_str(&json).expect("deserialize");
@@ -1464,12 +1619,8 @@ mod tests {
     fn first_focusable_skips_inert_rows() {
         let inert = |id: &str, kind: ViewFieldKind| ViewField {
             id: id.into(),
-            label: String::new(),
-            hint: String::new(),
-            disabled: false,
-            error: None,
-            warning: None,
             kind,
+            ..Default::default()
         };
         let view = PluginView {
             id: "v".into(),
@@ -1485,6 +1636,7 @@ mod tests {
                 ),
                 inert("go", ViewFieldKind::plain_button()),
             ],
+            ..Default::default()
         };
         assert_eq!(view.first_focusable(), Some(2));
         assert_eq!(view.field_index("go"), Some(2));
@@ -1549,12 +1701,8 @@ mod tests {
     fn inert_field(id: &str, kind: ViewFieldKind) -> ViewField {
         ViewField {
             id: id.into(),
-            label: String::new(),
-            hint: String::new(),
-            disabled: false,
-            error: None,
-            warning: None,
             kind,
+            ..Default::default()
         }
     }
 
@@ -1575,6 +1723,7 @@ mod tests {
                 inert_field("member", ViewFieldKind::plain_button()),
                 inert_field("after", ViewFieldKind::plain_button()),
             ],
+            ..Default::default()
         };
         // The header (index 0) stays visible; with no terminating `Section`
         // header, the collapse swallows every field after it through the
@@ -1599,6 +1748,7 @@ mod tests {
                 ),
                 inert_field("member", ViewFieldKind::plain_button()),
             ],
+            ..Default::default()
         };
         assert_eq!(view.visible_field_indices(), vec![0, 1]);
     }
@@ -1619,6 +1769,7 @@ mod tests {
                 ),
                 inert_field("member", ViewFieldKind::plain_button()),
             ],
+            ..Default::default()
         };
         assert_eq!(view.visible_field_indices(), vec![0, 1]);
         // The non-collapsible header itself is skipped by `first_focusable`,
@@ -1650,6 +1801,7 @@ mod tests {
                 ),
                 inert_field("b-member", ViewFieldKind::plain_button()),
             ],
+            ..Default::default()
         };
         // `a-member` (index 1) hides under `a`'s collapse; `b-hdr`/`b-member`
         // (indices 2, 3) are unaffected by `a`'s state.
@@ -1914,6 +2066,7 @@ mod tests {
                 text: "{}".into(),
                 filetype: Some("json".into()),
             }),
+            ..Default::default()
         };
         let json = serde_json::to_string(&view).unwrap();
         let back: PluginView = serde_json::from_str(&json).unwrap();
