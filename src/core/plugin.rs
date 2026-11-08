@@ -3116,7 +3116,7 @@ impl PluginManager {
 
     /// The plugin (file-stem) name that registered `vimcode.keymap.set`
     /// keymap `id` (the id [`Self::register_lua_keymap`] assigned it),
-    /// looked up by `Engine::ext_panel_contributions` to attribute a merged
+    /// looked up by `Engine::ext_contributions_markdown` to attribute a merged
     /// `Engine::user_keymaps` entry — whose lhs may already be leader-
     /// expanded — back to the extension that declared it.
     pub fn lua_keymap_source(&self, id: u64) -> Option<&str> {
@@ -3132,12 +3132,34 @@ impl PluginManager {
     /// there, not in `self.raw_lua_keymaps` (emptied by that merge). A
     /// caller that wants those too combines this with `user_keymaps`
     /// filtered by [`Self::lua_keymap_source`].
+    ///
+    /// `views` excludes any view also present in `panels` — a
+    /// `vimcode.ui.register_view` call with `sidebar = true` is harvested
+    /// into both `self.panels` and `self.views` under the same name (see
+    /// `load_one_plugin`), so without this filter the same title would be
+    /// listed twice, once under each heading.
     pub fn contributions_for_plugin(&self, plugin_name: &str) -> PluginContributions {
-        let commands: Vec<PluginCommandEntry> = self
-            .command_entries()
-            .into_iter()
-            .filter(|e| e.source.as_deref() == Some(plugin_name))
+        // Filters `command_sources` directly (rather than calling
+        // `command_entries()`, which builds and sorts an entry for *every*
+        // command before this would filter it back down) — cheaper when a
+        // plugin registers only a handful of a much larger command set.
+        let mut commands: Vec<PluginCommandEntry> = self
+            .command_sources
+            .iter()
+            .filter(|(_, src)| src.as_str() == plugin_name)
+            .map(|(name, _)| {
+                let meta = self.command_meta.get(name);
+                PluginCommandEntry {
+                    name: name.clone(),
+                    title: meta.and_then(|m| m.title.clone()),
+                    category: meta.and_then(|m| m.category.clone()),
+                    menu: meta.and_then(|m| m.menu.clone()),
+                    context_menu: meta.and_then(|m| m.context_menu.clone()),
+                    source: Some(plugin_name.to_string()),
+                }
+            })
             .collect();
+        commands.sort_by(|a, b| a.name.cmp(&b.name));
         let keymaps: Vec<(String, String, Option<String>)> = self
             .legacy_keymap_sources
             .iter()
@@ -3156,6 +3178,7 @@ impl PluginManager {
             .view_sources
             .iter()
             .filter(|(_, src)| src.as_str() == plugin_name)
+            .filter(|(view_name, _)| !self.panels.contains_key(view_name.as_str()))
             .filter_map(|(view_name, _)| self.view_title(view_name))
             .map(str::to_string)
             .collect();

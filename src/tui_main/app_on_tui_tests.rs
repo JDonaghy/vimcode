@@ -19954,6 +19954,159 @@ mod tests {
         }
     }
 
+    /// Extensions panel "Provides" listing: selecting an installed
+    /// extension and pressing Enter must paint its commands, keymaps,
+    /// panels and views — not just set engine-internal buffer state. Drives
+    /// the real key-dispatch path (`driver.dispatch` → `App::handle_dispatch`
+    /// → `route_focus_key`/`dispatch_sidebar_panel_key` →
+    /// `Engine::dispatch_ext_sidebar_key_unified` →
+    /// `Engine::ext_open_selected_readme`) and asserts on `driver.screen()`.
+    mod issue_2142_ext_provides_on_readme_key {
+        use super::*;
+        use crate::core::engine::sidebar::PANEL_EXTENSIONS;
+        use crate::core::extensions::ExtensionManifest;
+
+        /// A Lua fixture mirroring sql-tool's real registrations: a
+        /// palette command with a title/category, a leader keymap with a
+        /// desc, an activity-bar panel, and a tab-only view (`sidebar =
+        /// false`, so it shows up under Views and not duplicated into
+        /// Panels).
+        const FIXTURE_LUA: &str = r#"
+            vimcode.command("SqlNewConnection", function(_) end, {
+                title = "New Connection",
+                category = "SQL",
+            })
+            vimcode.keymap.set("n", "<leader>r", function(_) end, {
+                desc = "Run query",
+            })
+            vimcode.panel.register("sql", {
+                title = "SQL",
+                sections = {"Connections"},
+            })
+            vimcode.ui.register_view("sql_conn", {
+                title = "SQL Connection",
+                sidebar = false,
+                render = function() return { fields = {} } end,
+            })
+        "#;
+
+        /// Build an engine with one *installed* extension — real
+        /// `manifest.toml` + `README.md` + Lua script on disk under an
+        /// isolated `$HOME`, loaded for real through `Engine::plugin_init`
+        /// (not a shortcut) — with the Extensions sidebar focused and its
+        /// one INSTALLED row selected.
+        fn harness_with_one_installed_extension(
+            unique: &str,
+        ) -> (
+            crate::harness::ConformanceHarness<
+                quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+            >,
+            crate::core::paths::TestHomeGuard,
+        ) {
+            let home = std::env::temp_dir().join(format!(
+                "vimcode_test_2142_ext_provides_{unique}_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&home);
+            std::fs::create_dir_all(&home).unwrap();
+            let guard = crate::core::paths::set_test_home(&home);
+
+            let ext_dir = home
+                .join(".config")
+                .join("vimcode")
+                .join("extensions")
+                .join("sql-tool");
+            std::fs::create_dir_all(&ext_dir).unwrap();
+            std::fs::write(
+                ext_dir.join("manifest.toml"),
+                "name = \"sql-tool\"\ndisplay_name = \"SQL Tool\"\n",
+            )
+            .unwrap();
+            std::fs::write(
+                ext_dir.join("README.md"),
+                "# SQL Tool\n\nA database connection tool.",
+            )
+            .unwrap();
+            std::fs::write(ext_dir.join("sql_tool.lua"), FIXTURE_LUA).unwrap();
+
+            let mut engine = plain_engine();
+            // See `harness_with_one_available_extension`'s identical guard
+            // above: without this, `plain_engine()`'s own startup fires a
+            // real background fetch against the default public registry
+            // that can land mid-test and clobber this fixture's
+            // single-entry list.
+            engine.settings.extension_registries = Vec::new();
+            // A visible, non-whitespace leader so the expanded `<leader>r`
+            // lhs is legible on screen (the default leader is a literal
+            // space, which `<leader>r` would otherwise expand to " r").
+            engine.settings.leader = ',';
+            engine.extension_state.mark_installed("sql-tool");
+            engine.ext_registry = Some(vec![ExtensionManifest {
+                name: "sql-tool".to_string(),
+                display_name: "SQL Tool".to_string(),
+                ..Default::default()
+            }]);
+            // Loads `sql_tool.lua` for real through the same
+            // extensions-directory loop `plugin_init` runs at startup,
+            // populating `ext_plugin_names` exactly as a real install
+            // would.
+            engine.plugin_init();
+
+            engine.focus_sidebar_panel(PANEL_EXTENSIONS);
+            engine
+                .ext_sidebar_system
+                .borrow_mut()
+                .set_active_section(Some(0));
+            engine
+                .ext_sidebar_system
+                .borrow_mut()
+                .set_selected_path(0, Some(vec![0]));
+
+            let h = harness(engine);
+            (h, guard)
+        }
+
+        /// Pressing Enter on the installed row must paint the extension's
+        /// commands (with palette title/category), its leader keymap, its
+        /// panel and its tab-only view, plus its README — the issue's own
+        /// acceptance scenario, driven end-to-end through real key dispatch
+        /// rather than a direct engine-method call.
+        #[test]
+        fn enter_on_installed_row_paints_its_provides_section_and_readme() {
+            let (mut h, _home_guard) = harness_with_one_installed_extension("enter");
+            let driver = &mut h.driver;
+
+            driver.render();
+            let before = driver.screen();
+            assert!(
+                before.contains("INSTALLED") && before.contains("SQL Tool"),
+                "precondition: the Extensions sidebar must list the \
+                 installed extension; screen:\n{before}"
+            );
+
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.render();
+            let after = driver.screen();
+
+            for expected in [
+                "SQL: New Connection",      // command, with palette title/category
+                ",r",                       // leader keymap, lhs expanded
+                "Run query",                // keymap desc
+                "SQL",                      // panel title
+                "SQL Connection",           // tab-only view title
+                "database connection tool", // original README body
+            ] {
+                assert!(
+                    after.contains(expected),
+                    "#2142: pressing Enter on the installed row must paint \
+                     {expected:?} via the real key-dispatch path; \
+                     screen:\n{after}"
+                );
+            }
+        }
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Ex commands expand a leading `~` in a file-path argument before
     // resolving it, so `:vsplit ~/foo.txt` opens the real file under the
