@@ -694,6 +694,41 @@ pub enum ViewFieldKind {
         #[serde(default)]
         selected: usize,
     },
+    /// An editable free-text field backed by a fixed candidate list, with a
+    /// type-ahead filtered dropdown. Translated to
+    /// `quadraui::FieldKind::ComboBox`. Unlike [`Self::Dropdown`]'s
+    /// cycle-through selection, this is free text: `value` need not be one
+    /// of `options` verbatim — a plugin that wants strict validation checks
+    /// it itself in `on_event`.
+    ///
+    /// quadraui's own `FormController` drives the embedded `ComboBox`'s
+    /// keyboard handling (typing filters and opens the dropdown, Up/Down
+    /// move the highlighted option, Enter commits, Escape cancels) — see
+    /// `render::plugin_view_to_form`'s `ComboBox` arm and
+    /// `Engine::handle_plugin_view_key`'s combo-box branch for where
+    /// vimcode forwards keys into it and stores the resulting interaction
+    /// state (`text`/`open`/`highlighted`) across renders, since quadraui's
+    /// `FormController` carries no shadow cache for this field kind the way
+    /// it does for [`Self::Date`]'s `DatePicker`.
+    ///
+    /// Per-keystroke filter text reaches the plugin as
+    /// [`ViewEventKind::TextChanged`] — the same shape every other
+    /// text-backed field already uses. The confirmed selection (Enter, or a
+    /// dropdown item activated) reaches it as
+    /// [`ViewEventKind::ComboBoxChanged`], a dedicated variant rather than
+    /// reusing [`ViewEventKind::DropdownChanged`] (that one carries an
+    /// option *index*; a combo box's committed value may be free text with
+    /// no index into `options` at all) or [`ViewEventKind::TextCommitted`]
+    /// (that one also fires on `TextArea` blur, a trigger this field has no
+    /// equivalent of).
+    ComboBox {
+        #[serde(default)]
+        options: Vec<String>,
+        #[serde(default)]
+        value: String,
+        #[serde(default)]
+        placeholder: String,
+    },
     /// Single choice with every option visible. Translated to
     /// `quadraui::FieldKind::SegmentedControl`.
     Segmented {
@@ -834,6 +869,7 @@ impl ViewFieldKind {
             ViewFieldKind::Button { .. } => "button",
             ViewFieldKind::ReadOnly { .. } => "read_only",
             ViewFieldKind::Dropdown { .. } => "dropdown",
+            ViewFieldKind::ComboBox { .. } => "combo_box",
             ViewFieldKind::Segmented { .. } => "segmented",
             ViewFieldKind::Buttons { .. } => "buttons",
             ViewFieldKind::Toggles { .. } => "toggles",
@@ -952,6 +988,17 @@ pub enum ViewEventKind {
     DropdownChanged {
         selected: usize,
     },
+    /// A `combo_box` field confirmed a value — Enter, or a dropdown item
+    /// activated. Carries the committed free-text value, which need not be
+    /// one of the field's declared `options` verbatim. See
+    /// [`ViewFieldKind::ComboBox`]'s doc for why this isn't
+    /// [`Self::DropdownChanged`] (index, not text) or
+    /// [`Self::TextCommitted`] (also fires on `TextArea` blur). Per-keystroke
+    /// filter typing reaches the plugin as [`Self::TextChanged`] instead,
+    /// reusing that shape rather than adding a second one.
+    ComboBoxChanged {
+        value: String,
+    },
     SegmentedChanged {
         selected: usize,
     },
@@ -1068,6 +1115,7 @@ impl ViewEventKind {
             ViewEventKind::ButtonClicked => "ButtonClicked",
             ViewEventKind::ToggleChanged { .. } => "ToggleChanged",
             ViewEventKind::DropdownChanged { .. } => "DropdownChanged",
+            ViewEventKind::ComboBoxChanged { .. } => "ComboBoxChanged",
             ViewEventKind::SegmentedChanged { .. } => "SegmentedChanged",
             ViewEventKind::TextChanged { .. } => "TextChanged",
             ViewEventKind::TextCommitted { .. } => "TextCommitted",
@@ -1151,6 +1199,38 @@ impl PluginViewTextEditState {
     }
 }
 
+/// vimcode-owned interaction state for whichever `combo_box` field currently
+/// has keyboard focus, in either the sidebar or an editor-area tab.
+///
+/// Mirrors [`PluginViewTextEditState`]'s firewall: plugins never see
+/// `open`/`highlighted`, only the live filter text (via
+/// [`ViewEventKind::TextChanged`]) and the committed value (via
+/// [`ViewEventKind::ComboBoxChanged`]).
+///
+/// This exists because quadraui's `FormController` keeps no shadow cache of
+/// its own for `FieldKind::ComboBox` the way it does for `FieldKind::
+/// DatePicker`'s scrub position — the embedded `quadraui::ComboBox`'s
+/// `text`/`open`/`highlighted` fields are documented as "supplied fresh by
+/// the app each frame", so vimcode is that app: `render::plugin_view_to_form`
+/// reads this state (when it names the field being built) to seed the
+/// `ComboBox` it hands to the controller, and
+/// `Engine::handle_plugin_view_key`'s combo-box branch writes back whatever
+/// `quadraui::FormEvent::ComboBox*` action the controller resolves a key to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PluginViewComboBoxEditState {
+    /// The view that owns the focused field.
+    pub view: String,
+    /// The plugin-authored field id (not the namespaced `quadraui::WidgetId`).
+    pub field_id: String,
+    /// The live, possibly-uncommitted filter/edit text.
+    pub text: String,
+    /// Whether the filtered dropdown is currently shown.
+    pub open: bool,
+    /// Cursor index into the *filtered* option list — see
+    /// `quadraui::ComboBox::highlighted`'s own doc.
+    pub highlighted: Option<usize>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1225,6 +1305,29 @@ mod tests {
                 selected: 1,
             }
         );
+    }
+
+    #[test]
+    fn combo_box_field_kind_tag_is_the_lua_type_string() {
+        let json = r#"{"type":"combo_box","options":["Apple","Apricot"],"value":"Ap","placeholder":"Fruit"}"#;
+        let kind: ViewFieldKind = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(kind.type_name(), "combo_box");
+        assert_eq!(
+            kind,
+            ViewFieldKind::ComboBox {
+                options: vec!["Apple".into(), "Apricot".into()],
+                value: "Ap".into(),
+                placeholder: "Fruit".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn combo_box_changed_event_kind_name_is_the_lua_facing_string() {
+        let event = ViewEventKind::ComboBoxChanged {
+            value: "Apricot".into(),
+        };
+        assert_eq!(event.kind_name(), "ComboBoxChanged");
     }
 
     #[test]
