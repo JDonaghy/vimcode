@@ -518,6 +518,7 @@ fn lua_table_to_view_body(
                     let id: String = row.get("id").map_err(|_| {
                         LuaError::RuntimeError(format!("list item {}: missing id", idx + 1))
                     })?;
+                    let ctx = format!("list item {}", idx + 1);
                     items.push(ViewListItem {
                         id,
                         text: row.get("text").unwrap_or_default(),
@@ -525,6 +526,7 @@ fn lua_table_to_view_body(
                             .get::<_, String>("detail")
                             .ok()
                             .filter(|s| !s.is_empty()),
+                        icon: lua_codicon_name(&row, "icon", &ctx)?,
                     });
                 }
             }
@@ -735,11 +737,14 @@ fn lua_table_to_tree_nodes(tbl: LuaTable) -> LuaResult<Vec<crate::core::plugin_u
             Ok(children_tbl) => lua_table_to_tree_nodes(children_tbl)?,
             Err(_) => Vec::new(),
         };
+        let ctx = format!("tree node {}", idx + 1);
         nodes.push(ViewTreeNode {
             id,
             label: row.get("label").unwrap_or_default(),
             expanded: row.get("expanded").unwrap_or(false),
             children,
+            icon: lua_codicon_name(&row, "icon", &ctx)?,
+            badge: row.get::<_, String>("badge").ok().filter(|s| !s.is_empty()),
         });
     }
     Ok(nodes)
@@ -7336,6 +7341,56 @@ mod tests {
     }
 
     #[test]
+    fn a_list_item_icon_parses_and_an_unknown_name_is_an_error() {
+        use crate::core::plugin_ui::ViewBody;
+        let pm = pm_with_view(
+            "list-icon",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return {
+                        kind = "list",
+                        items = {
+                            { id = "r1", text = "main.rs", icon = "file" },
+                            { id = "r2", text = "no icon" },
+                        },
+                    }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let view = view.expect("render must succeed");
+        match view.body.expect("list body") {
+            ViewBody::List { items, .. } => {
+                assert_eq!(items[0].icon.as_deref(), Some("file"));
+                assert_eq!(items[1].icon, None);
+            }
+            other => panic!("expected List, got {other:?}"),
+        }
+
+        let pm = pm_with_view(
+            "list-bad-icon",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return {
+                        kind = "list",
+                        items = { { id = "r1", text = "x", icon = "not-a-real-icon" } },
+                    }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let err = view.expect_err("an unrecognised list item icon must not be silently accepted");
+        assert!(
+            err.contains("icon") && err.contains("not-a-real-icon"),
+            "the error must name the offending key and value: {err}"
+        );
+    }
+
+    #[test]
     fn a_list_item_missing_id_is_an_error_not_a_silent_drop() {
         let pm = pm_with_view(
             "list-badid",
@@ -7401,6 +7456,58 @@ mod tests {
         let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
         let err = view.expect_err("a tree view without \"nodes\" must not silently paint empty");
         assert!(err.contains("nodes"), "error was: {err}");
+    }
+
+    #[test]
+    fn a_tree_node_icon_and_badge_parse_and_an_unknown_icon_is_an_error() {
+        use crate::core::plugin_ui::ViewBody;
+        let pm = pm_with_view(
+            "tree-icon",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return {
+                        kind = "tree",
+                        nodes = {
+                            { id = "folder", label = "src", icon = "folder", badge = "M" },
+                            { id = "plain", label = "no icon" },
+                        },
+                    }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let view = view.expect("render must succeed");
+        match view.body.expect("tree body") {
+            ViewBody::Tree { nodes } => {
+                assert_eq!(nodes[0].icon.as_deref(), Some("folder"));
+                assert_eq!(nodes[0].badge.as_deref(), Some("M"));
+                assert_eq!(nodes[1].icon, None);
+                assert_eq!(nodes[1].badge, None);
+            }
+            other => panic!("expected Tree, got {other:?}"),
+        }
+
+        let pm = pm_with_view(
+            "tree-bad-icon",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return {
+                        kind = "tree",
+                        nodes = { { id = "n1", label = "x", icon = "not-a-real-icon" } },
+                    }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let err = view.expect_err("an unrecognised tree node icon must not be silently accepted");
+        assert!(
+            err.contains("icon") && err.contains("not-a-real-icon"),
+            "the error must name the offending key and value: {err}"
+        );
     }
 
     #[test]

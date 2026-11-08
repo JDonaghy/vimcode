@@ -38,7 +38,7 @@ fn parse_iso_date(s: &str) -> Option<quadraui::CalendarDate> {
 /// the string verbatim — the only route a validated value takes there is the
 /// legacy single-character literal glyph `lua_codicon_name` accepts
 /// unvalidated (e.g. `"⟳"`, `"+"`), so it is reachable, not dead.
-fn resolve_view_icon(name: &str) -> quadraui::Icon {
+pub(super) fn resolve_view_icon(name: &str) -> quadraui::Icon {
     quadraui::Icon::codicon(name, name).unwrap_or_else(|| quadraui::Icon::new(name, name))
 }
 

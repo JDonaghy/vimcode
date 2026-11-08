@@ -53,7 +53,10 @@ fn plugin_view_to_list(
             .iter()
             .map(|it| ListItem {
                 text: StyledText::plain(&it.text),
-                icon: None,
+                icon: it
+                    .icon
+                    .as_deref()
+                    .map(super::plugin_views_declared::resolve_view_icon),
                 detail: it.detail.as_deref().map(StyledText::plain),
                 decoration: Decoration::default(),
             })
@@ -261,7 +264,7 @@ fn flatten_tree_nodes(
     depth: u16,
     path: &mut quadraui::TreePath,
 ) -> Vec<quadraui::TreeRow> {
-    use quadraui::{StyledText, TreeRow};
+    use quadraui::{Badge, StyledText, TreeRow};
     let mut out = Vec::new();
     for (i, node) in nodes.iter().enumerate() {
         path.push(i as u16);
@@ -269,9 +272,12 @@ fn flatten_tree_nodes(
         out.push(TreeRow {
             path: path.clone(),
             indent: depth,
-            icon: None,
+            icon: node
+                .icon
+                .as_deref()
+                .map(super::plugin_views_declared::resolve_view_icon),
             text: StyledText::plain(&node.label),
-            badge: None,
+            badge: node.badge.as_deref().map(Badge::plain),
             is_expanded: is_branch.then_some(node.expanded),
             decoration: quadraui::Decoration::default(),
             edit: None,
