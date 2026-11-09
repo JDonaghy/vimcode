@@ -43,6 +43,34 @@ fn combo_box_key_from(key: &str, unicode: Option<char>) -> Option<quadraui::Key>
     }
 }
 
+/// Indices, within a `Buttons` or `Toggles` row's own item list, that the
+/// keyboard can land sub-focus on — every item for `Toggles` (no per-toggle
+/// `disabled` key exists), the non-`disabled` ones for `Buttons`. `None` for
+/// any other field kind, including a `Buttons`/`Toggles` row with no
+/// enabled items at all.
+///
+/// Shared by [`Engine::plugin_view_focus_field`] (seeding sub-focus on the
+/// first enabled item whenever a row gains field-level focus) and
+/// [`Engine::handle_plugin_view_key`]'s `Left`/`Right`/`h`/`l` arm (moving
+/// within it).
+fn plugin_view_row_item_indices(
+    kind: &crate::core::plugin_ui::ViewFieldKind,
+) -> Option<Vec<usize>> {
+    use crate::core::plugin_ui::ViewFieldKind;
+    match kind {
+        ViewFieldKind::Buttons { buttons } => Some(
+            buttons
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| !b.disabled)
+                .map(|(i, _)| i)
+                .collect(),
+        ),
+        ViewFieldKind::Toggles { toggles } => Some((0..toggles.len()).collect()),
+        _ => None,
+    }
+}
+
 /// Upper bound on nested plugin events queued during one dispatch. A plugin
 /// whose edit fires an event whose handler edits again could otherwise cascade
 /// without end; past this point the queue stops growing and the extra events
@@ -677,6 +705,28 @@ impl Engine {
         }
     }
 
+    /// Read the sub-focus index within `host`'s currently-focused `Buttons`/
+    /// `Toggles` row — see `Engine::ext_panel_row_focus`'s doc. Meaningless
+    /// when the focused field isn't one of those two kinds; callers that
+    /// care always check the field kind first.
+    pub(crate) fn plugin_view_row_focus(&self, host: PluginViewHost) -> usize {
+        match host {
+            PluginViewHost::Sidebar => self.ext_panel_row_focus,
+            PluginViewHost::Tab => self.plugin_view_tab_row_focus,
+            PluginViewHost::Dock => self.plugin_view_dock_row_focus,
+        }
+    }
+
+    /// Write the sub-focus index within `host`'s currently-focused `Buttons`/
+    /// `Toggles` row.
+    pub(crate) fn set_plugin_view_row_focus(&mut self, host: PluginViewHost, idx: usize) {
+        match host {
+            PluginViewHost::Sidebar => self.ext_panel_row_focus = idx,
+            PluginViewHost::Tab => self.plugin_view_tab_row_focus = idx,
+            PluginViewHost::Dock => self.plugin_view_dock_row_focus = idx,
+        }
+    }
+
     /// Nudge `host`'s scroll offset so its selection stays visible — the
     /// tab twin of `Engine::ext_panel_ensure_visible` (fixed 20-row viewport
     /// guess, same as that method's own fallback).
@@ -745,6 +795,19 @@ impl Engine {
         }
         self.set_plugin_view_selected(host, idx);
         self.prime_plugin_view_text_edit(name, idx);
+        // Reseed the row sub-focus (see `Engine::ext_panel_row_focus`'s doc)
+        // to the newly-focused field's first enabled item every time focus
+        // moves — including re-entering the same `Buttons`/`Toggles` row —
+        // so a stale position from a different field, or from this same
+        // row's last visit, never carries over.
+        let first_enabled = self
+            .plugin_views
+            .get(name)
+            .and_then(|v| v.fields.get(idx))
+            .and_then(|f| plugin_view_row_item_indices(&f.kind))
+            .and_then(|indices| indices.first().copied())
+            .unwrap_or(0);
+        self.set_plugin_view_row_focus(host, first_enabled);
     }
 
     /// Commit-or-discard whatever [`Engine::plugin_view_text_edit`] holds for
@@ -911,6 +974,13 @@ impl Engine {
             .fields
             .get(selected)
             .is_some_and(|f| !f.disabled && matches!(f.kind, ViewFieldKind::ComboBox { .. }));
+        let is_button_row_field = view.fields.get(selected).is_some_and(|f| {
+            !f.disabled
+                && matches!(
+                    f.kind,
+                    ViewFieldKind::Buttons { .. } | ViewFieldKind::Toggles { .. }
+                )
+        });
 
         // Field-to-field navigation always wins, text field or not.
         match key {
@@ -1022,6 +1092,38 @@ impl Engine {
             return self.handle_plugin_view_text_key(name, host, selected, key, ctrl, unicode);
         }
 
+        // `buttons`/`toggles`: `Left`/`Right` (and vim's `h`/`l`) move the
+        // sub-focus within the row, skipping disabled items, never wrapping
+        // past either end — see `Engine::ext_panel_row_focus`'s doc for how
+        // it's seeded/reset. `Enter`/`Space`'s own arm below reads this same
+        // index instead of always resolving to the row's first item.
+        if is_button_row_field {
+            let step: i32 = match key {
+                "Left" | "h" => -1,
+                "Right" | "l" => 1,
+                _ => 0,
+            };
+            if step != 0 {
+                let indices = self
+                    .plugin_views
+                    .get(name)
+                    .and_then(|v| v.fields.get(selected))
+                    .and_then(|f| plugin_view_row_item_indices(&f.kind))
+                    .unwrap_or_default();
+                if !indices.is_empty() {
+                    let current = self.plugin_view_row_focus(host);
+                    let pos = indices.iter().position(|&i| i == current).unwrap_or(0);
+                    let next_pos = if step < 0 {
+                        pos.saturating_sub(1)
+                    } else {
+                        (pos + 1).min(indices.len() - 1)
+                    };
+                    self.set_plugin_view_row_focus(host, indices[next_pos]);
+                }
+                return true;
+            }
+        }
+
         match key {
             "j" | "Down" => {
                 let next = focusable
@@ -1087,15 +1189,34 @@ impl Engine {
                         field.id.clone(),
                         ViewEventKind::ToggleChanged { value: !*value },
                     ),
-                    ViewFieldKind::Toggles { toggles } => match toggles.first() {
-                        Some(t) => (
-                            t.id.clone(),
-                            ViewEventKind::ToggleChanged { value: !t.value },
-                        ),
-                        None => return true,
-                    },
+                    ViewFieldKind::Toggles { toggles } => {
+                        // `ext_panel_row_focus`'s sub-focus index, when it
+                        // names a toggle that still exists; the row's first
+                        // one otherwise (freshly focused, or a stale index
+                        // from a `render` that shrank the list without a
+                        // refocus).
+                        let current = self.plugin_view_row_focus(host);
+                        match toggles.get(current).or_else(|| toggles.first()) {
+                            Some(t) => (
+                                t.id.clone(),
+                                ViewEventKind::ToggleChanged { value: !t.value },
+                            ),
+                            None => return true,
+                        }
+                    }
                     ViewFieldKind::Buttons { buttons } => {
-                        match buttons.iter().find(|b| !b.disabled) {
+                        // Same sub-focus contract as `Toggles` above, but
+                        // additionally skipping over a disabled button —
+                        // `Engine::plugin_view_focus_field` never seeds the
+                        // index onto one, but a `render` can disable the
+                        // currently sub-focused button without moving
+                        // field-level focus off the row.
+                        let current = self.plugin_view_row_focus(host);
+                        let chosen = buttons
+                            .get(current)
+                            .filter(|b| !b.disabled)
+                            .or_else(|| buttons.iter().find(|b| !b.disabled));
+                        match chosen {
                             Some(b) => (b.id.clone(), ViewEventKind::ButtonClicked),
                             None => return true,
                         }

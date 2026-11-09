@@ -23368,3 +23368,110 @@ mod find_in_selection {
         );
     }
 }
+
+/// A `buttons` row's keyboard sub-focus, on GTK — the backend twin
+/// of `tui_main::app_on_tui_tests::tests::issue_2146_plugin_ui_row_sub_focus`'s
+/// identically-shaped TUI test, proving the fix is the shared
+/// `render::plugin_view_to_form_with_row_focus` path, not something that
+/// only happens to work on one backend.
+#[cfg(test)]
+mod issue_2146_plugin_ui_row_sub_focus_gtk {
+    use super::*;
+
+    /// Loads `code` as a Lua plugin from a per-test temp dir — mirrors
+    /// `panel_surfaces`'s sibling `load_plugin_for_test` helper above.
+    fn engine_with_plugin(unique: &str, code: &str) -> Engine {
+        let dir = std::env::temp_dir().join(format!(
+            "vc_gtk_2146_row_focus_{unique}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{unique}.lua")), code).unwrap();
+        let mut engine = Engine::new();
+        let mut mgr = crate::core::plugin::PluginManager::new()
+            .unwrap_or_else(|e| panic!("failed to create PluginManager: {e}"));
+        mgr.load_plugins_dir(&dir, &[]);
+        assert!(
+            mgr.plugins[0].error.is_none(),
+            "fixture plugin must load cleanly: {:?}",
+            mgr.plugins[0].error
+        );
+        engine.set_plugin_manager(mgr);
+        let _ = std::fs::remove_dir_all(&dir);
+        engine
+    }
+
+    /// A `buttons` row of two enabled buttons: `Right` moves the sub-focus
+    /// from the first (`Cancel`) to the second (`Connect`) — painted as
+    /// that button's own label getting wrapped in `‹…›` — and `Enter` then
+    /// activates `Connect`, not `Cancel`.
+    #[test]
+    fn right_then_enter_on_a_buttons_row_activates_the_second_button_on_gtk() {
+        let engine = engine_with_plugin(
+            "rowfocus_buttons_gtk",
+            r#"
+            _G.clicked = "none"
+            vimcode.ui.register_view("rowfocus_buttons_2146_gtk", {
+                title = "Row Focus Buttons",
+                render = function()
+                    return {
+                        fields = {
+                            { type = "label", id = "status", label = "clicked:" .. _G.clicked },
+                            { type = "buttons", id = "actions", buttons = {
+                                { id = "cancel", label = "Cancel" },
+                                { id = "connect", label = "Connect" },
+                            } },
+                        },
+                    }
+                end,
+                on_event = function(_ctx, ev)
+                    if ev.kind == "ButtonClicked" then
+                        _G.clicked = ev.widget_id
+                        vimcode.ui.refresh("rowfocus_buttons_2146_gtk")
+                    end
+                end,
+            })
+            vimcode.command("ZqOpenRowFocusButtonsGtk", function(_)
+                vimcode.ui.open_view("rowfocus_buttons_2146_gtk")
+            end)
+            "#,
+        );
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+
+        h.driver.type_char(':');
+        for c in "ZqOpenRowFocusButtonsGtk".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.press_named(quadraui::NamedKey::Enter);
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("‹Cancel›")
+                && h.driver.screen_contains("Connect")
+                && !h.driver.screen_contains("‹Connect›"),
+            "opening the view must seed the row's sub-focus on its first \
+             button, painted as a `‹…›`-wrapped label; painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        h.driver.press_named(quadraui::NamedKey::Right);
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("‹Connect›") && !h.driver.screen_contains("‹Cancel›"),
+            "Right must move the row's sub-focus to the second button, \
+             and off the first; painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        h.driver.press_named(quadraui::NamedKey::Enter);
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("clicked:connect"),
+            "Enter must activate the sub-focused button (`connect`), not \
+             the row's first (`cancel`); painted: {:?}",
+            h.driver.painted_texts()
+        );
+    }
+}

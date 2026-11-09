@@ -5110,6 +5110,22 @@ pub struct Engine {
     /// below — it exists purely to keep that accessor exhaustive over every
     /// `PluginViewHost`.
     pub plugin_view_dock_table_col: usize,
+    /// Which item (within its own `buttons`/`toggles` list) the keyboard
+    /// would activate next, when the sidebar's currently-focused field
+    /// (`ext_panel_selected`) is a `ViewFieldKind::Buttons`/`Toggles` row —
+    /// `Left`/`Right`/`h`/`l` move it, `Enter`/`Space` activates it.
+    /// `Engine::plugin_view_focus_field` reseeds this to the row's first
+    /// enabled item every time field-level focus moves, including onto the
+    /// same row again, so leaving and re-entering a row never remembers a
+    /// stale position. Meaningless (and never read) while the focused
+    /// field isn't one of those two kinds — same "only valid for its own
+    /// field kind" contract `ext_panel_table_col` already has for `Table`.
+    pub ext_panel_row_focus: usize,
+    /// Tab twin of `ext_panel_row_focus`, kept separate for the same reason
+    /// `plugin_view_tab_selected` is kept separate from `ext_panel_selected`.
+    pub plugin_view_tab_row_focus: usize,
+    /// Dock twin of `ext_panel_row_focus`.
+    pub plugin_view_dock_row_focus: usize,
     /// Per-panel section expanded state.
     pub ext_panel_sections_expanded: HashMap<String, Vec<bool>>,
     /// Per-panel tree item expand state: (panel_name, item_id) → expanded.
@@ -5980,6 +5996,9 @@ impl Engine {
                 0.0, 0.0, 0.0, 0.0,
             )),
             plugin_view_dock_table_col: 0,
+            ext_panel_row_focus: 0,
+            plugin_view_tab_row_focus: 0,
+            plugin_view_dock_row_focus: 0,
             ext_panel_sections_expanded: HashMap::new(),
             ext_panel_tree_expanded: HashMap::new(),
             ext_panel_input_text: HashMap::new(),
