@@ -3909,6 +3909,18 @@ impl Engine {
     pub fn open_folder(&mut self, path: &Path) {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
 
+        // Opening a folder — a directory launch's own first call into
+        // this method, or a later explicit switch (Open Folder, a recent
+        // workspace, ...) — consumes any still-set file-argument launch
+        // force: see `file_argument_startup`'s own doc for why leaving it
+        // set here would otherwise pin a *later* `sync_app_shell_sidebar_
+        // visibility()` call (e.g. `Engine::open_recent_workspace`'s own,
+        // right after this method returns) to re-derive the sidebar
+        // hidden regardless of the new workspace's own settings/session.
+        // A no-op for the directory-launch call, since the flag is never
+        // set on that path in the first place.
+        self.file_argument_startup = false;
+
         // Save current per-workspace session before switching
         if let Some(ref root) = self.workspace_root.clone() {
             self.save_session_for_workspace(root);

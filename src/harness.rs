@@ -11419,12 +11419,19 @@ mod no_arg_gui_launch_first_frame_mod {
     /// this crate's own tests can't reuse directly -- that one lives in the
     /// separate `vimcode` bin target, which links `vimcode_core` as an
     /// ordinary dependency.
+    ///
+    /// `contains`, not an exact match: on the `px` (GUI) `UnitProfile` the
+    /// sidebar's left border column paints flush against the first row's
+    /// content with no space cell between them, so `inventory()`'s
+    /// space-delimited run grouping glues the border glyph and the
+    /// chevron into one run (e.g. `"│▾"`) rather than isolating the
+    /// chevron on its own -- an exact-equality check would miss it.
     fn explorer_tree_chevron_painted<D: ConformanceDriver>(driver: &D) -> bool {
         driver.inventory().text_runs().iter().any(|r| {
-            r.text == TREE_CHEVRON_DOWN.nerd
-                || r.text == TREE_CHEVRON_DOWN.fallback
-                || r.text == TREE_CHEVRON_RIGHT.nerd
-                || r.text == TREE_CHEVRON_RIGHT.fallback
+            r.text.contains(TREE_CHEVRON_DOWN.nerd)
+                || r.text.contains(TREE_CHEVRON_DOWN.fallback)
+                || r.text.contains(TREE_CHEVRON_RIGHT.nerd)
+                || r.text.contains(TREE_CHEVRON_RIGHT.fallback)
         })
     }
 
@@ -11470,6 +11477,57 @@ mod no_arg_gui_launch_first_frame_mod {
             !explorer_tree_chevron_painted(&driver),
             "a no-arg GUI launch must start with the Explorer collapsed on \
              its very first painted frame, before any event dispatches; \
+             screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// Positive control for the scenario above's own oracle: on this exact
+    /// `UnitProfile::px()` + `TuiBackend` pairing, with no event
+    /// dispatched, a launch whose `shell_config()` is *not* gated hidden
+    /// must paint the Explorer tree's chevrons on the very first frame.
+    /// Without this, the no-arg scenario's `!explorer_tree_chevron_
+    /// painted` assertion above could pass vacuously if this exact
+    /// construction path never painted a chevron at all, regardless of
+    /// sidebar visibility.
+    ///
+    /// A plain `Engine::new_for_test()` is neither the no-workspace state
+    /// nor a file-argument launch, so `Engine::sidebar_forced_hidden_by_
+    /// launch` is `false` and `shell_config()` leaves `ShellConfig::new`'s
+    /// own default (visible) in place — no `startup_*` call needed to
+    /// prove the chevron oracle fires.
+    #[test]
+    fn a_launch_with_a_visible_sidebar_does_paint_the_explorer_on_the_first_frame() {
+        crate::core::session::suppress_disk_saves();
+        let _paint = crate::test_paint::PaintGuard::acquire();
+        let _cwd = crate::test_cwd::CwdReadGuard::acquire();
+
+        let engine = crate::core::Engine::new_for_test();
+        let backend: Rc<RefCell<Box<dyn quadraui::Backend>>> =
+            Rc::new(RefCell::new(Box::new(TuiBackend::new())));
+        let app = App::new_headless_with_backend(
+            Rc::new(RefCell::new(engine)),
+            backend,
+            UnitProfile::px(),
+        );
+        let config = app.shell_config();
+        assert!(
+            config.sidebar_visible,
+            "precondition: shell_config() must leave ShellConfig's own \
+             default (visible) in place for a launch that isn't one of \
+             the two forced-hidden kinds"
+        );
+        let mut driver = driver_with_shell(app, config, 100, 30);
+
+        // No `UiEvent` dispatched -- deliberately the very first frame.
+        driver.render();
+
+        assert!(
+            explorer_tree_chevron_painted(&driver),
+            "a launch whose seeded sidebar is visible must paint the \
+             Explorer tree's chevrons on its very first frame, proving \
+             the oracle the scenario above's negative assertion relies \
+             on is actually live on this construction path; \
              screen:\n{}",
             driver.screen()
         );

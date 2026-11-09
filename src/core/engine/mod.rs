@@ -3456,17 +3456,16 @@ pub struct Engine {
     /// regardless of
     /// `session.explorer_visible`/`settings.explorer_visible_on_startup`.
     ///
-    /// Set once in [`Engine::startup_inner`] and never cleared — unlike
-    /// `workspace_root`, this does not need to track the engine's *current*
-    /// state, only the one-shot launch condition. `App::shell_config()`
-    /// only ever reads it once, through `sidebar_forced_hidden_by_launch`,
-    /// right after construction and before the runner's first frame; every
-    /// later sidebar change — the user's `<C-b>` toggle, `:Explorer`,
-    /// autohide, or a caller re-opening a sidebar panel on `self.app_shell`
-    /// directly — is read straight off `self.app_shell.sidebar_visible()`
-    /// at that point (see `shell_config()`'s own doc), not re-derived from
-    /// this flag, so leaving it set for the rest of the session does not
-    /// pin the sidebar hidden once something opens it.
+    /// Set once in [`Engine::startup_inner`], and cleared the moment that
+    /// one-shot launch-time force is consumed by an explicit sidebar
+    /// action — [`Engine::toggle_sidebar`], [`Engine::toggle_sidebar_
+    /// panel`], [`Engine::focus_sidebar_panel`], or [`Engine::open_
+    /// folder`] (which [`Engine::open_recent_workspace`] routes through).
+    /// Left set, this would re-derive `false` forever on every later
+    /// `sync_app_shell_sidebar_visibility()` call, pinning the Explorer
+    /// hidden even after one of those callers explicitly reopened it —
+    /// clearing it there keeps a stale one-shot launch condition from
+    /// outliving the launch it described.
     file_argument_startup: bool,
     /// Snapshot of user settings before any workspace/folder overlay was applied.
     /// Set when entering a workspace, restored when leaving. `None` if no overlay active.
@@ -6283,7 +6282,8 @@ impl Engine {
                 // pushes that onto the shadow `app_shell` immediately, and
                 // `App::shell_config()` reads the same formula to seed the
                 // real runner before its first frame — see that field's own
-                // doc for why leaving the flag set afterward is harmless.
+                // doc for where it gets cleared again once an explicit
+                // sidebar action consumes the force.
                 self.file_argument_startup = true;
                 self.sync_app_shell_sidebar_visibility();
             }

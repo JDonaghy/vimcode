@@ -633,6 +633,7 @@ mod portable_entry_point_tests {
 
         // No-workspace startup: forced hidden regardless of the setting.
         let mut no_workspace_engine = Engine::new_for_test();
+        no_workspace_engine.settings.swap_file = false;
         no_workspace_engine.settings.explorer_visible_on_startup = true;
         no_workspace_engine.startup_into_no_workspace_for_test();
         let app = App::new_headless_with_backend(
@@ -651,7 +652,12 @@ mod portable_entry_point_tests {
         // calls `std::env::set_current_dir` — a process-wide write that
         // must be excluded from every concurrent harness paint (see
         // `test_cwd`'s module doc), so the directory scenario below runs
-        // under an exclusive `CwdGuard`.
+        // under an exclusive `CwdGuard`. `suppress_disk_saves` keeps
+        // `session.add_recent_workspace` (called from `open_folder`) out of
+        // the real `~/.config/vimcode/session.json`, and `swap_file = false`
+        // on every fixture engine below keeps `open_file_with_mode` from
+        // writing a real swap file into the scratch dir.
+        crate::core::session::suppress_disk_saves();
         let _cwd = crate::test_cwd::CwdGuard::new();
         let dir = crate::harness::scratch_dir("vimcode_shell_config_sidebar_startup_2149");
         std::fs::create_dir_all(&dir)
@@ -661,6 +667,7 @@ mod portable_entry_point_tests {
 
         // File-argument startup: forced hidden regardless of the setting.
         let mut file_engine = Engine::new_for_test();
+        file_engine.settings.swap_file = false;
         file_engine.settings.explorer_visible_on_startup = true;
         file_engine.startup_without_session_restore(Some(&file_path));
         let app = App::new_headless_with_backend(
@@ -680,6 +687,7 @@ mod portable_entry_point_tests {
         // regardless of `explorer_visible_on_startup`, left at its
         // engine-default `false` here specifically to prove that.
         let mut dir_engine = Engine::new_for_test();
+        dir_engine.settings.swap_file = false;
         dir_engine.startup_without_session_restore(Some(&dir));
         let app = App::new_headless_with_backend(
             Rc::new(RefCell::new(dir_engine)),
@@ -691,8 +699,7 @@ mod portable_entry_point_tests {
             "shell_config() must not force a directory-argument launch's \
              sidebar hidden, even with explorer_visible_on_startup at its \
              own false default — it must keep ShellConfig's own default \
-             (visible) exactly as before shell_config() ever touched \
-             sidebar_visible at all"
+             (visible) in place"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

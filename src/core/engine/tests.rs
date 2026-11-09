@@ -775,6 +775,93 @@ fn startup_inner_bare_launch_does_not_touch_sidebar_visibility() {
     );
 }
 
+/// `startup_inner`'s file-argument branch (`file_path: Some(path)`, `path`
+/// not a directory) must collapse the shadow `app_shell`'s sidebar —
+/// matching `nvim <file>` / `code <file>` — even when
+/// `explorer_visible_on_startup` would otherwise derive it visible.
+/// Pinned directly against `Engine::startup_inner`'s own outcome, the
+/// counterpart to [`startup_inner_bare_launch_does_not_touch_sidebar_
+/// visibility`] above for the file-argument case.
+#[test]
+fn startup_inner_file_argument_collapses_sidebar() {
+    let dir = test_temp_path("vimcode_file_argument_startup_sidebar_ws");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("scratch.txt");
+    std::fs::write(&file, "x").unwrap();
+
+    let mut engine = Engine::new_for_test();
+    engine.cwd = dir.clone();
+    engine.settings.swap_file = false;
+    engine.settings.autohide_panels = false;
+    engine.settings.explorer_visible_on_startup = true;
+    engine.session.explorer_visible = false;
+    engine.sync_app_shell_sidebar_visibility();
+    assert!(
+        engine.app_shell.sidebar_visible(),
+        "sanity: the forced settings above must already derive a visible \
+         sidebar"
+    );
+
+    engine.startup_without_session_restore(Some(&file));
+
+    assert!(
+        !engine.app_shell.sidebar_visible(),
+        "a file-argument launch must collapse the shadow app_shell's \
+         sidebar regardless of explorer_visible_on_startup/session.\
+         explorer_visible"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A file-argument launch's forced-collapsed sidebar
+/// ([`startup_inner_file_argument_collapses_sidebar`] above) must not pin
+/// the Explorer hidden for the rest of the session: opening a different
+/// workspace afterward — the same path `Engine::open_recent_workspace`
+/// takes from the welcome panel's recent-workspace list, or File ▸ Open
+/// Recent — must re-derive and show the sidebar normally, not stay
+/// collapsed because of a stale launch-time condition.
+#[test]
+fn open_recent_workspace_after_a_file_argument_launch_shows_the_sidebar() {
+    let _cwd = crate::test_cwd::CwdGuard::new();
+    crate::core::session::suppress_disk_saves();
+
+    let launch_dir = test_temp_path("vimcode_file_arg_then_recent_ws_launch");
+    std::fs::create_dir_all(&launch_dir).unwrap();
+    let launch_file = launch_dir.join("scratch.txt");
+    std::fs::write(&launch_file, "x").unwrap();
+
+    let other_dir = test_temp_path("vimcode_file_arg_then_recent_ws_other");
+    std::fs::create_dir_all(&other_dir).unwrap();
+
+    let mut engine = Engine::new_for_test();
+    engine.cwd = launch_dir.clone();
+    engine.settings.swap_file = false;
+    engine.startup_without_session_restore(Some(&launch_file));
+    assert!(
+        !engine.app_shell.sidebar_visible(),
+        "precondition: the file-argument launch above must collapse the \
+         sidebar"
+    );
+
+    engine.open_recent_workspace(&other_dir);
+
+    assert!(
+        engine.app_shell.sidebar_visible(),
+        "opening a recent workspace after a file-argument launch must \
+         show the Explorer, not leave it collapsed because of the \
+         earlier launch's now-stale force"
+    );
+    assert!(
+        engine.explorer_has_focus,
+        "open_recent_workspace must be able to give the now-visible \
+         Explorer keyboard focus"
+    );
+
+    let _ = std::fs::remove_dir_all(&launch_dir);
+    let _ = std::fs::remove_dir_all(&other_dir);
+}
+
 /// A relative file argument that escapes a repo-less launch `cwd`
 /// (`vimcode ../notes/todo.txt` started from a directory with no git repo
 /// above it) must run `adopt_cwd_for_startup_file`'s repoint tail in full:

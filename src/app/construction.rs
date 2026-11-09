@@ -751,33 +751,46 @@ impl App {
         // Seed the runner's *real* `AppShell` sidebar bit from the shadow
         // `app_shell`'s own current `sidebar_visible()`, but only for the
         // two launch kinds `Engine::sidebar_forced_hidden_by_launch` names
-        // (no-workspace, file-argument) — before `quadraui::ShellConfig::
-        // with_sidebar_visible` existed, `ShellConfig::new`'s own
-        // `sidebar_visible: true` default always won the first frame
-        // regardless of engine state, and the runner only picked up the
-        // shadow's actual verdict once a `UiEvent` had dispatched
-        // (`sync_runner_sidebar_visibility`,
-        // `src/render/menu_and_chrome_routing.rs`), so both launches
-        // painted an uncollapsed Explorer on frame 1.
+        // (no-workspace, file-argument) — `quadraui::ShellConfig::new`'s
+        // own `sidebar_visible: true` default would otherwise always win
+        // the first frame regardless of engine state, and the runner
+        // would only pick up the shadow's actual verdict once a
+        // `UiEvent` had dispatched (`sync_runner_sidebar_visibility`,
+        // `src/render/menu_and_chrome_routing.rs`), painting an
+        // uncollapsed Explorer on frame 1 for both launches.
         //
-        // Reads the shadow's *current* bit rather than hardcoding `false`
-        // so a caller that explicitly re-opens the sidebar on `app_shell`
-        // after one of these two launches (a test fixture pinning a
-        // sidebar panel to check a startup-time auto-reveal, same as
-        // production code would via `toggle_sidebar`/`show_panel`) is
-        // respected, not silently overridden back to hidden.
+        // Reads the shadow's *current* bit rather than hardcoding
+        // `false` so a caller that explicitly re-opens the sidebar on
+        // `app_shell` after one of these two launches (a test fixture
+        // pinning a sidebar panel to check a startup-time auto-reveal,
+        // same as production code would via `toggle_sidebar`/
+        // `show_panel`) is respected, not silently overridden back to
+        // hidden.
         //
         // Deliberately *not* a general, ungated "always match the
         // shadow's current `sidebar_visible()`" seed: every other launch
         // (a directory argument, or a test fixture that never ran either
-        // forced-hidden startup path) keeps today's behaviour of leaving
-        // `ShellConfig`'s own default in place, exactly as before this
-        // method ever touched `sidebar_visible` at all — see
-        // `Engine::sidebar_forced_hidden_by_launch`'s own doc for why a
-        // plain `Engine::new_for_test()` fixture's own construction-time
-        // sync (zero-value settings) must not leak into this seed.
+        // forced-hidden startup path) keeps `ShellConfig`'s own default
+        // in place. A directory launch whose settings/session genuinely
+        // derive the sidebar hidden (`autohide_panels`, or
+        // `explorer_visible_on_startup`/`session.explorer_visible` both
+        // false) still shows an uncollapsed Explorer on this one frame,
+        // the same frame-1 flash this method exists to remove — just not
+        // covered here. Widening the seed to every launch would fix that
+        // too, but a directory launch's shadow `app_shell` is not
+        // guaranteed to already equal `Engine::derived_sidebar_visible()`
+        // the way the two forced-hidden kinds are (`Engine::open_folder`
+        // never calls `sync_app_shell_sidebar_visibility`, by its own
+        // doc), so a large number of existing TUI-harness test fixtures
+        // across the codebase set `session.explorer_visible`/open a panel
+        // directly on `app_shell` without re-syncing it and rely on
+        // `ShellConfig`'s always-visible default to paint anyway —
+        // widening this seed unconditionally would need auditing and
+        // fixing all of those fixtures too, out of scope here. Tracked as
+        // a deliberate follow-up rather than done in this pass.
         if self.engine.borrow().sidebar_forced_hidden_by_launch() {
-            cfg = cfg.with_sidebar_visible(self.engine.borrow().app_shell.sidebar_visible());
+            let sidebar_visible = self.engine.borrow().app_shell.sidebar_visible();
+            cfg = cfg.with_sidebar_visible(sidebar_visible);
         }
         cfg
     }

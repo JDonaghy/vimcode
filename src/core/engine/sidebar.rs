@@ -19,10 +19,10 @@ impl Engine {
     /// Always `false` in the no-workspace state
     /// ([`Engine::has_no_workspace`]) and on a file-argument launch
     /// (`self.file_argument_startup`, matching `nvim <file>` / `code
-    /// <file>` — see that field's own doc): there is either no workspace
-    /// tree to show, or the launch named one specific file to edit,
-    /// regardless of what `autohide_panels`/`explorer_visible_on_startup`
-    /// otherwise say.
+    /// <file>` — see that field's own doc, including where it gets
+    /// cleared again): there is either no workspace tree to show, or the
+    /// launch named one specific file to edit, regardless of what
+    /// `autohide_panels`/`explorer_visible_on_startup` otherwise say.
     pub fn derived_sidebar_visible(&self) -> bool {
         if self.has_no_workspace() || self.settings.autohide_panels || self.file_argument_startup {
             false
@@ -267,6 +267,11 @@ impl Engine {
     /// sidebar is already visible, hide it. Otherwise switch to the panel and
     /// show the sidebar. Focus flags are set/cleared automatically.
     pub fn toggle_sidebar_panel(&mut self, panel_id: &str) {
+        // An explicit sidebar action consumes any one-shot launch-time
+        // force still pinning the Explorer hidden — see
+        // `file_argument_startup`'s own doc for why leaving it set here
+        // would re-hide whatever this call just did.
+        self.file_argument_startup = false;
         let same = self
             .app_shell
             .active_panel_id()
@@ -298,6 +303,8 @@ impl Engine {
     /// Show a sidebar panel and give it focus (no toggle). Used for programmatic
     /// reveals like DAP session start.
     pub fn focus_sidebar_panel(&mut self, panel_id: &str) {
+        // See the matching comment in `toggle_sidebar_panel`.
+        self.file_argument_startup = false;
         self.app_shell
             .show_panel(&quadraui::WidgetId::new(panel_id));
         self.clear_sidebar_focus();
@@ -415,6 +422,8 @@ impl Engine {
 
     /// Toggle sidebar visibility without changing the active panel.
     pub fn toggle_sidebar(&mut self) {
+        // See the matching comment in `toggle_sidebar_panel`.
+        self.file_argument_startup = false;
         self.app_shell.toggle_sidebar();
         if !self.app_shell.sidebar_visible() {
             self.clear_sidebar_focus();
