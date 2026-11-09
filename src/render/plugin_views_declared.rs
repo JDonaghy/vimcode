@@ -135,17 +135,16 @@ pub fn plugin_view_to_form_with_combo_edit(
 /// quadraui 0.9's `FieldKind::ButtonRow`/`ToggleGroup` carry no per-item
 /// focus field of their own — unlike `FieldKind::Toolbar`'s
 /// `Toolbar::focused_index`, which a host sets and the primitive's own
-/// paint path renders with a distinct highlight; filed upstream
-/// (`JDonaghy/quadraui`) as the native equivalent these two field kinds
-/// are missing. Until that lands, the sub-focused item's own
-/// [`quadraui::ButtonRowItem::label`] / [`quadraui::ToggleGroupItem::label`]
-/// is wrapped in `‹` `›` here instead: plain text every backend's existing
-/// `ButtonRow`/`ToggleGroup` paint path already draws verbatim, so the
-/// highlight needs no new backend-specific rendering code to show up on
-/// every one of them identically. `‹…›` rather than `[…]`: a `buttons`
-/// row's own `ButtonRowItem` already paints bracket chrome around every
-/// item's label regardless of focus, so `[…]` here would nest into an
-/// ambiguous `[[Label]]` instead of standing out.
+/// paint path renders with a distinct highlight. Rather than adding one
+/// (a quadraui-side change this file can't make), the sub-focused item's
+/// own [`quadraui::ButtonRowItem::label`] / [`quadraui::ToggleGroupItem::
+/// label`] is wrapped in `‹` `›` here instead: plain text every backend's
+/// existing `ButtonRow`/`ToggleGroup` paint path already draws verbatim,
+/// so the highlight needs no new backend-specific rendering code to show
+/// up on every one of them identically. `‹…›` rather than `[…]`: a
+/// `buttons` row's own `ButtonRowItem` already paints bracket chrome
+/// around every item's label regardless of focus, so `[…]` here would
+/// nest into an ambiguous `[[Label]]` instead of standing out.
 #[allow(clippy::too_many_arguments)]
 pub fn plugin_view_to_form_with_row_focus(
     view_name: &str,

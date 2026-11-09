@@ -1168,10 +1168,9 @@ field-level focus:
   can see which one `Enter`/`Space` will activate. quadraui 0.9's
   `FieldKind::ButtonRow`/`ToggleGroup` have no native per-item focus
   highlight of their own (unlike `FieldKind::Toolbar`'s `focused_index`,
-  which does) — filed upstream (`JDonaghy/quadraui`) as the gap; `‹…›` is a
-  label-text stand-in until that lands, deliberately distinct from the
-  `[ label ]` bracket chrome a styled button already paints, so the two
-  don't nest into an ambiguous `[[Label]]`.
+  which does); `‹…›` is a label-text stand-in for that, deliberately
+  distinct from the `[ label ]` bracket chrome a styled button already
+  paints, so the two don't nest into an ambiguous `[[Label]]`.
 
 **Layout (`label_position`/`label_align`/`label_width`/`control_width`/
 `min_control_width`).** By default every field's label sits to the left of a
