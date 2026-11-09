@@ -5435,6 +5435,8 @@ mod tests {
             "/tests/fixtures/fake_acp_agent.sh"
         );
         let mut engine = Engine::new_for_test();
+        engine.cwd = std::env::temp_dir();
+        engine.workspace_root = Some(std::env::temp_dir());
         engine.settings.acp_agents = vec![crate::core::acp::AcpAgentProfile {
             name: "claude".to_string(),
             command: format!("sh \"{fixture}\""),
@@ -6850,6 +6852,8 @@ mod tests {
             "/tests/fixtures/fake_acp_agent.sh"
         );
         let mut engine = Engine::new_for_test();
+        engine.cwd = std::env::temp_dir();
+        engine.workspace_root = Some(std::env::temp_dir());
         engine.settings.acp_agents = vec![crate::core::acp::AcpAgentProfile {
             name: "claude".to_string(),
             command: format!("sh \"{fixture}\""),
@@ -6978,6 +6982,13 @@ mod tests {
     /// and cannot be used for a scenario that needs to spawn twice (once
     /// for the original session, once more for the resumed one, since
     /// `:AiClear` kills the first subprocess).
+    ///
+    /// The profile's `cwd` is empty, so the agent spawns in
+    /// `acp_workspace_cwd()` — `workspace_root`, else `cwd`, both of which
+    /// `Engine::new_for_test` seeds from the process working directory. A
+    /// concurrent CWD-writer test can leave that pointing at a temp dir it
+    /// later deletes, making the spawn fail with ENOENT, so both are pinned
+    /// to `temp_dir()` here.
     #[cfg(unix)]
     fn engine_with_registered_fixture_agent(extra_env: &[(&str, &str)]) -> Engine {
         let fixture = concat!(
@@ -6985,6 +6996,8 @@ mod tests {
             "/tests/fixtures/fake_acp_agent.sh"
         );
         let mut engine = Engine::new_for_test();
+        engine.cwd = std::env::temp_dir();
+        engine.workspace_root = Some(std::env::temp_dir());
         engine.settings.acp_agents = vec![crate::core::acp::AcpAgentProfile {
             name: "claude".to_string(),
             command: format!("sh \"{fixture}\""),
