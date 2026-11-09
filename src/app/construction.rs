@@ -748,6 +748,37 @@ impl App {
             .with_status_bar_under_main_column()
             .with_command_line()
             .with_status_bar();
+        // Seed the runner's *real* `AppShell` sidebar bit from the shadow
+        // `app_shell`'s own current `sidebar_visible()`, but only for the
+        // two launch kinds `Engine::sidebar_forced_hidden_by_launch` names
+        // (no-workspace, file-argument) — before `quadraui::ShellConfig::
+        // with_sidebar_visible` existed, `ShellConfig::new`'s own
+        // `sidebar_visible: true` default always won the first frame
+        // regardless of engine state, and the runner only picked up the
+        // shadow's actual verdict once a `UiEvent` had dispatched
+        // (`sync_runner_sidebar_visibility`,
+        // `src/render/menu_and_chrome_routing.rs`), so both launches
+        // painted an uncollapsed Explorer on frame 1.
+        //
+        // Reads the shadow's *current* bit rather than hardcoding `false`
+        // so a caller that explicitly re-opens the sidebar on `app_shell`
+        // after one of these two launches (a test fixture pinning a
+        // sidebar panel to check a startup-time auto-reveal, same as
+        // production code would via `toggle_sidebar`/`show_panel`) is
+        // respected, not silently overridden back to hidden.
+        //
+        // Deliberately *not* a general, ungated "always match the
+        // shadow's current `sidebar_visible()`" seed: every other launch
+        // (a directory argument, or a test fixture that never ran either
+        // forced-hidden startup path) keeps today's behaviour of leaving
+        // `ShellConfig`'s own default in place, exactly as before this
+        // method ever touched `sidebar_visible` at all — see
+        // `Engine::sidebar_forced_hidden_by_launch`'s own doc for why a
+        // plain `Engine::new_for_test()` fixture's own construction-time
+        // sync (zero-value settings) must not leak into this seed.
+        if self.engine.borrow().sidebar_forced_hidden_by_launch() {
+            cfg = cfg.with_sidebar_visible(self.engine.borrow().app_shell.sidebar_visible());
+        }
         cfg
     }
 

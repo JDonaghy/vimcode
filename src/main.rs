@@ -658,9 +658,7 @@ mod file_argument_launch_tests {
     ///
     /// The "explorer starts collapsed when a file argument is given" half
     /// of this same requirement is covered separately by
-    /// [`file_argument_on_launch_collapses_explorer`] below, which is
-    /// `#[ignore]`d pending a quadraui capability this crate's published
-    /// version doesn't have yet — see that test's doc.
+    /// [`file_argument_on_launch_collapses_explorer`] below.
     #[test]
     fn file_argument_opens_relative_and_absolute_paths_bare_launch_keeps_default() {
         // This bin's own `#[cfg(test)]` module links `vimcode_core` as an
@@ -769,27 +767,14 @@ mod file_argument_launch_tests {
     /// the ambient `explorer_visible_on_startup` setting would otherwise
     /// display.
     ///
-    /// `#[ignore]`d: blocked on quadraui. `Engine::startup_inner` does not
-    /// touch its own shadow `app_shell`'s sidebar bit on a file-argument
-    /// launch either, because doing so would only ever reach the real,
-    /// painting runner `AppShell` via `sync_runner_sidebar_visibility`
-    /// (`src/render/menu_and_chrome_routing.rs`), which itself only runs
-    /// from inside `ShellApp::handle`/`on_shell_event_ctx` — both reachable
-    /// only once a `UiEvent` has already dispatched through a live
-    /// `ShellContext`. The very first frame renders before any event
-    /// dispatches (`quadraui::tui::run::run_with`'s loop calls `app.setup()`
-    /// once, then paints, before ever calling `app.handle()`), and
-    /// `quadraui::compose::app_shell::AppShell::new` hardcodes
-    /// `sidebar_visible: true` with no builder or `ShellConfig` field to
-    /// seed a different initial value — confirmed absent in both the
-    /// published 0.6.1 this crate depends on and the newer 0.7.0. There is
-    /// currently no quadraui-published mechanism for an app to seed the
-    /// real `AppShell`'s initial chrome state before its first paint, so
-    /// flipping the shadow alone would only desync it further from the
-    /// runner without changing anything the user sees.
+    /// `Engine::startup_inner`'s file branch sets `file_argument_startup`
+    /// and syncs the shadow `app_shell` before this test's driver is even
+    /// built; `App::shell_config()` reads the same
+    /// `Engine::derived_sidebar_visible` formula via
+    /// `quadraui::ShellConfig::with_sidebar_visible`, so the real, painting
+    /// runner `AppShell` already starts collapsed on frame 1 — no dispatched
+    /// `UiEvent` is needed to pick it up.
     #[test]
-    #[ignore = "blocked on quadraui: AppShell::new has no way to seed \
-                initial sidebar visibility before the first render"]
     fn file_argument_on_launch_collapses_explorer() {
         vimcode_core::core::session::suppress_disk_saves();
 

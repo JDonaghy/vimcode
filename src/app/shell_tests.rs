@@ -598,4 +598,103 @@ mod portable_entry_point_tests {
              every ~250ms idle tick with several tabs open"
         );
     }
+
+    /// [`App::shell_config`] must seed
+    /// `quadraui::ShellConfig::with_sidebar_visible(false)` for the two
+    /// launch kinds [`crate::core::Engine::sidebar_forced_hidden_by_launch`]
+    /// names — no-workspace and file-argument — so the real, painting
+    /// runner's sidebar bit already starts hidden on frame 1, before
+    /// `sync_runner_sidebar_visibility` ever gets a `UiEvent` to run from.
+    /// `explorer_visible_on_startup` is pinned `true` on both to prove the
+    /// force wins over the setting, not merely that the setting happens to
+    /// agree.
+    ///
+    /// A directory-argument launch must instead keep today's behaviour of
+    /// leaving `ShellConfig`'s own default (visible) in place regardless
+    /// of settings — `shell_config()` deliberately never reads
+    /// `derived_sidebar_visible()`'s full settings/session formula, only
+    /// the narrower by-launch-kind force, so it cannot override a test
+    /// fixture (or any other engine mutator) that opened or hid a sidebar
+    /// panel on the shadow `app_shell` directly before `shell_config()`
+    /// ever ran. `explorer_visible_on_startup` is left `false` (the
+    /// engine's own default) on this third case specifically to prove that
+    /// point: the runner still starts visible even though the setting
+    /// alone would derive `false`.
+    ///
+    /// Backend-neutral (`TuiBackend`, no `gui` feature needed) — the
+    /// formula lives in `core::engine::sidebar`, not in any backend.
+    #[test]
+    fn shell_config_seeds_sidebar_hidden_only_for_the_forced_launch_kinds() {
+        fn tui_backend() -> Rc<RefCell<Box<dyn quadraui::Backend>>> {
+            Rc::new(RefCell::new(
+                Box::new(quadraui::tui::TuiBackend::new()) as Box<dyn quadraui::Backend>
+            ))
+        }
+
+        // No-workspace startup: forced hidden regardless of the setting.
+        let mut no_workspace_engine = Engine::new_for_test();
+        no_workspace_engine.settings.explorer_visible_on_startup = true;
+        no_workspace_engine.startup_into_no_workspace_for_test();
+        let app = App::new_headless_with_backend(
+            Rc::new(RefCell::new(no_workspace_engine)),
+            tui_backend(),
+            render::UnitProfile::px(),
+        );
+        assert!(
+            !app.shell_config().sidebar_visible,
+            "shell_config() must seed a hidden sidebar for the \
+             no-workspace state even when explorer_visible_on_startup \
+             is true"
+        );
+
+        // A directory argument routes through `Engine::open_folder`, which
+        // calls `std::env::set_current_dir` — a process-wide write that
+        // must be excluded from every concurrent harness paint (see
+        // `test_cwd`'s module doc), so the directory scenario below runs
+        // under an exclusive `CwdGuard`.
+        let _cwd = crate::test_cwd::CwdGuard::new();
+        let dir = crate::harness::scratch_dir("vimcode_shell_config_sidebar_startup_2149");
+        std::fs::create_dir_all(&dir)
+            .expect("test must be able to create its own scratch directory");
+        let file_path = dir.join("scratch.txt");
+        std::fs::write(&file_path, "x").expect("test must be able to write its scratch file");
+
+        // File-argument startup: forced hidden regardless of the setting.
+        let mut file_engine = Engine::new_for_test();
+        file_engine.settings.explorer_visible_on_startup = true;
+        file_engine.startup_without_session_restore(Some(&file_path));
+        let app = App::new_headless_with_backend(
+            Rc::new(RefCell::new(file_engine)),
+            tui_backend(),
+            render::UnitProfile::px(),
+        );
+        assert!(
+            !app.shell_config().sidebar_visible,
+            "shell_config() must seed a hidden sidebar for a \
+             file-argument launch even when explorer_visible_on_startup \
+             is true"
+        );
+
+        // Directory-argument startup: not a forced-hidden launch kind, so
+        // the runner keeps `ShellConfig`'s own default (visible) —
+        // regardless of `explorer_visible_on_startup`, left at its
+        // engine-default `false` here specifically to prove that.
+        let mut dir_engine = Engine::new_for_test();
+        dir_engine.startup_without_session_restore(Some(&dir));
+        let app = App::new_headless_with_backend(
+            Rc::new(RefCell::new(dir_engine)),
+            tui_backend(),
+            render::UnitProfile::px(),
+        );
+        assert!(
+            app.shell_config().sidebar_visible,
+            "shell_config() must not force a directory-argument launch's \
+             sidebar hidden, even with explorer_visible_on_startup at its \
+             own false default — it must keep ShellConfig's own default \
+             (visible) exactly as before shell_config() ever touched \
+             sidebar_visible at all"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

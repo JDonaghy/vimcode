@@ -3449,6 +3449,25 @@ pub struct Engine {
     /// `Engine::open_branch_review`'s own "no workspace open" error already
     /// treats this sentinel the same way.
     pub workspace_root: Option<PathBuf>,
+    /// `true` for a launch naming a *file* path (not a directory) on the
+    /// command line. Read by [`Engine::derived_sidebar_visible`] (via
+    /// [`Engine::sidebar_forced_hidden_by_launch`]) to force the Explorer
+    /// collapsed on that launch, matching `nvim <file>` / `code <file>`,
+    /// regardless of
+    /// `session.explorer_visible`/`settings.explorer_visible_on_startup`.
+    ///
+    /// Set once in [`Engine::startup_inner`] and never cleared — unlike
+    /// `workspace_root`, this does not need to track the engine's *current*
+    /// state, only the one-shot launch condition. `App::shell_config()`
+    /// only ever reads it once, through `sidebar_forced_hidden_by_launch`,
+    /// right after construction and before the runner's first frame; every
+    /// later sidebar change — the user's `<C-b>` toggle, `:Explorer`,
+    /// autohide, or a caller re-opening a sidebar panel on `self.app_shell`
+    /// directly — is read straight off `self.app_shell.sidebar_visible()`
+    /// at that point (see `shell_config()`'s own doc), not re-derived from
+    /// this flag, so leaving it set for the rest of the session does not
+    /// pin the sidebar hidden once something opens it.
+    file_argument_startup: bool,
     /// Snapshot of user settings before any workspace/folder overlay was applied.
     /// Set when entering a workspace, restored when leaving. `None` if no overlay active.
     pub base_settings: Option<Box<Settings>>,
@@ -5533,6 +5552,7 @@ impl Engine {
             confirm_sub: None,
             workspace_file: None,
             workspace_root: Some(cwd.clone()),
+            file_argument_startup: false,
             base_settings: None,
             explorer_has_focus: false,
             search_has_focus: false,
@@ -6253,22 +6273,19 @@ impl Engine {
             } else {
                 self.adopt_cwd_for_startup_file(path);
                 let _ = self.open_file_with_mode(path, OpenMode::Permanent);
-                // A launch argument names one specific file to edit, so
-                // ideally the explorer side panel would start collapsed
-                // (matching `nvim <file>` / `code <file>`) rather than
-                // showing whatever the ambient `explorer_visible_on_startup`
-                // setting would otherwise display. There is currently no
-                // quadraui-published mechanism for seeding the real,
-                // painting `AppShell`'s initial sidebar visibility before
-                // its first render (`AppShell::new` hardcodes
-                // `sidebar_visible: true`), and flipping only this engine's
-                // *shadow* `app_shell` here would desync it from the
-                // runner's own copy until the next dispatched `UiEvent` —
-                // including inverting the very first `<C-b>` press
-                // (`Engine::toggle_sidebar` would see the two already
-                // "agreeing" and no-op). So this stays unimplemented until
-                // that quadraui gap closes; see `src/main.rs`'s
-                // `file_argument_on_launch_collapses_explorer` test.
+                // A launch argument names one specific file to edit, so the
+                // explorer side panel starts collapsed (matching `nvim
+                // <file>` / `code <file>`) rather than showing whatever the
+                // ambient `explorer_visible_on_startup` setting would
+                // otherwise display. `file_argument_startup` makes
+                // `derived_sidebar_visible` return `false` for this launch;
+                // the `sync_app_shell_sidebar_visibility()` call below
+                // pushes that onto the shadow `app_shell` immediately, and
+                // `App::shell_config()` reads the same formula to seed the
+                // real runner before its first frame — see that field's own
+                // doc for why leaving the flag set afterward is harmless.
+                self.file_argument_startup = true;
+                self.sync_app_shell_sidebar_visibility();
             }
         } else if restore_session {
             self.restore_session_files();

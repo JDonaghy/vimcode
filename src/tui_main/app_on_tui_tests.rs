@@ -5956,9 +5956,18 @@ mod tests {
             engine.startup_without_session_restore(Some(&sample));
             engine.explorer_expanded.insert(dir.clone());
             engine.explorer_rebuild_rows();
-            // See the double-click test above: `app_shell.show_panel` was
-            // confirmed a no-op in this harness and is deliberately not
-            // called here either.
+            // A file-argument `startup_without_session_restore` call
+            // forces the shadow `app_shell`'s sidebar collapsed
+            // (`Engine::sidebar_forced_hidden_by_launch`), which
+            // `App::shell_config` seeds onto the runner before frame 1 —
+            // unlike the double-click test above (which opens its file via
+            // `open_file_in_tab`, not a startup path, so the force never
+            // applies there), this fixture needs the explicit `show_panel`
+            // to make the Explorer paint before this test's first
+            // `driver.find`.
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_EXPLORER,
+            ));
             engine.session.explorer_visible = true;
             let active_group = engine.active_group;
             let mut h = harness(engine);

@@ -4229,11 +4229,15 @@ mod tests {
         engine.startup_without_session_restore(Some(&sample));
         engine.explorer_expanded.insert(dir.clone());
         engine.explorer_rebuild_rows();
-        // `app_shell.show_panel(...)` is not called here — confirmed a
-        // no-op in this harness (the runner-side `AppShell` the driver
-        // actually paints from is never synced from this *shadow* copy at
-        // startup; `collapse_sidebar`'s TUI-side doc traces the same gap).
-        // `session.explorer_visible` alone drives the painted sidebar.
+        // A file-argument `startup_without_session_restore` call forces
+        // the shadow `app_shell`'s sidebar collapsed
+        // (`Engine::sidebar_forced_hidden_by_launch`), which
+        // `App::shell_config` seeds onto the runner before frame 1, so
+        // `show_panel` is needed here to make the Explorer paint before
+        // this test's first `driver.find`.
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_EXPLORER,
+        ));
         engine.session.explorer_visible = true;
 
         let mut h = harness(engine, 800, 480);

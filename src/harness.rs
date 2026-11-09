@@ -3065,26 +3065,9 @@ pub(crate) fn assert_text_metrics_backend_applies_metrics<B: quadraui::Backend>(
 /// recorded next to it, not just its issue number, per that issue's own
 /// gate-labelling requirement.
 ///
-/// Currently holds one entry: the `_gtk` control arm of
-/// `core::engine::tests::test_startup_into_no_workspace_renders_empty_editor_with_explorer_collapsed`.
-/// See the comment immediately above the entry below for the root cause.
-pub(crate) const KNOWN_BUGS: &[&str] = &[
-    // category: quadraui (no hook in `quadraui::ShellApp`/`ShellAdapter`
-    // lets an app reconcile shell/sidebar state before the first rendered
-    // frame on a non-`cell` profile. `ShellAdapter::setup` takes no
-    // `ShellContext`; `ShellAdapter::render` and the `ShellApp::pre_render`
-    // it calls are both `&self`, so neither can reach
-    // `ShellAdapter::apply_requested_panel` — that method needs `&mut self`
-    // and is only ever called from `ShellAdapter::handle`, which requires a
-    // dispatched `UiEvent`. The real GTK runner never dispatches one
-    // between `setup()` and the first paint (painting is wired through
-    // `set_draw_func`, which calls `render()` directly), so GTK's `px`
-    // profile paints its default Explorer-at-index-0 sidebar on frame 0
-    // regardless of `Engine`'s collapsed-on-startup state. A quadraui issue
-    // requesting a frame-0 reconciliation hook on `ShellApp`/`ShellAdapter`
-    // must be filed) — target: quadraui.
-    "test_startup_into_no_workspace_renders_empty_editor_with_explorer_collapsed_gtk",
-];
+/// Empty: every scenario in this suite takes the plain `Pass`/`Regression`
+/// arms of [`GateOutcome`] — there is no bug this table needs to track.
+pub(crate) const KNOWN_BUGS: &[&str] = &[];
 
 /// A regression guard, not a "list stays empty forever" rule: an empty
 /// list and a list with a genuine, still-open entry (see the doc above
@@ -3096,9 +3079,10 @@ pub(crate) const KNOWN_BUGS: &[&str] = &[
 mod known_bugs_is_empty {
     #[test]
     fn known_bugs_has_the_expected_entries() {
+        let expected: &[&str] = &[];
         assert_eq!(
             super::KNOWN_BUGS,
-            &["test_startup_into_no_workspace_renders_empty_editor_with_explorer_collapsed_gtk"],
+            expected,
             "KNOWN_BUGS changed — update this test's expectation (and this \
              module's doc comment) alongside whatever PR added or removed \
              an entry: {:?}",
@@ -11392,5 +11376,102 @@ mod welcome_panel_recent_entry_restores_workspace_mod {
                 driver.inventory().text_runs()
             );
         },
+    }
+}
+
+// ── the real runner's first frame must start with the Explorer collapsed
+// on a no-arg GUI launch ─────────────────────────────────────────────────
+//
+// The `welcome_panel_*_mod` scenarios above drive a pre-built `Engine`
+// fixture (already past `startup_into_no_workspace_for_test`) through
+// `App::new_headless_with_backend`, which only proves the *shadow*
+// `app_shell`'s sidebar bit agrees with `Engine::derived_sidebar_visible`
+// -- not that the real, painting runner `AppShell` agrees too. Before
+// `App::shell_config()` seeded `quadraui::ShellConfig::with_sidebar_
+// visible`, the runner's own construction-time default (`sidebar_visible:
+// true`) always won the first frame regardless of what the shadow said,
+// and only caught up once a `UiEvent` dispatched through
+// `sync_runner_sidebar_visibility` (`src/render/menu_and_chrome_routing.rs`).
+// This scenario drives the real `App::build_portable_engine` (via
+// `App::new_portable_for_test`) + `App::shell_config()` construction path
+// end to end and renders exactly one frame with **no** event dispatched,
+// so it can only pass if `shell_config()` itself seeds the sidebar bit
+// correctly.
+
+#[cfg(test)]
+mod no_arg_gui_launch_first_frame_mod {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use quadraui::testing::ConformanceDriver;
+    use quadraui::tui::testing::driver_with_shell;
+    use quadraui::tui::TuiBackend;
+
+    use crate::app::App;
+    use crate::icons::{TREE_CHEVRON_DOWN, TREE_CHEVRON_RIGHT};
+    use crate::render::UnitProfile;
+
+    /// Whether the Explorer tree's own expand/collapse chevron is painted
+    /// anywhere on screen -- every directory row paints one of these
+    /// regardless of expansion state, so this is a reliable "is the tree
+    /// painted at all" oracle. Mirrors `src/main.rs`'s
+    /// `file_argument_launch_tests::explorer_tree_chevron_painted`, which
+    /// this crate's own tests can't reuse directly -- that one lives in the
+    /// separate `vimcode` bin target, which links `vimcode_core` as an
+    /// ordinary dependency.
+    fn explorer_tree_chevron_painted<D: ConformanceDriver>(driver: &D) -> bool {
+        driver.inventory().text_runs().iter().any(|r| {
+            r.text == TREE_CHEVRON_DOWN.nerd
+                || r.text == TREE_CHEVRON_DOWN.fallback
+                || r.text == TREE_CHEVRON_RIGHT.nerd
+                || r.text == TREE_CHEVRON_RIGHT.fallback
+        })
+    }
+
+    #[test]
+    fn no_arg_gui_launch_does_not_paint_the_explorer_on_the_first_frame() {
+        crate::core::session::suppress_disk_saves();
+        let _paint = crate::test_paint::PaintGuard::acquire();
+        let _cwd = crate::test_cwd::CwdReadGuard::acquire();
+
+        let backend: Rc<RefCell<Box<dyn quadraui::Backend>>> =
+            Rc::new(RefCell::new(Box::new(TuiBackend::new())));
+        // `UnitProfile::px()` is the GUI profile every real GTK/macOS/
+        // Win-GUI entry point passes to `App::new_portable`; `TuiBackend`
+        // stands in for the concrete backend purely because it needs no
+        // live display, the same substitution
+        // `build_portable_engine_no_workspace_tests` (`src/app/
+        // construction.rs`) makes -- this scenario exercises
+        // `shell_config()`'s own sidebar-seeding logic, not any
+        // backend-specific renderer.
+        let app = App::new_portable_for_test(None, backend, UnitProfile::px());
+        assert!(
+            app.engine.borrow().has_no_workspace(),
+            "precondition: a no-arg launch on a GUI UnitProfile must enter \
+             the no-workspace state"
+        );
+        let config = app.shell_config();
+        assert!(
+            !config.sidebar_visible,
+            "precondition: shell_config() must seed a hidden sidebar for \
+             the no-workspace state"
+        );
+        let mut driver = driver_with_shell(app, config, 100, 30);
+
+        // No `UiEvent` dispatched -- this is deliberately the very first
+        // frame. `quadraui::tui::run::run_with`'s loop calls `app.setup()`
+        // once, then paints, before ever calling `app.handle()`, so if
+        // `ShellConfig::with_sidebar_visible` were not wired, this render
+        // would show the sidebar's construction-time default (visible)
+        // regardless of what the engine derived.
+        driver.render();
+
+        assert!(
+            !explorer_tree_chevron_painted(&driver),
+            "a no-arg GUI launch must start with the Explorer collapsed on \
+             its very first painted frame, before any event dispatches; \
+             screen:\n{}",
+            driver.screen()
+        );
     }
 }
