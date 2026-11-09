@@ -17,15 +17,47 @@ impl Engine {
     /// doc for why a *second*, independent copy of it went stale.
     ///
     /// Always `false` in the no-workspace state
-    /// ([`Engine::has_no_workspace`]): there is no workspace tree to show,
+    /// ([`Engine::has_no_workspace`]) and on a file-argument launch
+    /// (`self.file_argument_startup`, matching `nvim <file>` / `code
+    /// <file>` — see that field's own doc): there is either no workspace
+    /// tree to show, or the launch named one specific file to edit,
     /// regardless of what `autohide_panels`/`explorer_visible_on_startup`
     /// otherwise say.
     pub fn derived_sidebar_visible(&self) -> bool {
-        if self.has_no_workspace() || self.settings.autohide_panels {
+        if self.has_no_workspace() || self.settings.autohide_panels || self.file_argument_startup {
             false
         } else {
             self.session.explorer_visible || self.settings.explorer_visible_on_startup
         }
+    }
+
+    /// The subset of [`Self::derived_sidebar_visible`]'s force-`false`
+    /// conditions that name a specific *launch kind* rather than an
+    /// ordinary settings/session toggle: the no-workspace state and a
+    /// file-argument launch. `App::shell_config()` reads this — not the
+    /// full `derived_sidebar_visible()` formula — to decide whether to
+    /// seed `quadraui::ShellConfig::with_sidebar_visible` from the shadow
+    /// `app_shell`'s own current `sidebar_visible()` before the runner's
+    /// first frame.
+    ///
+    /// Deliberately excludes `autohide_panels` and the
+    /// `session.explorer_visible`/`settings.explorer_visible_on_startup`
+    /// pair: `shell_config()` leaves `ShellConfig`'s own default
+    /// (visible) in place for every launch *other* than these two, so a
+    /// caller that opened or hid a sidebar panel directly on the shadow
+    /// `app_shell` before `shell_config()` ever ran — a test fixture
+    /// built from a plain `Engine::new_for_test()` with zero-value
+    /// settings, or any of the other engine mutators `Self::sync_app_
+    /// shell_sidebar_visibility`'s own doc lists — is not silently
+    /// overridden by a fresh re-derivation that knows nothing about that
+    /// mutation. For the two launch kinds this *does* gate on,
+    /// `shell_config()` still reads the shadow's current bit rather than
+    /// hardcoding `false` — see that call site's own doc for why a later,
+    /// explicit re-open of the sidebar (production's `toggle_sidebar`/
+    /// `show_panel`, or a test fixture doing the same to check a
+    /// startup-time auto-reveal) must win over the launch-time force.
+    pub(crate) fn sidebar_forced_hidden_by_launch(&self) -> bool {
+        self.has_no_workspace() || self.file_argument_startup
     }
 
     /// Make `self.app_shell`'s sidebar visibility agree with

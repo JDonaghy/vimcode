@@ -1178,10 +1178,9 @@ fn assert_no_workspace_render_scenario<D: quadraui::testing::ConformanceDriver>(
 /// `!screen_has("EXPLORER")` assertion is vacuously true: `cell`-profile
 /// `AppShell` registers a hamburger panel at index 0 regardless of engine
 /// state, painting "Menu" rather than "EXPLORER" whether or not the
-/// collapse logic under test actually ran. The `_gtk` arm below is meant
-/// to be the control that makes the assertion meaningful on a profile that
-/// *would* paint "EXPLORER" by default; see its own doc for why it is
-/// currently gated instead of a working control.
+/// collapse logic under test actually ran. The `_gtk` arm below is the
+/// control that makes the assertion meaningful on a profile that *would*
+/// paint "EXPLORER" by default.
 #[test]
 fn test_startup_into_no_workspace_renders_empty_editor_with_explorer_collapsed_tui() {
     let (engine, dir, fixture_file, session_path) = no_workspace_render_fixture();
@@ -1194,32 +1193,20 @@ fn test_startup_into_no_workspace_renders_empty_editor_with_explorer_collapsed_t
 /// `AppShell` registers no hamburger panel, so it defaults to Explorer at
 /// index 0 and *would* paint "EXPLORER" if the sidebar were left visible —
 /// making the `_tui` arm's `!screen_has("EXPLORER")` assertion a real
-/// control here rather than a given, *if* this arm itself passed.
+/// control here.
 ///
-/// It currently does not, for a confirmed upstream reason rather than a
-/// vimcode bug: `quadraui::ShellAdapter::setup` takes no `ShellContext`,
-/// and both `ShellAdapter::render` and the `ShellApp::pre_render` it calls
-/// are `&self`, so nothing in the paint path can reach the `&mut self`
-/// `apply_requested_panel` that reconciles sidebar visibility — that only
-/// runs from `ShellAdapter::handle`, which the real GTK runner never
-/// dispatches an event into before the first paint. So GTK's sidebar
-/// defaults to Explorer-visible on frame 0 regardless of
-/// `Engine::startup_into_no_workspace`'s collapsed state, and this arm's
-/// `!screen_has("EXPLORER")` assertion fails. Gated via `known_bug_gate`
-/// (see `crate::harness::KNOWN_BUGS`'s doc) until quadraui grows a frame-0
-/// reconciliation hook; this is not weakened to pass today.
+/// `App::shell_config()` seeds `quadraui::ShellConfig::with_sidebar_
+/// visible(false)` for the no-workspace state before the runner's first
+/// frame (`Engine::sidebar_forced_hidden_by_launch`), so GTK's sidebar
+/// starts collapsed on frame 0 without needing any `UiEvent` to dispatch
+/// first.
 #[cfg(feature = "gui")]
 #[test]
 fn test_startup_into_no_workspace_renders_empty_editor_with_explorer_collapsed_gtk() {
-    crate::harness::known_bug_gate(
-        "test_startup_into_no_workspace_renders_empty_editor_with_explorer_collapsed_gtk",
-        || {
-            let (engine, dir, fixture_file, session_path) = no_workspace_render_fixture();
-            let h = crate::gtk::testing::conformance_harness(engine, 800, 480);
-            assert_no_workspace_render_scenario(&h.driver);
-            cleanup_no_workspace_render_fixture(&dir, &fixture_file, &session_path);
-        },
-    );
+    let (engine, dir, fixture_file, session_path) = no_workspace_render_fixture();
+    let h = crate::gtk::testing::conformance_harness(engine, 800, 480);
+    assert_no_workspace_render_scenario(&h.driver);
+    cleanup_no_workspace_render_fixture(&dir, &fixture_file, &session_path);
 }
 
 #[test]
