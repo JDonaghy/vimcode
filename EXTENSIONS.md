@@ -1148,6 +1148,31 @@ layout change.
 Every field also accepts `label`, `hint`, `disabled`, `error` and `warning`
 (`error` / `warning` render an indicator plus the message instead of the hint).
 
+**Keyboard navigation within a `"buttons"`/`"toggles"` row.** Tab/Shift-Tab
+move between *fields*, treating a whole row as one stop — they never step
+through its individual buttons/toggles (the alternative, stepping Tab through
+each row item the way a browser form does, was considered and rejected: it
+would make Tab's meaning depend on which field is focused). Once a row has
+field-level focus:
+
+- `Left`/`Right` (and `h`/`l`, for a view that otherwise uses vim-style
+  navigation) move a second, *item-level* sub-focus within the row, skipping
+  any `disabled` button, without wrapping past either end.
+- `Enter`/`Space` activates whichever item the sub-focus is currently on —
+  `ButtonClicked` for that button's own id, `ToggleChanged` for that toggle's
+  own id — not always the row's first item.
+- Tabbing onto a row (or back onto it after leaving) always resets the
+  sub-focus to its first enabled item, regardless of where it was left last
+  time.
+- The sub-focused item's own label paints wrapped in `‹…›` so a keyboard user
+  can see which one `Enter`/`Space` will activate. quadraui 0.9's
+  `FieldKind::ButtonRow`/`ToggleGroup` have no native per-item focus
+  highlight of their own (unlike `FieldKind::Toolbar`'s `focused_index`,
+  which does) — filed upstream (`JDonaghy/quadraui`) as the gap; `‹…›` is a
+  label-text stand-in until that lands, deliberately distinct from the
+  `[ label ]` bracket chrome a styled button already paints, so the two
+  don't nest into an ambiguous `[[Label]]`.
+
 **Layout (`label_position`/`label_align`/`label_width`/`control_width`/
 `min_control_width`).** By default every field's label sits to the left of a
 control that stretches to the row's right edge — tightly packed, full-width

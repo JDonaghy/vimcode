@@ -17090,7 +17090,7 @@ mod tests {
             );
         }
 
-        /// Acceptance scenario (#2063): a `vimcode.command(name, fn)`
+        /// Acceptance scenario: a `vimcode.command(name, fn)`
         /// registration is discoverable from the command palette without any
         /// extra registration step, and confirming it there actually runs
         /// the Lua callback — not just lists the name.
@@ -18724,6 +18724,244 @@ mod tests {
                 screen.contains("ZQ_CTXMENU_RAN"),
                 "selecting the extension-contributed context-menu item \
                  must run its registered Lua callback; screen:\n{screen}"
+            );
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // A `buttons`/`toggles` row's keyboard sub-focus. `Left`/`Right`
+    // move within the row, skipping disabled items; `Enter`/`Space` activates
+    // whichever item is sub-focused rather than always the row's first one.
+    // ─────────────────────────────────────────────────────────────────────────
+    mod issue_2146_plugin_ui_row_sub_focus {
+        use super::*;
+
+        /// An engine with one Lua plugin loaded from a temp dir, named so
+        /// concurrent runs cannot collide — mirrors `live_plugin_api`'s own
+        /// identically-shaped helper above.
+        fn engine_with_plugin(unique: &str, code: &str) -> crate::core::Engine {
+            let dir = std::env::temp_dir().join(format!(
+                "vc_app_on_tui_2146_row_focus_{unique}_{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(format!("{unique}.lua")), code).unwrap();
+            let mut engine = plain_engine();
+            let mut mgr =
+                crate::core::plugin::PluginManager::new().expect("PluginManager::new must succeed");
+            mgr.load_plugins_dir(&dir, &[]);
+            assert!(
+                mgr.plugins[0].error.is_none(),
+                "plugin must load cleanly: {:?}",
+                mgr.plugins[0].error
+            );
+            engine.set_plugin_manager(mgr);
+            let _ = std::fs::remove_dir_all(&dir);
+            engine
+        }
+
+        /// A `buttons` row of two enabled buttons: `Right` moves the
+        /// sub-focus from the first (`Cancel`) to the second (`Connect`) —
+        /// painted as that button's own label getting wrapped in `‹…›` —
+        /// and `Enter` then activates `Connect`, not `Cancel`.
+        #[test]
+        fn right_then_enter_on_a_buttons_row_activates_the_second_button_via_shell_app() {
+            let engine = engine_with_plugin(
+                "rowfocus_buttons",
+                r#"
+                _G.clicked = "none"
+                vimcode.ui.register_view("rowfocus_buttons_2146", {
+                    title = "Row Focus Buttons",
+                    render = function()
+                        return {
+                            fields = {
+                                { type = "label", id = "status", label = "clicked:" .. _G.clicked },
+                                { type = "buttons", id = "actions", buttons = {
+                                    { id = "cancel", label = "Cancel" },
+                                    { id = "connect", label = "Connect" },
+                                } },
+                            },
+                        }
+                    end,
+                    on_event = function(_ctx, ev)
+                        if ev.kind == "ButtonClicked" then
+                            _G.clicked = ev.widget_id
+                            vimcode.ui.refresh("rowfocus_buttons_2146")
+                        end
+                    end,
+                })
+                vimcode.command("ZqOpenRowFocusButtons", function(_)
+                    vimcode.ui.open_view("rowfocus_buttons_2146")
+                end)
+                "#,
+            );
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            driver.type_char(':');
+            for c in "ZqOpenRowFocusButtons".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.render();
+
+            let before = driver.screen();
+            assert!(
+                before.contains("‹Cancel›")
+                    && before.contains("Connect")
+                    && !before.contains("‹Connect›"),
+                "opening the view must seed the row's sub-focus on its \
+                 first button, painted as a `‹…›`-wrapped label; screen:\n{before}"
+            );
+
+            driver.press_named(quadraui::NamedKey::Right);
+            driver.render();
+            let mid = driver.screen();
+            assert!(
+                mid.contains("‹Connect›") && mid.contains("Cancel") && !mid.contains("‹Cancel›"),
+                "Right must move the row's sub-focus to the second button, \
+                 and off the first; screen:\n{mid}"
+            );
+
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.render();
+            let after = driver.screen();
+            assert!(
+                after.contains("clicked:connect"),
+                "Enter must activate the sub-focused button (`connect`), \
+                 not the row's first (`cancel`); screen:\n{after}"
+            );
+        }
+
+        /// A `buttons` row whose first button is `disabled = true` seeds
+        /// sub-focus on the first *enabled* one instead — `Enter` with no
+        /// `Right` at all must still activate it, not silently no-op the
+        /// way it would if sub-focus stayed on the disabled item.
+        #[test]
+        fn a_disabled_first_button_seeds_sub_focus_on_the_first_enabled_one_via_shell_app() {
+            let engine = engine_with_plugin(
+                "rowfocus_buttons_disabled",
+                r#"
+                _G.clicked = "none"
+                vimcode.ui.register_view("rowfocus_buttons_disabled_2146", {
+                    title = "Row Focus Buttons Disabled",
+                    render = function()
+                        return {
+                            fields = {
+                                { type = "label", id = "status", label = "clicked:" .. _G.clicked },
+                                { type = "buttons", id = "actions", buttons = {
+                                    { id = "cancel", label = "Cancel", disabled = true },
+                                    { id = "connect", label = "Connect" },
+                                } },
+                            },
+                        }
+                    end,
+                    on_event = function(_ctx, ev)
+                        if ev.kind == "ButtonClicked" then
+                            _G.clicked = ev.widget_id
+                            vimcode.ui.refresh("rowfocus_buttons_disabled_2146")
+                        end
+                    end,
+                })
+                vimcode.command("ZqOpenRowFocusButtonsDisabled", function(_)
+                    vimcode.ui.open_view("rowfocus_buttons_disabled_2146")
+                end)
+                "#,
+            );
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            driver.type_char(':');
+            for c in "ZqOpenRowFocusButtonsDisabled".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.render();
+
+            let before = driver.screen();
+            assert!(
+                before.contains("‹Connect›") && !before.contains("‹Cancel›"),
+                "a disabled first button must not take the row's initial \
+                 sub-focus; screen:\n{before}"
+            );
+
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.render();
+            let after = driver.screen();
+            assert!(
+                after.contains("clicked:connect"),
+                "Enter, with no Right at all, must activate the first \
+                 *enabled* button; screen:\n{after}"
+            );
+        }
+
+        /// A `toggles` row: `Right` moves the sub-focus to the second entry
+        /// and `Space` toggles it, not the first.
+        #[test]
+        fn right_then_space_on_a_toggles_row_toggles_the_second_entry_via_shell_app() {
+            let engine = engine_with_plugin(
+                "rowfocus_toggles",
+                r#"
+                _G.toggled = "none"
+                vimcode.ui.register_view("rowfocus_toggles_2146", {
+                    title = "Row Focus Toggles",
+                    render = function()
+                        return {
+                            fields = {
+                                { type = "label", id = "status", label = "toggled:" .. _G.toggled },
+                                { type = "toggles", id = "opts", toggles = {
+                                    { id = "verbose", label = "Verbose", value = false },
+                                    { id = "strict", label = "Strict", value = false },
+                                } },
+                            },
+                        }
+                    end,
+                    on_event = function(_ctx, ev)
+                        if ev.kind == "ToggleChanged" then
+                            _G.toggled = ev.widget_id
+                            vimcode.ui.refresh("rowfocus_toggles_2146")
+                        end
+                    end,
+                })
+                vimcode.command("ZqOpenRowFocusToggles", function(_)
+                    vimcode.ui.open_view("rowfocus_toggles_2146")
+                end)
+                "#,
+            );
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            driver.type_char(':');
+            for c in "ZqOpenRowFocusToggles".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.render();
+
+            let before = driver.screen();
+            assert!(
+                before.contains("‹Verbose›") && !before.contains("‹Strict›"),
+                "opening the view must seed the toggles row's sub-focus on \
+                 its first entry; screen:\n{before}"
+            );
+
+            driver.press_named(quadraui::NamedKey::Right);
+            driver.render();
+            let mid = driver.screen();
+            assert!(
+                mid.contains("‹Strict›") && !mid.contains("‹Verbose›"),
+                "Right must move the toggles row's sub-focus to the second \
+                 entry; screen:\n{mid}"
+            );
+
+            driver.type_char(' ');
+            driver.render();
+            let after = driver.screen();
+            assert!(
+                after.contains("toggled:strict"),
+                "Space must toggle the sub-focused entry (`strict`), not \
+                 the row's first (`verbose`); screen:\n{after}"
             );
         }
     }

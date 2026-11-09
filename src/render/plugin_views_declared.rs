@@ -118,6 +118,45 @@ pub fn plugin_view_to_form_with_combo_edit(
     text_edit: Option<&crate::core::plugin_ui::PluginViewTextEditState>,
     combo_edit: Option<&crate::core::plugin_ui::PluginViewComboBoxEditState>,
 ) -> quadraui::Form {
+    plugin_view_to_form_with_row_focus(
+        view_name, view, selected, scroll_top, has_focus, text_edit, combo_edit, 0,
+    )
+}
+
+/// [`plugin_view_to_form_with_combo_edit`] plus `row_focus`: which item,
+/// within `selected`'s own `buttons`/`toggles` list, the row's keyboard
+/// sub-focus is on — `Engine::ext_panel_row_focus` (or its tab/dock twin).
+/// Ignored unless `selected` both has keyboard focus (`has_focus`) and is a
+/// `Buttons`/`Toggles` field; a separate function rather than an eighth
+/// parameter on [`plugin_view_to_form_with_combo_edit`] itself, for the same
+/// "pre-existing call sites keep compiling unchanged" reason that function's
+/// own doc gives for not growing [`plugin_view_to_form`] directly.
+///
+/// quadraui 0.9's `FieldKind::ButtonRow`/`ToggleGroup` carry no per-item
+/// focus field of their own — unlike `FieldKind::Toolbar`'s
+/// `Toolbar::focused_index`, which a host sets and the primitive's own
+/// paint path renders with a distinct highlight; filed upstream
+/// (`JDonaghy/quadraui`) as the native equivalent these two field kinds
+/// are missing. Until that lands, the sub-focused item's own
+/// [`quadraui::ButtonRowItem::label`] / [`quadraui::ToggleGroupItem::label`]
+/// is wrapped in `‹` `›` here instead: plain text every backend's existing
+/// `ButtonRow`/`ToggleGroup` paint path already draws verbatim, so the
+/// highlight needs no new backend-specific rendering code to show up on
+/// every one of them identically. `‹…›` rather than `[…]`: a `buttons`
+/// row's own `ButtonRowItem` already paints bracket chrome around every
+/// item's label regardless of focus, so `[…]` here would nest into an
+/// ambiguous `[[Label]]` instead of standing out.
+#[allow(clippy::too_many_arguments)]
+pub fn plugin_view_to_form_with_row_focus(
+    view_name: &str,
+    view: &crate::core::plugin_ui::PluginView,
+    selected: usize,
+    scroll_top: usize,
+    has_focus: bool,
+    text_edit: Option<&crate::core::plugin_ui::PluginViewTextEditState>,
+    combo_edit: Option<&crate::core::plugin_ui::PluginViewComboBoxEditState>,
+    row_focus: usize,
+) -> quadraui::Form {
     use crate::core::plugin_ui::{namespaced_widget_id, ViewFieldKind};
     use quadraui::{
         ButtonRowItem, Color, FieldKind, Form, FormField, StyledText, ToggleGroupItem, Toolbar,
@@ -134,6 +173,19 @@ pub fn plugin_view_to_form_with_combo_edit(
         .iter()
         .map(|&i| {
             let f = &view.fields[i];
+            // Whether `row_focus` names an item in *this* field's own
+            // `buttons`/`toggles` list that the keyboard will activate next
+            // — see `plugin_view_to_form_with_row_focus`'s doc for why that
+            // item's label gets marked below rather than a native per-item
+            // focus flag.
+            let row_focused = has_focus && i == selected;
+            let mark_row_focused = |label: String, idx: usize| {
+                if row_focused && idx == row_focus {
+                    format!("‹{label}›")
+                } else {
+                    label
+                }
+            };
             let kind = match &f.kind {
                 ViewFieldKind::Label => FieldKind::Label,
                 ViewFieldKind::Text { value, placeholder } => {
@@ -271,10 +323,12 @@ pub fn plugin_view_to_form_with_combo_edit(
                 ViewFieldKind::Buttons { buttons } => FieldKind::ButtonRow {
                     buttons: buttons
                         .iter()
-                        .map(|b| {
+                        .enumerate()
+                        .map(|(idx, b)| {
+                            let label = mark_row_focused(b.label.clone(), idx);
                             let resolved_icon = b.icon.as_deref().map(resolve_view_icon);
                             let spec = resolve_button_spec(
-                                &b.label,
+                                &label,
                                 b.variant,
                                 resolved_icon.as_ref(),
                                 &b.tooltip,
@@ -282,7 +336,7 @@ pub fn plugin_view_to_form_with_combo_edit(
                             );
                             ButtonRowItem {
                                 id: wid(&b.id),
-                                label: b.label.clone(),
+                                label,
                                 disabled: b.disabled,
                                 icon: resolved_icon,
                                 spec,
@@ -293,9 +347,10 @@ pub fn plugin_view_to_form_with_combo_edit(
                 ViewFieldKind::Toggles { toggles } => FieldKind::ToggleGroup {
                     toggles: toggles
                         .iter()
-                        .map(|t| ToggleGroupItem {
+                        .enumerate()
+                        .map(|(idx, t)| ToggleGroupItem {
                             id: wid(&t.id),
-                            label: t.label.clone(),
+                            label: mark_row_focused(t.label.clone(), idx),
                             value: t.value,
                         })
                         .collect(),
@@ -481,7 +536,7 @@ pub fn populate_plugin_view_form_controller(engine: &Engine) -> bool {
     let Some(view) = engine.plugin_views.get(&name) else {
         return false;
     };
-    let form = plugin_view_to_form_with_combo_edit(
+    let form = plugin_view_to_form_with_row_focus(
         &name,
         view,
         engine.ext_panel_selected,
@@ -489,6 +544,7 @@ pub fn populate_plugin_view_form_controller(engine: &Engine) -> bool {
         engine.ext_panel_has_focus,
         engine.plugin_view_text_edit.as_ref(),
         engine.plugin_view_combo_edit.as_ref(),
+        engine.plugin_view_row_focus(PluginViewHost::Sidebar),
     );
     let mut fc = engine.plugin_view_form_controller.borrow_mut();
     fc.set_form(form);
@@ -514,7 +570,7 @@ pub fn populate_plugin_view_tab_form_controller(
     let Some(view) = engine.plugin_views.get(name) else {
         return false;
     };
-    let form = plugin_view_to_form_with_combo_edit(
+    let form = plugin_view_to_form_with_row_focus(
         name,
         view,
         engine.plugin_view_tab_selected,
@@ -522,6 +578,7 @@ pub fn populate_plugin_view_tab_form_controller(
         has_focus,
         engine.plugin_view_text_edit.as_ref(),
         engine.plugin_view_combo_edit.as_ref(),
+        engine.plugin_view_row_focus(PluginViewHost::Tab),
     );
     let mut fc = engine.plugin_view_tab_form_controller.borrow_mut();
     fc.set_form(form);
@@ -545,7 +602,7 @@ pub fn populate_plugin_view_dock_form_controller(
     let Some(view) = engine.plugin_views.get(name) else {
         return false;
     };
-    let form = plugin_view_to_form_with_combo_edit(
+    let form = plugin_view_to_form_with_row_focus(
         name,
         view,
         engine.plugin_view_dock_selected,
@@ -553,6 +610,7 @@ pub fn populate_plugin_view_dock_form_controller(
         has_focus,
         engine.plugin_view_text_edit.as_ref(),
         engine.plugin_view_combo_edit.as_ref(),
+        engine.plugin_view_row_focus(PluginViewHost::Dock),
     );
     let mut fc = engine.plugin_view_dock_form_controller.borrow_mut();
     fc.set_form(form);
