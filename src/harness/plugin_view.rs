@@ -168,10 +168,17 @@ pub const SECTION_VIEW: &str = "zqxw146section";
 pub const SECTION_VIEW_TITLE: &str = "Zq146Sec";
 /// The labelled group's non-collapsible `Section` header.
 pub const ROW_GROUP_HEADER: &str = "GrZQ146";
-/// The first button in the group header's horizontal control row.
-pub const ROW_GROUP_BUTTON1: &str = "G1ZQ146";
-/// The second button in the group header's horizontal control row.
-pub const ROW_GROUP_BUTTON2: &str = "G2ZQ146";
+/// The first button in the group header's horizontal control row. Two
+/// columns shorter than this module's other needles: a `buttons` row with
+/// keyboard focus paints its sub-focused item's label wrapped in `‹…›`
+/// (`render::plugin_view_to_form_with_row_focus`), and that marker comes
+/// out of the same 20-column sidebar budget the module doc describes — at
+/// seven characters each, the pair plus the marker overflows it and the
+/// second button's label is clipped mid-needle.
+pub const ROW_GROUP_BUTTON1: &str = "G1Q46";
+/// The second button in the group header's horizontal control row — see
+/// [`ROW_GROUP_BUTTON1`] for why both are short.
+pub const ROW_GROUP_BUTTON2: &str = "G2Q46";
 /// The collapsible section's header label (sans disclosure glyph).
 pub const ROW_COLLAPSIBLE_HEADER: &str = "CoZQ146";
 /// [`ROW_COLLAPSIBLE_HEADER`] as painted while expanded — `render::
