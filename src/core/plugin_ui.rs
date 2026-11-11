@@ -1023,6 +1023,35 @@ pub enum ViewFieldKind {
         #[serde(default)]
         selected: usize,
     },
+    /// Single choice from a stacked list of options, one per sub-row —
+    /// the classic radio-button group. Translated to
+    /// `quadraui::FieldKind::RadioGroup`. Unlike every other field kind
+    /// here, this one's row spans one sub-row per option rather than
+    /// staying a single `row_h` — see `quadraui::primitives::form`'s own
+    /// module doc for why `RadioGroup` is the one exception.
+    ///
+    /// Distinct from [`Self::Segmented`] (every option painted in one
+    /// compact row, better for 2-4 short labels) and [`Self::Toggles`]
+    /// (independent booleans, not mutually exclusive): this kind is for
+    /// a short, always-visible, single-choice list where each option's
+    /// label is long enough, or there are enough of them, to want its
+    /// own line.
+    ///
+    /// `quadraui::FormController` drives this field's keyboard handling
+    /// natively: `Up`/`Left` moves the selection to the previous enabled
+    /// option, `Down`/`Right` to the next, wrapping at either end and
+    /// skipping disabled options — see `Engine::handle_plugin_view_key`'s
+    /// radio-group branch for where vimcode forwards keys into it. A
+    /// click on any option resolves the same way through the controller's
+    /// own hit-testing. Either path reaches the plugin immediately as
+    /// [`ViewEventKind::RadioGroupChanged`] — no separate confirm step,
+    /// the same shape [`Self::Segmented`]'s own `SegmentedChanged` uses.
+    RadioGroup {
+        #[serde(default)]
+        options: Vec<String>,
+        #[serde(default)]
+        selected: usize,
+    },
     /// A horizontal row of buttons, each with its own id. Translated to
     /// `quadraui::FieldKind::ButtonRow`.
     Buttons {
@@ -1185,6 +1214,7 @@ impl ViewFieldKind {
             ViewFieldKind::Dropdown { .. } => "dropdown",
             ViewFieldKind::ComboBox { .. } => "combo_box",
             ViewFieldKind::Segmented { .. } => "segmented",
+            ViewFieldKind::RadioGroup { .. } => "radio_group",
             ViewFieldKind::Buttons { .. } => "buttons",
             ViewFieldKind::Toggles { .. } => "toggles",
             ViewFieldKind::Date { .. } => "date",
@@ -1320,6 +1350,12 @@ pub enum ViewEventKind {
         value: String,
     },
     SegmentedChanged {
+        selected: usize,
+    },
+    /// A `radio_group` field's selection changed — by `Up`/`Down`/`Left`/
+    /// `Right` moving the cursor, or a click on any option. No separate
+    /// confirm step, the same shape [`Self::SegmentedChanged`] uses.
+    RadioGroupChanged {
         selected: usize,
     },
     TextChanged {
@@ -1464,6 +1500,7 @@ impl ViewEventKind {
             ViewEventKind::DropdownChanged { .. } => "DropdownChanged",
             ViewEventKind::ComboBoxChanged { .. } => "ComboBoxChanged",
             ViewEventKind::SegmentedChanged { .. } => "SegmentedChanged",
+            ViewEventKind::RadioGroupChanged { .. } => "RadioGroupChanged",
             ViewEventKind::TextChanged { .. } => "TextChanged",
             ViewEventKind::TextCommitted { .. } => "TextCommitted",
             ViewEventKind::DateChanged { .. } => "DateChanged",
@@ -1727,6 +1764,26 @@ mod tests {
     fn number_committed_event_kind_name_is_the_lua_facing_string() {
         let event = ViewEventKind::NumberCommitted { value: 5.0 };
         assert_eq!(event.kind_name(), "NumberCommitted");
+    }
+
+    #[test]
+    fn radio_group_field_kind_tag_is_the_lua_type_string() {
+        let json = r#"{"type":"radio_group","options":["Light","Dark"],"selected":1}"#;
+        let kind: ViewFieldKind = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(kind.type_name(), "radio_group");
+        assert_eq!(
+            kind,
+            ViewFieldKind::RadioGroup {
+                options: vec!["Light".into(), "Dark".into()],
+                selected: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn radio_group_changed_event_kind_name_is_the_lua_facing_string() {
+        let event = ViewEventKind::RadioGroupChanged { selected: 1 };
+        assert_eq!(event.kind_name(), "RadioGroupChanged");
     }
 
     #[test]

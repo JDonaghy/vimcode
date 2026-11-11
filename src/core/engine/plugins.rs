@@ -1223,6 +1223,10 @@ impl Engine {
             .fields
             .get(selected)
             .is_some_and(|f| !f.disabled && matches!(f.kind, ViewFieldKind::NumberInput { .. }));
+        let is_radio_group_field = view
+            .fields
+            .get(selected)
+            .is_some_and(|f| !f.disabled && matches!(f.kind, ViewFieldKind::RadioGroup { .. }));
         let is_button_row_field = view.fields.get(selected).is_some_and(|f| {
             !f.disabled
                 && matches!(
@@ -1378,6 +1382,53 @@ impl Engine {
                     }
                     // The dock never holds keyboard focus (see the `Date`
                     // arm's identical comment above), so a `number_input`
+                    // key never actually reaches this arm in practice.
+                    PluginViewHost::Dock => false,
+                };
+            }
+        }
+
+        // `radio_group`: forward `Up`/`Left`/`Down`/`Right` to the shared
+        // `quadraui::FormController`, which drives the embedded
+        // `RadioGroup`'s own cursor movement (wrapping, skipping disabled
+        // options) and fires `FormEvent::RadioChanged` immediately — no
+        // separate confirm step, so there is nothing for `Enter`/`Space` to
+        // do on this field kind (unlike `Dropdown`/`Segmented`'s own
+        // Enter/Space-cycles-the-value handling below). Every other key
+        // falls through to the generic dispatch, same as an unclaimed key
+        // on any other field kind.
+        if is_radio_group_field {
+            let named = match key {
+                "Left" => Some(quadraui::NamedKey::Left),
+                "Right" => Some(quadraui::NamedKey::Right),
+                "Up" => Some(quadraui::NamedKey::Up),
+                "Down" => Some(quadraui::NamedKey::Down),
+                _ => None,
+            };
+            if let Some(named) = named {
+                let event = quadraui::UiEvent::KeyPressed {
+                    key: quadraui::Key::Named(named),
+                    modifiers: quadraui::Modifiers {
+                        ctrl,
+                        ..Default::default()
+                    },
+                    repeat: false,
+                };
+                return match host {
+                    PluginViewHost::Sidebar => {
+                        let rect = self.plugin_view_form_rect.get();
+                        crate::render::handle_plugin_view_ui_event(self, &event, rect)
+                    }
+                    PluginViewHost::Tab => {
+                        let rect = self.plugin_view_tab_form_rect.get();
+                        crate::render::handle_plugin_view_tab_ui_event(self, name, &event, rect)
+                    }
+                    PluginViewHost::Modal => {
+                        let rect = self.plugin_view_modal_form_rect.get();
+                        crate::render::handle_plugin_view_modal_ui_event(self, name, &event, rect)
+                    }
+                    // The dock never holds keyboard focus (see the `Date`
+                    // arm's identical comment above), so a `radio_group`
                     // key never actually reaches this arm in practice.
                     PluginViewHost::Dock => false,
                 };
@@ -1593,6 +1644,14 @@ impl Engine {
                         // key is intercepted above (see
                         // `is_number_input_field`) and forwarded to the
                         // `FormController`, including `Enter`/`Up`/`Down`.
+                        return true;
+                    }
+                    ViewFieldKind::RadioGroup { .. } => {
+                        // `RadioGroup::handle_key` claims only `Up`/`Down`/
+                        // `Left`/`Right` (see `is_radio_group_field` above),
+                        // which already select-and-fire with no separate
+                        // confirm step, so `Enter`/`Space` have nothing
+                        // left to do on this field kind.
                         return true;
                     }
                     ViewFieldKind::Toolbar { buttons } => {

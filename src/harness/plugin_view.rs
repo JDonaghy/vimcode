@@ -182,6 +182,32 @@ pub const ROW_NUMBER_TYPED: &str = "71";
 /// The value painted after `Enter` confirms [`ROW_NUMBER_TYPED`] — parsed,
 /// clamped to `[min, max]` (7 is already in range, so it commits verbatim).
 pub const ROW_NUMBER_COMMITTED: &str = ROW_NUMBER_TYPED;
+/// A `radio_group`-kind row's label. Declared last in the field stack
+/// (after `vol2`) so this row's addition cannot shift any existing
+/// scenario's `Tab`-count-based navigation — same convention
+/// [`ROW_COMBO_LABEL`]'s doc names.
+pub const ROW_RADIO_LABEL: &str = "RgZ";
+/// The radio group's first declared option — short like
+/// [`ROW_GROUP_BUTTON1`], for the same reason: `quadraui::tui::
+/// draw_radio_group` paints `"({glyph}) {label}"` directly in the control
+/// column past the form's shared label column, so a longer tag risks the
+/// same 20-column sidebar budget trap this module's doc already names.
+pub const ROW_RADIO_OPTION_A: &str = "L1Q46";
+/// The radio group's second declared option — see [`ROW_RADIO_OPTION_A`].
+pub const ROW_RADIO_OPTION_B: &str = "D1Q46";
+/// A plain `label` row echoing the plugin's own `radio_selected` state —
+/// the `radio_group` twin of [`COUNT_0`]/[`COUNT_1`]'s `cnt` row. The
+/// selected option's own painted marker is a vector-drawn filled/empty
+/// circle on GTK (`quadraui::primitives::radio_group::native_surface_paint
+/// ::paint`), not text — unlike `tui::draw_radio_group`'s literal
+/// `"(•) "`/`"( ) "` glyph prefix — so this echo is the one assertion that
+/// proves the resolved selection on both backends identically, the same
+/// reason the `cnt` row exists instead of reading `count` back out of Lua
+/// directly.
+pub const ROW_RADIO_SELECTED_0: &str = "rs0ZQ146";
+/// [`ROW_RADIO_SELECTED_0`] after the selection moves to
+/// [`ROW_RADIO_OPTION_B`] (index 1).
+pub const ROW_RADIO_SELECTED_1: &str = "rs1ZQ146";
 
 /// Registered view name for the `section`-kind fixture: a labelled,
 /// non-collapsible group (a `Section` header immediately followed by a
@@ -876,6 +902,7 @@ local date_value = "{ROW_DATE_INITIAL}"
 local slider_value = 6.0
 local combo_value = ""
 local number_value = 42.0
+local radio_selected = 0
 
 vimcode.ui.register_view("{VIEW}", {{
   title = "{VIEW_TITLE}",
@@ -909,6 +936,10 @@ vimcode.ui.register_view("{VIEW}", {{
            value = combo_value }},
         {{ type = "number_input", id = "vol2", label = "{ROW_NUMBER_LABEL}",
            value = number_value, min = 0.0, max = 100.0, step = 17.0 }},
+        {{ type = "radio_group", id = "rdg", label = "{ROW_RADIO_LABEL}",
+           options = {{"{ROW_RADIO_OPTION_A}", "{ROW_RADIO_OPTION_B}"}},
+           selected = radio_selected }},
+        {{ type = "label", id = "rdgsel", label = "rs" .. radio_selected .. "ZQ146" }},
       }},
     }}
   end,
@@ -940,6 +971,9 @@ vimcode.ui.register_view("{VIEW}", {{
     elseif event.widget_id == "vol2"
         and (event.kind == "NumberChanged" or event.kind == "NumberCommitted") then
       number_value = event.value
+      count = count + 1
+    elseif event.widget_id == "rdg" and event.kind == "RadioGroupChanged" then
+      radio_selected = event.value
       count = count + 1
     end
   end,
@@ -2165,10 +2199,11 @@ pub fn combo_box_filter_and_commit_reaches_the_plugin_handler(driver: &mut impl 
 /// reported to the plugin.
 ///
 /// `Tab` x9 from the initially-focused `url` field walks past `tls`,
-/// `send`, `etx`, `dob`, `vol`, `swt`, `tbr` and `cmb` onto `vol2`, the
-/// last declared field (appended after every pre-existing one, including
-/// `combo_box`'s own, so this scenario cannot shift any other scenario's
-/// `Tab`-count navigation).
+/// `send`, `etx`, `dob`, `vol`, `swt`, `tbr` and `cmb` onto `vol2`, appended
+/// after every pre-existing field (including `combo_box`'s own) so this
+/// scenario cannot shift any other scenario's `Tab`-count navigation.
+/// `radio_group`'s own `rdg` field is appended after `vol2` for the same
+/// reason, so it doesn't shift this one either.
 ///
 /// RED-verified: replacing `render::plugin_view_event_from_form_event`'s
 /// `NumberChanged`/`NumberCommitted` arms with a fall-through to `_ =>
@@ -2243,6 +2278,64 @@ pub fn number_input_step_and_commit_reaches_the_plugin_handler(
         driver.screen_has(COUNT_2),
         "Enter on the focused number_input field must reach the plugin's \
          on_event handler as NumberCommitted and repaint ({COUNT_2:?}); \
+         painted runs were {:?}",
+        painted(driver)
+    );
+}
+
+/// Scenario 4f — a focused `radio_group` field: `Down` renders one sub-row
+/// per declared option and moves the selection to the next one
+/// immediately, reaching the plugin's `on_event` handler as a single
+/// `RadioGroupChanged` event — unlike `number_input`'s own stepper, there is
+/// no separate typed-draft/confirm step for this field kind at all (see
+/// `ViewFieldKind::RadioGroup`'s doc).
+pub fn radio_group_selection_reaches_the_plugin_handler(driver: &mut impl ConformanceDriver) {
+    assert!(
+        driver.screen_has(ROW_RADIO_OPTION_A),
+        "precondition: the radio group's first option must be painted on \
+         its own sub-row ({ROW_RADIO_OPTION_A:?}); painted runs were {:?}",
+        painted(driver)
+    );
+    assert!(
+        driver.screen_has(ROW_RADIO_OPTION_B),
+        "precondition: the radio group's second option must also be painted \
+         on its own sub-row ({ROW_RADIO_OPTION_B:?}); painted runs were {:?}",
+        painted(driver)
+    );
+    assert!(
+        driver.screen_has(ROW_RADIO_SELECTED_0),
+        "precondition: the radio group must start with option 0 selected \
+         ({ROW_RADIO_SELECTED_0:?}); painted runs were {:?}",
+        painted(driver)
+    );
+    assert!(
+        driver.screen_has(COUNT_0),
+        "precondition: the counter row must start at {COUNT_0:?}; painted \
+         runs were {:?}",
+        painted(driver)
+    );
+    for _ in 0..10 {
+        driver.press_named(quadraui::NamedKey::Tab);
+    }
+    driver.press_named(quadraui::NamedKey::Down);
+    assert!(
+        driver.screen_has(ROW_RADIO_SELECTED_1),
+        "Down on the focused radio_group field must move the selection to \
+         the next option and reach the plugin's on_event handler as \
+         RadioGroupChanged, whose repaint echoes the new selection \
+         ({ROW_RADIO_SELECTED_1:?}); painted runs were {:?}",
+        painted(driver)
+    );
+    assert!(
+        !driver.screen_has(ROW_RADIO_SELECTED_0),
+        "the stale selection echo {ROW_RADIO_SELECTED_0:?} must not still be \
+         painted after the selection moved; painted runs were {:?}",
+        painted(driver)
+    );
+    assert!(
+        driver.screen_has(COUNT_1),
+        "Down on the focused radio_group field must reach the plugin's \
+         on_event handler as RadioGroupChanged and repaint ({COUNT_1:?}); \
          painted runs were {:?}",
         painted(driver)
     );
@@ -4641,6 +4734,12 @@ mod tests {
     }
 
     #[test]
+    fn plugin_view_radio_group_selection_reaches_the_handler_on_tui() {
+        let (mut h, _dir) = tui();
+        radio_group_selection_reaches_the_plugin_handler(&mut h.driver);
+    }
+
+    #[test]
     fn plugin_view_tab_paints_and_click_reaches_the_handler_on_tui() {
         let (mut h, _dir) = tui_tab();
         tab_paints_and_click_reaches_the_plugin_handler(&mut h.driver);
@@ -5306,6 +5405,13 @@ mod tests {
     fn plugin_view_number_input_step_and_commit_reaches_the_handler_on_gtk() {
         let (mut h, _dir) = gtk();
         number_input_step_and_commit_reaches_the_plugin_handler(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_radio_group_selection_reaches_the_handler_on_gtk() {
+        let (mut h, _dir) = gtk();
+        radio_group_selection_reaches_the_plugin_handler(&mut h.driver);
     }
 
     #[cfg(feature = "gui")]
