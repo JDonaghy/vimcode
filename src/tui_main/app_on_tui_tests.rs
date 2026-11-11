@@ -5027,22 +5027,18 @@ mod tests {
                 .terminal_cursor_position()
                 .expect("insert-mode cursor must be visible after typing");
             let popup_bounds = driver
-                // The mirrored `shell_app.rs` test brackets with
-                // *both* the popup's own left and right borders
-                // (`"│ ZQXWFOOBAR │"`) specifically because the candidate
-                // text also appears verbatim as plain buffer content (the
-                // dictionary line above) with its own leading `"│ "` —
-                // this fixture's persistent activity-bar/divider chrome
-                // puts a `"│"` immediately left of *every* row's content,
-                // and that row's 1-cell gutter reservation happens to
-                // reproduce the leading `"│ "` prefix too, so a
-                // left-border-only needle silently matched the dictionary
-                // line first (the topmost row `find_bounds` scans) instead
-                // of the popup — this port had dropped the trailing
-                // `" │"` when copying the needle over, silently comparing
-                // the dictionary line's own x against the cursor instead
-                // of the popup's.
-                .find_bounds("│ ZQXWFOOBAR │")
+                // The needle brackets the candidate with *both* of the
+                // popup's own borders, and with the kind icon the popup
+                // paints between its left border and the label, because
+                // the candidate text also appears verbatim as plain
+                // buffer content (the dictionary line above): this
+                // fixture's persistent activity-bar/divider chrome puts a
+                // `"│"` immediately left of *every* row's content, and
+                // that row's 1-cell gutter reservation reproduces a
+                // leading `"│ "` prefix too, so a left-border-only needle
+                // matches the dictionary line first (the topmost row
+                // `find_bounds` scans) instead of the popup.
+                .find_bounds("│tx ZQXWFOOBAR │")
                 .expect("completion popup must be visible on screen");
 
             assert!(
@@ -5051,6 +5047,40 @@ mod tests {
                  cursor's display column (x={cursor_x}), not the raw \
                  character column; screen:\n{screen}",
                 popup_bounds.x,
+            );
+        }
+
+        /// The completion popup must be wide enough for everything a row
+        /// paints: both side borders, the kind icon and its trailing gap,
+        /// and the candidate label itself. A width budgeted for the label
+        /// plus borders alone drops the label's tail off the row's right
+        /// edge, so the popup offers `"ZQXWFOOBA"` for a candidate that is
+        /// really `"ZQXWFOOBAR"`.
+        #[test]
+        fn completion_popup_paints_the_candidate_label_untruncated_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.buffer_mut().insert(0, "ZQXWFOOBAR\n");
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            driver.type_char('G');
+            driver.type_char('o');
+            for c in "ZQXWFOO".chars() {
+                driver.type_char(c);
+            }
+
+            let screen = driver.screen();
+            assert_eq!(
+                screen.matches("ZQXWFOOBAR").count(),
+                2,
+                "the popup must paint the whole \"ZQXWFOOBAR\" candidate \
+                 (so it appears twice: dictionary line and popup row), \
+                 not a width-truncated prefix of it; screen:\n{screen}"
+            );
+            assert!(
+                driver.screen_has("ZQXWFOOBAR │"),
+                "the candidate label must fit inside the popup's own \
+                 right border; screen:\n{screen}"
             );
         }
 
