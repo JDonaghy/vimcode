@@ -43,6 +43,31 @@ fn combo_box_key_from(key: &str, unicode: Option<char>) -> Option<quadraui::Key>
     }
 }
 
+/// Map an engine key event to the `quadraui::Key`
+/// [`quadraui::primitives::number_input::NumberInput::handle_key`]
+/// recognises, for [`Engine::handle_plugin_view_key`]'s `number_input`
+/// branch.
+///
+/// `None` for a key the primitive has no path for at all (`Left`/`Right`/
+/// `Home`/`End`/function keys, letters, or a `ctrl`-chord whose `unicode`
+/// is `None`) — unlike [`combo_box_key_from`]'s "any non-control character"
+/// fallback, `NumberInput::handle_key` only accepts an ASCII digit, `-` or
+/// `.` as typed input (see its own `is_number_char`), so a key outside that
+/// set simply falls through to whatever the caller does for an unrecognised
+/// key on any other field.
+fn number_input_key_from(key: &str, unicode: Option<char>) -> Option<quadraui::Key> {
+    match key {
+        "Up" => Some(quadraui::Key::Named(quadraui::NamedKey::Up)),
+        "Down" => Some(quadraui::Key::Named(quadraui::NamedKey::Down)),
+        "Return" | "Enter" => Some(quadraui::Key::Named(quadraui::NamedKey::Enter)),
+        "Escape" => Some(quadraui::Key::Named(quadraui::NamedKey::Escape)),
+        "BackSpace" => Some(quadraui::Key::Named(quadraui::NamedKey::Backspace)),
+        _ => unicode
+            .filter(|c| c.is_ascii_digit() || *c == '-' || *c == '.')
+            .map(quadraui::Key::Char),
+    }
+}
+
 /// Indices, within a `Buttons` or `Toggles` row's own item list, that the
 /// keyboard can land sub-focus on — every item for `Toggles` (no per-toggle
 /// `disabled` key exists), the non-`disabled` ones for `Buttons`. `None` for
@@ -664,6 +689,7 @@ impl Engine {
         // survives `take()` above — only the slot's name is cleared.
         self.blur_plugin_view_text_edit(&name, PluginViewHost::Modal);
         self.plugin_view_combo_edit = None;
+        self.plugin_view_number_edit = None;
         if let Some(prev) = self.plugin_view_modal_prev_focus.take() {
             self.restore_focus_owner(prev);
         }
@@ -1003,6 +1029,15 @@ impl Engine {
         if !still_focused {
             self.plugin_view_combo_edit = None;
         }
+        let still_focused_number = self.plugin_view_number_edit.as_ref().is_some_and(|state| {
+            self.plugin_views
+                .get(name)
+                .and_then(|v| v.fields.get(idx))
+                .is_some_and(|f| state.view == name && state.field_id == f.id)
+        });
+        if !still_focused_number {
+            self.plugin_view_number_edit = None;
+        }
         self.set_plugin_view_selected(host, idx);
         self.prime_plugin_view_text_edit(name, idx);
         // Reseed the row sub-focus (see `Engine::ext_panel_row_focus`'s doc)
@@ -1184,6 +1219,10 @@ impl Engine {
             .fields
             .get(selected)
             .is_some_and(|f| !f.disabled && matches!(f.kind, ViewFieldKind::ComboBox { .. }));
+        let is_number_input_field = view
+            .fields
+            .get(selected)
+            .is_some_and(|f| !f.disabled && matches!(f.kind, ViewFieldKind::NumberInput { .. }));
         let is_button_row_field = view.fields.get(selected).is_some_and(|f| {
             !f.disabled
                 && matches!(
@@ -1301,6 +1340,45 @@ impl Engine {
                     // The dock never holds keyboard focus (see the `Date`
                     // arm's identical comment above), so a `combo_box` key
                     // never actually reaches this arm in practice.
+                    PluginViewHost::Dock => false,
+                };
+            }
+        }
+
+        // `number_input`: forward every key the embedded
+        // `quadraui::NumberInput` recognises (digits/`-`/`.`, `Backspace`,
+        // `Up`/`Down`, `Enter`, `Escape`) to the shared
+        // `quadraui::FormController`, which drives its draft/step/commit/
+        // cancel logic directly — see `number_input_key_from`'s doc for why
+        // a key it has no path for at all (letters, `Home`/`End`/`Left`/
+        // `Right`/function keys) instead falls through to the generic
+        // dispatch below, same as an unclaimed key on any other field kind.
+        if is_number_input_field {
+            if let Some(quadraui_key) = number_input_key_from(key, unicode) {
+                let event = quadraui::UiEvent::KeyPressed {
+                    key: quadraui_key,
+                    modifiers: quadraui::Modifiers {
+                        ctrl,
+                        ..Default::default()
+                    },
+                    repeat: false,
+                };
+                return match host {
+                    PluginViewHost::Sidebar => {
+                        let rect = self.plugin_view_form_rect.get();
+                        crate::render::handle_plugin_view_ui_event(self, &event, rect)
+                    }
+                    PluginViewHost::Tab => {
+                        let rect = self.plugin_view_tab_form_rect.get();
+                        crate::render::handle_plugin_view_tab_ui_event(self, name, &event, rect)
+                    }
+                    PluginViewHost::Modal => {
+                        let rect = self.plugin_view_modal_form_rect.get();
+                        crate::render::handle_plugin_view_modal_ui_event(self, name, &event, rect)
+                    }
+                    // The dock never holds keyboard focus (see the `Date`
+                    // arm's identical comment above), so a `number_input`
+                    // key never actually reaches this arm in practice.
                     PluginViewHost::Dock => false,
                 };
             }
@@ -1506,6 +1584,15 @@ impl Engine {
                         // for `ColorPicker` (see `ViewFieldKind::Color`'s
                         // doc) — display-only until a popup/hex editor is
                         // designed.
+                        return true;
+                    }
+                    ViewFieldKind::NumberInput { .. } => {
+                        // Reached only for `Space`, which is not one of
+                        // `NumberInput::handle_key`'s own claimed keys
+                        // (it is not an ASCII digit/`-`/`.`): every other
+                        // key is intercepted above (see
+                        // `is_number_input_field`) and forwarded to the
+                        // `FormController`, including `Enter`/`Up`/`Down`.
                         return true;
                     }
                     ViewFieldKind::Toolbar { buttons } => {

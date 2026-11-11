@@ -4903,6 +4903,14 @@ pub struct Engine {
     /// on demand by the first key that touches a focused `combo_box` field;
     /// cleared on blur, commit (Enter) or cancel (Escape).
     pub plugin_view_combo_edit: Option<crate::core::plugin_ui::PluginViewComboBoxEditState>,
+    /// Local interaction state for whichever plugin-view `number_input`
+    /// field currently has keyboard focus — the `number_input` twin of
+    /// `plugin_view_combo_edit`, same "quadraui's `FormController` keeps no
+    /// shadow cache of its own" reasoning. Created on demand by the first
+    /// digit typed into a focused `number_input` field; cleared on blur,
+    /// a stepper step/commit (Enter) or cancel (Escape) — see
+    /// [`crate::core::plugin_ui::PluginViewNumberEditState`]'s doc.
+    pub plugin_view_number_edit: Option<crate::core::plugin_ui::PluginViewNumberEditState>,
     /// Flat selection index for a `vimcode.ui.register_view` view hosted as an
     /// editor-area tab — the tab twin of `ext_panel_selected`. Kept separate
     /// from `ext_panel_selected` (rather than shared) because the sidebar and a
@@ -5986,6 +5994,7 @@ impl Engine {
             plugin_view_render_depth: 0,
             plugin_view_text_edit: None,
             plugin_view_combo_edit: None,
+            plugin_view_number_edit: None,
             plugin_view_tab_selected: 0,
             plugin_view_tab_scroll_top: 0,
             plugin_view_tab_form_controller: std::cell::RefCell::new(

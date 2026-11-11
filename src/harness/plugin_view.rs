@@ -159,6 +159,29 @@ pub const ROW_COMBO_FILTER: &str = "CmA";
 /// option — the full [`ROW_COMBO_OPTION_A`] string, proving the committed
 /// value came from the *option list*, not merely the typed filter text.
 pub const ROW_COMBO_COMMITTED: &str = ROW_COMBO_OPTION_A;
+/// A `number_input`-kind row's label. Declared last in the field stack
+/// (after `cmb`) so this row's addition cannot shift any existing
+/// scenario's `Tab`-count-based navigation — same convention
+/// [`ROW_COMBO_LABEL`]'s doc names.
+pub const ROW_NUMBER_LABEL: &str = "NbZ";
+/// That row's plugin-declared initial value, as `quadraui`'s
+/// `draw_field_number_input` paints it at the field's default `precision`
+/// of 0 decimal places (`format!("{{value:.0}}")`) — unlike
+/// [`ROW_SLIDER_INITIAL`]'s two-decimal `"6.00"`, a bare `NumberInput`
+/// paints no decimal point at all.
+pub const ROW_NUMBER_INITIAL: &str = "42";
+/// The value painted after one `Up` arrow-key step — `quadraui::
+/// FormController` drives this natively (unlike the `slider` field, which
+/// has no native keyboard path at all), stepping by the declared `step`
+/// (17) and clamping to `[min, max]`.
+pub const ROW_NUMBER_STEPPED: &str = "59";
+/// Typed into the focused `number_input` field after the stepper above —
+/// replaces the embedded `NumberInput`'s in-progress draft, which paints
+/// in place of the committed value until `Enter` confirms it.
+pub const ROW_NUMBER_TYPED: &str = "71";
+/// The value painted after `Enter` confirms [`ROW_NUMBER_TYPED`] — parsed,
+/// clamped to `[min, max]` (7 is already in range, so it commits verbatim).
+pub const ROW_NUMBER_COMMITTED: &str = ROW_NUMBER_TYPED;
 
 /// Registered view name for the `section`-kind fixture: a labelled,
 /// non-collapsible group (a `Section` header immediately followed by a
@@ -819,6 +842,10 @@ end)
 pub const COUNT_0: &str = "n0ZQ146";
 /// See [`COUNT_0`].
 pub const COUNT_1: &str = "n1ZQ146";
+/// See [`COUNT_0`] — after two activations (used by the `number_input`
+/// scenario, whose stepper step and typed commit each bump the counter
+/// once).
+pub const COUNT_2: &str = "n2ZQ146";
 
 /// The registered view's name for the dock's row-0 click-routing regression
 /// fixture: a view whose *first* declared field is the clickable one.
@@ -848,6 +875,7 @@ local count = 0
 local date_value = "{ROW_DATE_INITIAL}"
 local slider_value = 6.0
 local combo_value = ""
+local number_value = 42.0
 
 vimcode.ui.register_view("{VIEW}", {{
   title = "{VIEW_TITLE}",
@@ -879,6 +907,8 @@ vimcode.ui.register_view("{VIEW}", {{
         {{ type = "combo_box", id = "cmb", label = "{ROW_COMBO_LABEL}",
            options = {{"{ROW_COMBO_OPTION_A}", "{ROW_COMBO_OPTION_B}"}},
            value = combo_value }},
+        {{ type = "number_input", id = "vol2", label = "{ROW_NUMBER_LABEL}",
+           value = number_value, min = 0.0, max = 100.0, step = 17.0 }},
       }},
     }}
   end,
@@ -906,6 +936,10 @@ vimcode.ui.register_view("{VIEW}", {{
       -- deliberately *not* matched above, so only the committed selection
       -- (Enter) bumps the counter.
       combo_value = event.value
+      count = count + 1
+    elseif event.widget_id == "vol2"
+        and (event.kind == "NumberChanged" or event.kind == "NumberCommitted") then
+      number_value = event.value
       count = count + 1
     end
   end,
@@ -2118,6 +2152,98 @@ pub fn combo_box_filter_and_commit_reaches_the_plugin_handler(driver: &mut impl 
         "Enter on the focused combo box must reach the plugin's on_event \
          handler as ComboBoxChanged and repaint ({COUNT_1:?}); painted runs \
          were {:?}",
+        painted(driver)
+    );
+}
+
+/// Scenario 4e — a focused `number_input` field: `Up` steps its committed
+/// value by `step` (clamped to `[min, max]`) immediately, reaching the
+/// plugin's `on_event` handler as `NumberChanged` — unlike the `slider`
+/// field above, `quadraui::FormController` drives this natively. Typing
+/// digits then confirming with `Enter` instead reaches it as
+/// `NumberCommitted`, with the in-progress typed draft visible but not yet
+/// reported to the plugin.
+///
+/// `Tab` x9 from the initially-focused `url` field walks past `tls`,
+/// `send`, `etx`, `dob`, `vol`, `swt`, `tbr` and `cmb` onto `vol2`, the
+/// last declared field (appended after every pre-existing one, including
+/// `combo_box`'s own, so this scenario cannot shift any other scenario's
+/// `Tab`-count navigation).
+///
+/// RED-verified: replacing `render::plugin_view_event_from_form_event`'s
+/// `NumberChanged`/`NumberCommitted` arms with a fall-through to `_ =>
+/// return None` makes every assertion below but the first two fail — the
+/// screen keeps showing [`ROW_NUMBER_INITIAL`] instead of
+/// [`ROW_NUMBER_STEPPED`]/[`ROW_NUMBER_COMMITTED`] and the counter never
+/// advances past [`COUNT_0`] — while every other `plugin_view` scenario,
+/// including the slider and combo-box ones above, stays green.
+pub fn number_input_step_and_commit_reaches_the_plugin_handler(
+    driver: &mut impl ConformanceDriver,
+) {
+    assert!(
+        driver.screen_has(ROW_NUMBER_INITIAL),
+        "precondition: the number row must start at {ROW_NUMBER_INITIAL:?}; \
+         painted runs were {:?}",
+        painted(driver)
+    );
+    assert!(
+        driver.screen_has(COUNT_0),
+        "precondition: the counter row must start at {COUNT_0:?}; painted \
+         runs were {:?}",
+        painted(driver)
+    );
+    for _ in 0..9 {
+        driver.press_named(quadraui::NamedKey::Tab);
+    }
+    driver.press_named(quadraui::NamedKey::Up);
+    assert!(
+        driver.screen_has(ROW_NUMBER_STEPPED),
+        "Up on the focused number_input field must step its value by one \
+         `step` and repaint it ({ROW_NUMBER_STEPPED:?}); painted runs were \
+         {:?}",
+        painted(driver)
+    );
+    assert!(
+        driver.screen_has(COUNT_1),
+        "Up on the focused number_input field must reach the plugin's \
+         on_event handler as NumberChanged and repaint ({COUNT_1:?}); \
+         painted runs were {:?}",
+        painted(driver)
+    );
+    assert!(
+        !driver.screen_has(ROW_NUMBER_INITIAL),
+        "the stale number value {ROW_NUMBER_INITIAL:?} must not still be \
+         painted after the view re-rendered; painted runs were {:?}",
+        painted(driver)
+    );
+
+    driver.type_text(ROW_NUMBER_TYPED);
+    assert!(
+        driver.screen_has(ROW_NUMBER_TYPED),
+        "typing {ROW_NUMBER_TYPED:?} into the focused number_input field \
+         must insert it into the painted draft; painted runs were {:?}",
+        painted(driver)
+    );
+    assert!(
+        driver.screen_has(COUNT_1),
+        "the in-progress typed draft reaches vimcode only as \
+         NumberDraftChanged, which never reaches on_event — the counter \
+         must still read {COUNT_1:?}; painted runs were {:?}",
+        painted(driver)
+    );
+    driver.press_named(quadraui::NamedKey::Enter);
+    assert!(
+        driver.screen_has(ROW_NUMBER_COMMITTED),
+        "Enter on the focused number_input field must commit the typed \
+         draft and repaint it ({ROW_NUMBER_COMMITTED:?}); painted runs \
+         were {:?}",
+        painted(driver)
+    );
+    assert!(
+        driver.screen_has(COUNT_2),
+        "Enter on the focused number_input field must reach the plugin's \
+         on_event handler as NumberCommitted and repaint ({COUNT_2:?}); \
+         painted runs were {:?}",
         painted(driver)
     );
 }
@@ -4509,6 +4635,12 @@ mod tests {
     }
 
     #[test]
+    fn plugin_view_number_input_step_and_commit_reaches_the_handler_on_tui() {
+        let (mut h, _dir) = tui();
+        number_input_step_and_commit_reaches_the_plugin_handler(&mut h.driver);
+    }
+
+    #[test]
     fn plugin_view_tab_paints_and_click_reaches_the_handler_on_tui() {
         let (mut h, _dir) = tui_tab();
         tab_paints_and_click_reaches_the_plugin_handler(&mut h.driver);
@@ -5167,6 +5299,13 @@ mod tests {
     fn plugin_view_combo_box_filter_and_commit_reaches_the_handler_on_gtk() {
         let (mut h, _dir) = gtk();
         combo_box_filter_and_commit_reaches_the_plugin_handler(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_number_input_step_and_commit_reaches_the_handler_on_gtk() {
+        let (mut h, _dir) = gtk();
+        number_input_step_and_commit_reaches_the_plugin_handler(&mut h.driver);
     }
 
     #[cfg(feature = "gui")]
