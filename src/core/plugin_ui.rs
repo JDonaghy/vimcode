@@ -1319,6 +1319,19 @@ pub enum ViewEventKind {
     /// [`PluginViewEvent::widget_id`], not duplicated here.
     ToolbarButtonClicked,
     FocusChanged,
+    /// The user abandoned a view hosted in the modal
+    /// (`vimcode.ui.open_view(name, {location = "modal"})`) — `Escape`, or a
+    /// click on the scrim outside the dialog — so a plugin can tell "the
+    /// dialog was dismissed" from "nothing happened yet" without having to
+    /// own a Cancel button. Carries no payload, and names the view itself
+    /// rather than a field, so [`PluginViewEvent::widget_id`] is empty.
+    ///
+    /// A `vimcode.ui.close_view` the plugin issued itself does *not* fire
+    /// this: the plugin already knows it asked for the close, and firing
+    /// from inside the plugin's own callback would be swallowed by the
+    /// dispatch reentrancy guard anyway. Neither does opening a second view
+    /// into the single modal slot.
+    Dismissed,
     // ── ViewBody events ──────────────────────────────────────────────────
     /// A `List`/`Table` row moved into selection (index into
     /// `items`/`rows`). `col` is the 0-based column a mouse click landed in
@@ -1408,6 +1421,7 @@ impl ViewEventKind {
             ViewEventKind::SectionToggled { .. } => "SectionToggled",
             ViewEventKind::ToolbarButtonClicked => "ToolbarButtonClicked",
             ViewEventKind::FocusChanged => "FocusChanged",
+            ViewEventKind::Dismissed => "Dismissed",
             ViewEventKind::ItemSelected { .. } => "ItemSelected",
             ViewEventKind::ItemActivated { .. } => "ItemActivated",
             ViewEventKind::NodeSelected { .. } => "NodeSelected",

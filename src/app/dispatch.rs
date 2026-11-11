@@ -605,16 +605,20 @@ impl App {
         // `vimcode.ui.open_view(name, {location = "modal"})` owns every
         // pointer event while open, ahead of the sidebar/editor routers below
         // (the modal is centred, so it overlaps the sidebar too): a left
-        // press routes through `render::route_plugin_view_modal_click`, a
-        // wheel notch scrolls the modal's body, and every other pointer
-        // event is swallowed so nothing beneath the scrim reacts to it.
+        // press (or double-click, which the modal treats as the press it
+        // contains — `handle_plugin_view_modal_ui_event` probes `FormController`
+        // with exactly that translation) routes through
+        // `render::route_plugin_view_modal_click`, a wheel notch scrolls the
+        // modal's body, and every other pointer event is swallowed so nothing
+        // beneath the scrim reacts to it.
         if self.engine.borrow().plugin_view_modal.is_some() {
             let consumed = match &event {
                 UiEvent::MouseDown {
                     button: MouseButton::Left,
                     position,
                     ..
-                } => {
+                }
+                | UiEvent::DoubleClick { position, .. } => {
                     render::route_plugin_view_modal_click(&mut self.engine.borrow_mut(), *position);
                     true
                 }
@@ -626,9 +630,7 @@ impl App {
                     }
                     true
                 }
-                UiEvent::MouseDown { .. }
-                | UiEvent::MouseUp { .. }
-                | UiEvent::DoubleClick { .. } => true,
+                UiEvent::MouseDown { .. } | UiEvent::MouseUp { .. } => true,
                 _ => false,
             };
             if consumed {
