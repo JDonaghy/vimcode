@@ -618,6 +618,34 @@ pub fn populate_plugin_view_dock_form_controller(
     true
 }
 
+/// Populate `Engine::plugin_view_modal_form_controller` from the named
+/// plugin view — the modal twin of [`populate_plugin_view_dock_form_controller`],
+/// reading `plugin_view_modal_*` interaction state. The caller is the shell's
+/// `FrameOp::PluginViewModal` rung, which resolves the view name from
+/// `Engine::plugin_view_modal`.
+///
+/// Returns `false` when `name` isn't a registered view.
+pub fn populate_plugin_view_modal_form_controller(engine: &Engine, name: &str) -> bool {
+    let Some(view) = engine.plugin_views.get(name) else {
+        return false;
+    };
+    let form = plugin_view_to_form_with_row_focus(
+        name,
+        view,
+        engine.plugin_view_modal_selected,
+        engine.plugin_view_modal_scroll_top,
+        true,
+        engine.plugin_view_text_edit.as_ref(),
+        engine.plugin_view_combo_edit.as_ref(),
+        engine.plugin_view_row_focus(PluginViewHost::Modal),
+    );
+    let mut fc = engine.plugin_view_modal_form_controller.borrow_mut();
+    fc.set_form(form);
+    fc.set_scroll_offset(engine.plugin_view_modal_scroll_top);
+    fc.set_has_focus(true);
+    true
+}
+
 /// Route a pointer event over a plugin view through the shared
 /// `quadraui::FormController` and dispatch whatever widget event it resolves to
 /// the plugin's `on_event` callback.
@@ -854,6 +882,212 @@ pub fn handle_plugin_view_dock_ui_event(
                 crate::core::engine::PluginViewHost::Dock,
                 idx,
             );
+        }
+    }
+    if matches!(kind, ViewEventKind::FocusChanged) {
+        return true;
+    }
+    engine.dispatch_plugin_view_event(PluginViewEvent {
+        view: view_name,
+        widget_id: field_id,
+        kind,
+    });
+    true
+}
+
+/// The centred rect the plugin-view modal occupies within `viewport`:
+/// 60 % of its width (at least 40 columns' worth of `cw`, clamped to the
+/// viewport) and 60 % of its height, centred.
+pub fn plugin_view_modal_rect(viewport: quadraui::Rect, cw: f32) -> quadraui::Rect {
+    let w = (viewport.width * 0.6)
+        .max(40.0 * cw)
+        .min(viewport.width)
+        .round();
+    let h = (viewport.height * 0.6).round();
+    let x = viewport.x + ((viewport.width - w) / 2.0).round();
+    let y = viewport.y + ((viewport.height - h) / 2.0).round();
+    quadraui::Rect::new(x, y, w, h)
+}
+
+/// Paint the plugin-view modal (`Engine::plugin_view_modal`) into
+/// `modal_rect`: a title bar carrying the view's title above the view's
+/// body. The body rect is cached in `Engine::plugin_view_modal_form_rect`
+/// for the click router. Only the field-stack `Form` default and the
+/// `TextView` body kind paint anything — the other body kinds have no
+/// modal-hosted layout cache, the same "accepted, not yet wired" precedent
+/// the dock host follows. The caller paints the scrim first.
+pub fn paint_plugin_view_modal(
+    engine: &Engine,
+    modal_rect: quadraui::Rect,
+    theme: &Theme,
+    backend: &mut dyn quadraui::Backend,
+) {
+    let Some(name) = engine.plugin_view_modal.as_deref() else {
+        return;
+    };
+    engine.plugin_view_modal_rect.set(modal_rect);
+    let title = engine.plugin_view_title(name);
+    let panel = SidebarPanelBody {
+        background: Some(theme.tab_bar_bg),
+        chrome: SidebarPanelChrome::StatusBars(vec![quadraui::StatusBar {
+            id: quadraui::WidgetId::new("plugin-view-modal-title"),
+            left_segments: vec![quadraui::StatusBarSegment {
+                text: format!(" {title}"),
+                fg: theme.foreground,
+                bg: theme.completion_bg.lighten(0.08),
+                bold: true,
+                action_id: None,
+            }],
+            right_segments: Vec::new(),
+        }]),
+        scrollbar_gutter: None,
+    };
+    panel.render_with(backend, modal_rect, |backend, body| {
+        engine.plugin_view_modal_form_rect.set(body);
+        let kind = engine
+            .plugin_views
+            .get(name)
+            .and_then(|v| v.body.as_ref())
+            .map(|b| b.kind_name());
+        match kind {
+            None => {
+                if populate_plugin_view_modal_form_controller(engine, name) {
+                    engine
+                        .plugin_view_modal_form_controller
+                        .borrow_mut()
+                        .render_and_cache(backend, body);
+                }
+            }
+            Some("text_view") => {
+                paint_plugin_view_text(engine, name, PluginViewHost::Modal, true, body, backend);
+            }
+            Some(_) => {}
+        }
+    });
+}
+
+/// Route a left press at `position` while the plugin-view modal is open.
+/// Returns `false` (nothing consumed) only when no modal is open; otherwise
+/// the modal swallows the press: inside a `Form`-kind view's body it routes
+/// through [`handle_plugin_view_modal_ui_event`], elsewhere inside the modal
+/// it is inert, and outside the modal it dismisses it
+/// (`Engine::dismiss_plugin_view_modal`), like clicking a dialog's scrim.
+pub fn route_plugin_view_modal_click(engine: &mut Engine, position: quadraui::Point) -> bool {
+    let Some(name) = engine.plugin_view_modal.clone() else {
+        return false;
+    };
+    let modal_rect = engine.plugin_view_modal_rect.get();
+    if !modal_rect.contains(position) {
+        engine.dismiss_plugin_view_modal();
+        return true;
+    }
+    let body = engine.plugin_view_modal_form_rect.get();
+    let is_form = engine.plugin_views.get(&name).is_some_and(|v| v.is_form());
+    if is_form && body.contains(position) {
+        let event = quadraui::UiEvent::MouseDown {
+            widget: None,
+            button: quadraui::MouseButton::Left,
+            position,
+            modifiers: quadraui::Modifiers::default(),
+        };
+        handle_plugin_view_modal_ui_event(engine, &name, &event, body);
+    }
+    true
+}
+
+/// Scroll the open plugin-view modal's body by a wheel `delta_y` (backend
+/// polarity: positive scrolls down, the same polarity
+/// `Engine::handle_plugin_view_dock_scroll` takes). A `TextView` body
+/// scrolls its text; a `Form` body scrolls its field stack.
+pub fn scroll_plugin_view_modal(engine: &mut Engine, delta_y: f32) {
+    let Some(name) = engine.plugin_view_modal.clone() else {
+        return;
+    };
+    let kind = engine
+        .plugin_views
+        .get(&name)
+        .and_then(|v| v.body.as_ref())
+        .map(|b| b.kind_name());
+    match kind {
+        Some("text_view") => {
+            let step = (delta_y.abs() * 3.0).ceil() as i32 * delta_y.signum() as i32;
+            scroll_plugin_view_text(engine, &name, PluginViewHost::Modal, step);
+        }
+        None => {
+            let body = engine.plugin_view_modal_form_rect.get();
+            let center =
+                quadraui::Point::new(body.x + body.width / 2.0, body.y + body.height / 2.0);
+            let event = quadraui::UiEvent::Scroll {
+                widget: None,
+                position: center,
+                delta: quadraui::ScrollDelta::new(0.0, -delta_y),
+            };
+            handle_plugin_view_modal_ui_event(engine, &name, &event, body);
+        }
+        Some(_) => {}
+    }
+}
+
+/// Route a pointer or forwarded key event over the modal-hosted plugin view
+/// — the modal twin of [`handle_plugin_view_dock_ui_event`]. `name` is
+/// `Engine::plugin_view_modal`'s payload; `rect` must be the rect the
+/// `FrameOp::PluginViewModal` rung last painted the view's `Form` into
+/// (cached in `Engine::plugin_view_modal_form_rect`).
+///
+/// Returns `true` when the event was consumed.
+pub fn handle_plugin_view_modal_ui_event(
+    engine: &mut Engine,
+    name: &str,
+    event: &quadraui::UiEvent,
+    rect: quadraui::Rect,
+) -> bool {
+    use crate::core::plugin_ui::{PluginViewEvent, ViewEventKind};
+
+    if !populate_plugin_view_modal_form_controller(engine, name) {
+        return false;
+    }
+    let probe = match event {
+        quadraui::UiEvent::DoubleClick { widget, position } => quadraui::UiEvent::MouseDown {
+            widget: *widget,
+            button: quadraui::MouseButton::Left,
+            position: *position,
+            modifiers: quadraui::Modifiers::default(),
+        },
+        other => other.clone(),
+    };
+    let result = engine
+        .plugin_view_modal_form_controller
+        .borrow_mut()
+        .handle_cached(&probe, rect);
+
+    let sync_scroll = |engine: &mut Engine| {
+        let offset = engine
+            .plugin_view_modal_form_controller
+            .borrow()
+            .scroll_offset();
+        engine.plugin_view_modal_scroll_top = offset;
+    };
+
+    let action = match result {
+        quadraui::FormControllerEvent::Ignored => return false,
+        quadraui::FormControllerEvent::ScrollChanged | quadraui::FormControllerEvent::Consumed => {
+            sync_scroll(engine);
+            return true;
+        }
+        quadraui::FormControllerEvent::FormAction(action) => action,
+    };
+    sync_scroll(engine);
+    apply_combo_box_form_action(engine, &action);
+
+    let Some((view_name, field_id, mut kind)) = plugin_view_event_from_form_event(&action) else {
+        return true;
+    };
+    kind = remap_section_toggle(engine, &view_name, &field_id, kind);
+    kind = remap_styled_button_focus(engine, &view_name, &field_id, kind);
+
+    if let Some(view) = engine.plugin_views.get(&view_name) {
+        if let Some(idx) = view.field_index(&field_id) {
+            engine.plugin_view_focus_field(&view_name, PluginViewHost::Modal, idx);
         }
     }
     if matches!(kind, ViewEventKind::FocusChanged) {

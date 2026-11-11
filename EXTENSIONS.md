@@ -1074,12 +1074,22 @@ vimcode.ui.close_view("my_view")
 later, and may use the whole `vimcode.*` API — including the immediate
 `vimcode.buffer.*` / `vimcode.window.*` API.
 
-`open_view(name, opts)` is an immediate call. `"tab"` is the only `location` (and the
-default). An unknown view name or any other location raises an error. The tab behaves
-like any other tab: close it with `:tabclose`, split it or move it between groups.
+`open_view(name, opts)` is an immediate call. `location` is one of `"tab"` (the
+default), `"split"`/`"vsplit"` (with an optional `side`), `"dock"` (the bottom panel)
+or `"modal"`. An unknown view name or any other location raises an error. The tab
+behaves like any other tab: close it with `:tabclose`, split it or move it between
+groups.
+
+`{ location = "modal" }` shows the view in a centred dialog over a dimmed editor —
+the shape for a connection form or a confirm-and-submit dialog. There is one modal
+slot: opening the same view again just re-focuses it, and opening another view
+replaces it. The modal takes the keyboard (its first focusable field is focused, so
+a form is typeable straight away) and every click; `Escape` (when the focused field
+doesn't claim it), a click outside the dialog, or `close_view(name)` dismisses it.
+`Form` and `text_view` views paint in a modal; other body kinds open an empty one.
 
 `close_view(name) -> bool` is the immediate-call counterpart: it closes every tab,
-split window and dock slot currently showing `name`, returning `false` if `name`
+split window, dock slot and modal currently showing `name`, returning `false` if `name`
 wasn't open anywhere. An unknown view name raises an error, matching `open_view`.
 Each closed window goes through the same path `:q`/`<C-w>c` use, so it can never
 close the editor's very last window — a plugin cannot use this to quit vimcode.

@@ -135,6 +135,12 @@ pub enum FrameOp {
     /// Painted when `Engine::settings_modal_open` is true instead of the
     /// `PANEL_SETTINGS` arm of [`Self::SidebarPanel`].
     SettingsModal,
+    /// A `vimcode.ui.register_view` view opened with `{location = "modal"}`
+    /// (`Engine::plugin_view_modal`): a scrim plus the view's body in a
+    /// centred panel. Routed at its own call site (keys in
+    /// `Engine::handle_key`, clicks in `App::handle_mouse_click_msg`) rather
+    /// than through [`route_modal_overlay_click`].
+    PluginViewModal,
     /// `Backend::draw_dialog` — modal, so above every rung but the toasts,
     /// matching [`route_modal_overlay_click`]'s own arbitration.
     Dialog,
@@ -162,6 +168,7 @@ impl FrameOp {
                 | FrameOp::ContextMenu
                 | FrameOp::ChangeReview
                 | FrameOp::SettingsModal
+                | FrameOp::PluginViewModal
                 | FrameOp::Dialog
                 | FrameOp::ToastStack
         )
@@ -176,10 +183,10 @@ impl FrameOp {
 /// Adding a surface means adding a variant here: a compile error in both
 /// backends' `match` until both handle it.
 ///
-/// The five chrome rungs come first, the eleven overlay rungs
+/// The five chrome rungs come first, the twelve overlay rungs
 /// ([`FrameOp::is_overlay`]) are the tail: every chrome rung is composed before
 /// the first overlay rung, on both backends.
-pub const FRAME_Z_ORDER: [FrameOp; 16] = [
+pub const FRAME_Z_ORDER: [FrameOp; 17] = [
     // ── chrome ───────────────────────────────────────────────────────────
     FrameOp::MenuRow,
     FrameOp::SidebarPanel,
@@ -196,6 +203,7 @@ pub const FRAME_Z_ORDER: [FrameOp; 16] = [
     FrameOp::ContextMenu,
     FrameOp::ChangeReview,
     FrameOp::SettingsModal,
+    FrameOp::PluginViewModal,
     FrameOp::Dialog,
     FrameOp::ToastStack,
 ];
@@ -230,6 +238,7 @@ pub struct FramePresence {
     pub context_menu: bool,
     pub change_review: bool,
     pub settings_modal: bool,
+    pub plugin_view_modal: bool,
     pub dialog: bool,
     pub toast_stack: bool,
 }
@@ -289,6 +298,7 @@ impl FramePresence {
                 .is_some_and(|p| !p.items.is_empty()),
             change_review: screen.change_review.is_some(),
             settings_modal: false,
+            plugin_view_modal: false,
             dialog: screen.dialog.is_some(),
             toast_stack: false,
         }
@@ -311,6 +321,7 @@ impl FramePresence {
             FrameOp::ContextMenu => self.context_menu,
             FrameOp::ChangeReview => self.change_review,
             FrameOp::SettingsModal => self.settings_modal,
+            FrameOp::PluginViewModal => self.plugin_view_modal,
             FrameOp::Dialog => self.dialog,
             FrameOp::ToastStack => self.toast_stack,
         }

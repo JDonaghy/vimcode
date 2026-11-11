@@ -5639,22 +5639,25 @@ impl PluginManager {
         // window split alongside the active window (`{location = "split"}`
         // for a horizontal/top-bottom split, `{location = "vsplit"}` for a
         // vertical/left-right split — vim's own `:split`/`:vsplit` naming),
-        // or the single reusable bottom-panel slot (`{location = "dock"}`).
+        // the single reusable bottom-panel slot (`{location = "dock"}`), or
+        // the single reusable centred modal over the editor (`{location =
+        // "modal"}` — takes keyboard focus; `Escape`, a click outside it or
+        // `close_view` dismisses it).
         // An optional `side` (`"above"`/`"below"` for `"split"`, `"left"`/
         // `"right"` for `"vsplit"`) pins which sibling the new window lands
         // on, overriding `splitbelow`/`splitright`; omitting it falls back
         // to those settings, the way `<C-w>s`/`<C-w>v` already do. `"dock"`
-        // ignores `side` (there is only ever one dock slot, re-pointed to
-        // `name` and re-shown if it isn't already — the "reuse by name"
-        // behaviour: the same `name` opened twice never creates a second
-        // surface). A call with an unsupported `location`/`side`, a `side`
+        // and `"modal"` ignore `side` (there is only ever one slot of each,
+        // re-pointed to `name` and re-shown if it isn't already — the
+        // "reuse by name" behaviour: the same `name` opened twice never
+        // creates a second surface). A call with an unsupported `location`/`side`, a `side`
         // from the wrong axis (e.g. `"left"` with `location = "split"`), or
         // a `name` that isn't a registered view is a Lua error rather than
         // a silent no-op, matching `register_view`'s "fail loudly at the
         // Lua/Rust boundary" convention.
         //
         // Immediate ("live engine") API, like `vimcode.buffer.*`: opening a
-        // tab, split or dock is a structural engine mutation
+        // tab, split, dock or modal is a structural engine mutation
         // (`Engine::open_plugin_view_tab`/`open_plugin_view_split`/
         // `open_plugin_view_dock`), not queued output data, so it needs
         // `live_engine` the way `vimcode.buffer.create` does rather than a
@@ -5674,6 +5677,9 @@ impl PluginManager {
                     })?,
                     "dock" => live_engine("vimcode.ui.open_view", move |e| {
                         e.open_plugin_view_dock(&name)
+                    })?,
+                    "modal" => live_engine("vimcode.ui.open_view", move |e| {
+                        e.open_plugin_view_modal(&name)
                     })?,
                     "split" | "vsplit" => {
                         let direction = if location == "vsplit" {
@@ -5720,7 +5726,8 @@ impl PluginManager {
                     other => {
                         return Err(LuaError::RuntimeError(format!(
                             "vimcode.ui.open_view({name:?}): unsupported location {other:?} \
-                             (expected \"tab\", \"dock\", \"split\" or \"vsplit\")"
+                             (expected \"tab\", \"dock\", \"modal\", \"split\" or \
+                             \"vsplit\")"
                         )));
                     }
                 };
@@ -5734,7 +5741,7 @@ impl PluginManager {
         )?;
 
         // vimcode.ui.close_view(name) -> bool. Closes every tab, split
-        // window and dock slot currently showing a view opened via
+        // window, dock slot and modal currently showing a view opened via
         // `vimcode.ui.open_view` — a form's Cancel button, or a successful
         // submit that should dismiss its own dialog, has something to call.
         // `false` when `name` was registered but not open anywhere; the

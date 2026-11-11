@@ -416,6 +416,7 @@ impl quadraui::ShellApp for App {
         // what reached the canvas.
         presence.dialog = screen.dialog.is_some() && !self.native_dialog_shown.get();
         presence.settings_modal = engine.settings_modal_open;
+        presence.plugin_view_modal = engine.plugin_view_modal.is_some();
 
         // Measure the title-bar band whenever the Command Center rung
         // is live, independent of whether `FrameOp::MenuRow` itself composes.
@@ -919,6 +920,25 @@ impl quadraui::ShellApp for App {
                         quadraui::Backend::set_current_line_height(backend, px);
                     }
                     composed.push(render::FrameOp::SettingsModal);
+                }
+
+                // ── Plugin-view modal ───────────────────────────────────────────
+                // `vimcode.ui.open_view(name, {location = "modal"})`: scrim,
+                // then the view in a centred panel — all in the shared
+                // `render::paint_plugin_view_modal`.
+                render::FrameOp::PluginViewModal => {
+                    let scrim_rect =
+                        render::modal_scrim_rect(&engine, &el, popup_viewport.width, y as f32, lh);
+                    backend.draw_solid_fill(scrim_rect, render::MODAL_SCRIM_COLOR);
+                    let modal_rect = render::plugin_view_modal_rect(popup_viewport, cw as f32);
+                    backend.set_editor_font(&editor_family, editor_size_pt);
+                    render::paint_plugin_view_modal(&engine, modal_rect, &theme, backend);
+                    if let Some(px) =
+                        resolve_editor_line_height_px(&engine.settings, backend, editor_size_pt)
+                    {
+                        quadraui::Backend::set_current_line_height(backend, px);
+                    }
+                    composed.push(render::FrameOp::PluginViewModal);
                 }
 
                 // ── Modal dialog ────────────────────────────────────────────────

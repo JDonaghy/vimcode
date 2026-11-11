@@ -145,6 +145,10 @@ pub(crate) enum PluginViewHost {
     Sidebar,
     Tab,
     Dock,
+    /// A centred modal over the editor (`Engine::open_plugin_view_modal`).
+    /// Unlike the dock it *does* take keyboard focus — a modal owns every
+    /// key until it is dismissed.
+    Modal,
 }
 
 impl Engine {
@@ -295,7 +299,7 @@ impl Engine {
     /// are unreachable for a view that is actually registered — they exist
     /// only so a caller that somehow asks for an unregistered name gets a
     /// sane title instead of a panic.
-    fn plugin_view_title(&self, name: &str) -> String {
+    pub(crate) fn plugin_view_title(&self, name: &str) -> String {
         self.plugin_manager
             .as_ref()
             .and_then(|pm| pm.view_title(name))
@@ -547,14 +551,94 @@ impl Engine {
         true
     }
 
-    /// Close every tab, split window and dock slot currently showing `name`
+    /// Open or re-focus `name` (a `vimcode.ui.register_view` view) as a
+    /// centred modal over the editor, the way `vimcode.ui.open_view(name,
+    /// {location = "modal"})` is wired.
+    ///
+    /// Like the dock there is exactly one modal slot, so "reuse by name"
+    /// falls out of re-pointing [`Engine::plugin_view_modal`]: opening the
+    /// same view twice never stacks a second dialog, and opening a different
+    /// view replaces the current one. Unlike the dock, the modal takes
+    /// keyboard focus — every other panel's focus is cleared and the first
+    /// focusable field is selected, so a form is typeable the moment it
+    /// appears. `Escape` (when not consumed by the focused field), a click
+    /// outside the modal, or `vimcode.ui.close_view(name)` dismisses it
+    /// ([`Self::dismiss_plugin_view_modal`]).
+    ///
+    /// The modal paints `Form`- and `TextView`-kind views; other body kinds
+    /// are accepted (so a plugin can still open one) but paint an empty
+    /// modal, the same "accepted, not yet wired" precedent the dock follows.
+    pub fn open_plugin_view_modal(&mut self, name: &str) -> bool {
+        if !self.is_plugin_view(name) {
+            return false;
+        }
+        if let Some(prev) = self.plugin_view_modal.clone() {
+            self.blur_plugin_view_text_edit(&prev, PluginViewHost::Modal);
+        }
+        self.clear_sidebar_focus();
+        self.terminal_has_focus = false;
+        self.plugin_view_modal = Some(name.to_string());
+        self.plugin_view_modal_scroll_top = 0;
+        // See `open_plugin_view_tab`'s doc for why the refresh must be
+        // deferred when called from inside an already-running plugin
+        // callback.
+        if self.plugin_dispatch_depth == 0 {
+            self.refresh_plugin_view(name);
+        } else {
+            self.plugin_view_tab_pending_refresh.push(name.to_string());
+        }
+        let first = self
+            .plugin_views
+            .get(name)
+            .and_then(|v| v.first_focusable())
+            .unwrap_or(0);
+        self.plugin_view_focus_field(name, PluginViewHost::Modal, first);
+        true
+    }
+
+    /// Dismiss the plugin-view modal, if one is open. A `TextArea` edit in
+    /// progress commits on the way out (the same blur rule every host
+    /// follows); a `Text`/`Password` edit is discarded. Returns whether a
+    /// modal was open.
+    pub fn dismiss_plugin_view_modal(&mut self) -> bool {
+        let Some(name) = self.plugin_view_modal.take() else {
+            return false;
+        };
+        // `blur_plugin_view_text_edit` reads the modal's selection, which
+        // survives `take()` above — only the slot's name is cleared.
+        self.blur_plugin_view_text_edit(&name, PluginViewHost::Modal);
+        self.plugin_view_combo_edit = None;
+        true
+    }
+
+    /// Route a key to the open plugin-view modal. Every key is consumed
+    /// while a modal is open — it is modal — and an `Escape` the focused
+    /// field doesn't claim for itself dismisses the modal. Returns `false`
+    /// only when no modal is open.
+    pub(crate) fn handle_plugin_view_modal_key(
+        &mut self,
+        key: &str,
+        ctrl: bool,
+        unicode: Option<char>,
+    ) -> bool {
+        let Some(name) = self.plugin_view_modal.clone() else {
+            return false;
+        };
+        let claimed = self.handle_plugin_view_key(&name, key, ctrl, unicode, PluginViewHost::Modal);
+        if !claimed && key == "Escape" {
+            self.dismiss_plugin_view_modal();
+        }
+        true
+    }
+
+    /// Close every tab, split window, dock slot and modal showing `name`
     /// (a `vimcode.ui.register_view` view), the way
     /// `vimcode.ui.close_view(name)` is wired.
     ///
     /// `None` when `name` isn't a registered view at all — the Lua wrapper
     /// turns that into a loud error, matching `vimcode.ui.open_view`'s "fail
     /// loudly at the Lua/Rust boundary" convention. `Some(false)` when `name`
-    /// is registered but not currently open as a tab, split, or dock — with
+    /// is registered but not currently open as a tab, split, dock or modal — with
     /// one caveat: if `name`'s only remaining window is the editor's one
     /// remaining window overall, the "refuse to close the last window"
     /// guard below also reports `Some(false)`, even though the view is
@@ -586,6 +670,10 @@ impl Engine {
         let caller_active = self.active_window_id();
         let message_before_close = self.message.clone();
         let mut closed = false;
+        if self.plugin_view_modal.as_deref() == Some(name) {
+            self.dismiss_plugin_view_modal();
+            closed = true;
+        }
         if let BottomPanelKind::Plugin(dock_name) = &self.bottom_panel_kind {
             if self.bottom_panel_open && dock_name == name {
                 self.bottom_panel_open = false;
@@ -651,6 +739,7 @@ impl Engine {
             PluginViewHost::Sidebar => self.ext_panel_selected,
             PluginViewHost::Tab => self.plugin_view_tab_selected,
             PluginViewHost::Dock => self.plugin_view_dock_selected,
+            PluginViewHost::Modal => self.plugin_view_modal_selected,
         }
     }
 
@@ -660,6 +749,7 @@ impl Engine {
             PluginViewHost::Sidebar => self.ext_panel_selected = idx,
             PluginViewHost::Tab => self.plugin_view_tab_selected = idx,
             PluginViewHost::Dock => self.plugin_view_dock_selected = idx,
+            PluginViewHost::Modal => self.plugin_view_modal_selected = idx,
         }
     }
 
@@ -671,6 +761,7 @@ impl Engine {
             PluginViewHost::Sidebar => self.ext_panel_scroll_top,
             PluginViewHost::Tab => self.plugin_view_tab_scroll_top,
             PluginViewHost::Dock => self.plugin_view_dock_scroll_top,
+            PluginViewHost::Modal => self.plugin_view_modal_scroll_top,
         }
     }
 
@@ -680,6 +771,7 @@ impl Engine {
             PluginViewHost::Sidebar => self.ext_panel_scroll_top = offset,
             PluginViewHost::Tab => self.plugin_view_tab_scroll_top = offset,
             PluginViewHost::Dock => self.plugin_view_dock_scroll_top = offset,
+            PluginViewHost::Modal => self.plugin_view_modal_scroll_top = offset,
         }
     }
 
@@ -693,6 +785,7 @@ impl Engine {
             PluginViewHost::Sidebar => self.ext_panel_table_col,
             PluginViewHost::Tab => self.plugin_view_tab_table_col,
             PluginViewHost::Dock => self.plugin_view_dock_table_col,
+            PluginViewHost::Modal => self.plugin_view_modal_table_col,
         }
     }
 
@@ -702,6 +795,7 @@ impl Engine {
             PluginViewHost::Sidebar => self.ext_panel_table_col = col,
             PluginViewHost::Tab => self.plugin_view_tab_table_col = col,
             PluginViewHost::Dock => self.plugin_view_dock_table_col = col,
+            PluginViewHost::Modal => self.plugin_view_modal_table_col = col,
         }
     }
 
@@ -714,6 +808,7 @@ impl Engine {
             PluginViewHost::Sidebar => self.ext_panel_row_focus,
             PluginViewHost::Tab => self.plugin_view_tab_row_focus,
             PluginViewHost::Dock => self.plugin_view_dock_row_focus,
+            PluginViewHost::Modal => self.plugin_view_modal_row_focus,
         }
     }
 
@@ -724,6 +819,7 @@ impl Engine {
             PluginViewHost::Sidebar => self.ext_panel_row_focus = idx,
             PluginViewHost::Tab => self.plugin_view_tab_row_focus = idx,
             PluginViewHost::Dock => self.plugin_view_dock_row_focus = idx,
+            PluginViewHost::Modal => self.plugin_view_modal_row_focus = idx,
         }
     }
 
@@ -756,6 +852,15 @@ impl Engine {
                     self.plugin_view_dock_scroll_top = sel;
                 } else if sel >= self.plugin_view_dock_scroll_top + ROWS {
                     self.plugin_view_dock_scroll_top = sel.saturating_sub(ROWS - 1);
+                }
+            }
+            PluginViewHost::Modal => {
+                const ROWS: usize = 20;
+                let sel = self.plugin_view_modal_selected;
+                if sel < self.plugin_view_modal_scroll_top {
+                    self.plugin_view_modal_scroll_top = sel;
+                } else if sel >= self.plugin_view_modal_scroll_top + ROWS {
+                    self.plugin_view_modal_scroll_top = sel.saturating_sub(ROWS - 1);
                 }
             }
         }
@@ -1045,6 +1150,10 @@ impl Engine {
                         let rect = self.plugin_view_tab_form_rect.get();
                         crate::render::handle_plugin_view_tab_ui_event(self, name, &event, rect)
                     }
+                    PluginViewHost::Modal => {
+                        let rect = self.plugin_view_modal_form_rect.get();
+                        crate::render::handle_plugin_view_modal_ui_event(self, name, &event, rect)
+                    }
                     // The dock never holds keyboard focus, so a
                     // Date-field key never actually reaches this arm in
                     // practice; it exists only to keep the match exhaustive.
@@ -1079,6 +1188,10 @@ impl Engine {
                     PluginViewHost::Tab => {
                         let rect = self.plugin_view_tab_form_rect.get();
                         crate::render::handle_plugin_view_tab_ui_event(self, name, &event, rect)
+                    }
+                    PluginViewHost::Modal => {
+                        let rect = self.plugin_view_modal_form_rect.get();
+                        crate::render::handle_plugin_view_modal_ui_event(self, name, &event, rect)
                     }
                     // The dock never holds keyboard focus (see the `Date`
                     // arm's identical comment above), so a `combo_box` key
@@ -1158,6 +1271,7 @@ impl Engine {
                     PluginViewHost::Sidebar => self.ext_panel_scroll_top = 0,
                     PluginViewHost::Tab => self.plugin_view_tab_scroll_top = 0,
                     PluginViewHost::Dock => self.plugin_view_dock_scroll_top = 0,
+                    PluginViewHost::Modal => self.plugin_view_modal_scroll_top = 0,
                 }
                 true
             }
@@ -1686,7 +1800,9 @@ impl Engine {
                     .get(&name)
                     .and_then(|v| v.first_focusable())
                 {
-                    if self.active_plugin_view_tab().as_deref() == Some(name.as_str()) {
+                    if self.plugin_view_modal.as_deref() == Some(name.as_str()) {
+                        self.plugin_view_focus_field(&name, PluginViewHost::Modal, first);
+                    } else if self.active_plugin_view_tab().as_deref() == Some(name.as_str()) {
                         self.plugin_view_focus_field(&name, PluginViewHost::Tab, first);
                     }
                 }

@@ -601,6 +601,42 @@ impl App {
             }
         }
 
+        // ── Plugin-view modal ────────────────────────────────────────────
+        // `vimcode.ui.open_view(name, {location = "modal"})` owns every
+        // pointer event while open, ahead of the sidebar/editor routers below
+        // (the modal is centred, so it overlaps the sidebar too): a left
+        // press routes through `render::route_plugin_view_modal_click`, a
+        // wheel notch scrolls the modal's body, and every other pointer
+        // event is swallowed so nothing beneath the scrim reacts to it.
+        if self.engine.borrow().plugin_view_modal.is_some() {
+            let consumed = match &event {
+                UiEvent::MouseDown {
+                    button: MouseButton::Left,
+                    position,
+                    ..
+                } => {
+                    render::route_plugin_view_modal_click(&mut self.engine.borrow_mut(), *position);
+                    true
+                }
+                UiEvent::Scroll { delta, .. } => {
+                    // `ScrollDelta` is positive-up; the modal scroll takes
+                    // positive-down, like `handle_plugin_view_dock_scroll`.
+                    if delta.y.abs() > 0.01 {
+                        render::scroll_plugin_view_modal(&mut self.engine.borrow_mut(), -delta.y);
+                    }
+                    true
+                }
+                UiEvent::MouseDown { .. }
+                | UiEvent::MouseUp { .. }
+                | UiEvent::DoubleClick { .. } => true,
+                _ => false,
+            };
+            if consumed {
+                self.draw_needed.set(true);
+                return quadraui::Reaction::Redraw;
+            }
+        }
+
         // Pointer events over the sidebar content area are forwarded to the active
         // panel's controller before the editor click path sees them. In ShellApp
         // mode there is no per-panel DrawingArea, so without this the file explorer
