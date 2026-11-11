@@ -343,6 +343,20 @@ pub const CANCEL_HEADER: &str = "Zq2139CancelHdr";
 /// [`CANCEL_VIEW`]'s sole button field's caption — the click target.
 pub const CANCEL_BUTTON: &str = "Zq2139CancelBtn";
 
+/// Registered view name for the modal-dismissal fixture: its `on_event`
+/// counts `Dismissed` events and renders the running total, so re-opening
+/// the modal shows how many times the user abandoned it — the only way to
+/// read a dismissal *after* the dialog that reported it is gone.
+pub const DISMISS_VIEW: &str = "zqxw2141dsm";
+/// [`DISMISS_VIEW`]'s header label — proves the modal painted at all.
+pub const DISMISS_HEADER: &str = "Zq2141DsmHdr";
+/// [`DISMISS_VIEW`]'s counter label with no `Dismissed` event seen yet.
+pub const DISMISS_COUNT_0: &str = "dsm0Zq2141";
+/// See [`DISMISS_COUNT_0`] — after one dismissal.
+pub const DISMISS_COUNT_1: &str = "dsm1Zq2141";
+/// See [`DISMISS_COUNT_0`] — after two.
+pub const DISMISS_COUNT_2: &str = "dsm2Zq2141";
+
 /// `Chart` fixture needles. Both series' labels are painted into the legend
 /// row (`quadraui`'s `paint_legend`/`primitives::chart::paint_legend` draw
 /// one swatch-plus-label text run per series), so each doubles as both a
@@ -917,6 +931,39 @@ vimcode.command("Zq2141CancelOpenModal", function()
   vimcode.ui.open_view("{CANCEL_VIEW}", {{ location = "modal" }})
 end)
 
+-- A view that counts the `Dismissed` events its modal reports and renders
+-- the running total, so a scenario can re-open the dialog and read how
+-- many times the user walked away from it — `Escape` and an outside click
+-- each count once, a `close_view` the plugin issued itself never does.
+local dismissed = 0
+vimcode.ui.register_view("{DISMISS_VIEW}", {{
+  title = "{DISMISS_VIEW}",
+  render = function()
+    return {{
+      id = "main",
+      schema_version = 1,
+      fields = {{
+        {{ type = "label", id = "hdr", label = "{DISMISS_HEADER}" }},
+        {{ type = "label", id = "dsm",
+           label = "dsm" .. tostring(dismissed) .. "Zq2141" }},
+      }},
+    }}
+  end,
+  on_event = function(ctx, event)
+    if event.kind == "Dismissed" then
+      dismissed = dismissed + 1
+    end
+  end,
+}})
+
+vimcode.command("Zq2141DsmOpenModal", function()
+  vimcode.ui.open_view("{DISMISS_VIEW}", {{ location = "modal" }})
+end)
+
+vimcode.command("Zq2141DsmCloseView", function()
+  vimcode.ui.close_view("{DISMISS_VIEW}")
+end)
+
 vimcode.command("Zq146OpenTab", function()
   vimcode.ui.open_view("{VIEW}", {{ location = "tab" }})
 end)
@@ -1399,6 +1446,35 @@ pub fn engine_with_plugin_view_modal(view: &str, command: &str) -> (Engine, Path
     engine.app_shell.show_panel(&quadraui::WidgetId::new(
         crate::core::engine::sidebar::PANEL_SETTINGS,
     ));
+
+    assert!(
+        engine.plugin_run_command(command, ""),
+        "fixture plugin must register the {command} command"
+    );
+    assert_eq!(
+        engine.plugin_view_modal.as_deref(),
+        Some(view),
+        "vimcode.ui.open_view(..., {{location = \"modal\"}}) must open the modal"
+    );
+    (engine, dir)
+}
+
+/// Modal fixture whose modal is opened *over a focused Explorer*, so a
+/// scenario can prove the keyboard goes back to the Explorer — not to the
+/// editor — once the modal is dismissed.
+pub fn engine_with_plugin_view_modal_over_focused_explorer(
+    view: &str,
+    command: &str,
+) -> (Engine, PathBuf) {
+    let dir = plugin_dir();
+    let mut engine = Engine::new_for_test();
+    load_fixture_plugin(&mut engine, &dir);
+
+    engine.focus_sidebar_panel(crate::core::engine::sidebar::PANEL_EXPLORER);
+    assert!(
+        engine.explorer_has_focus,
+        "precondition: the Explorer must hold the keyboard before the modal opens"
+    );
 
     assert!(
         engine.plugin_run_command(command, ""),
@@ -3609,6 +3685,111 @@ pub fn modal_swallows_keys_and_outside_click_dismisses_it(driver: &mut impl Conf
     );
 }
 
+/// Scenario 13d — a user dismissal tells the plugin: `Escape` and a click
+/// on the scrim each fire one `Dismissed` event at the view's `on_event`,
+/// while a `vimcode.ui.close_view` the plugin issued itself fires none.
+/// The count is read back by re-opening the modal, which renders it — the
+/// dialog that reported the dismissal is gone by then.
+pub fn modal_dismissal_reports_a_dismissed_event<
+    D: ConformanceDriver + crate::harness::rest_client::DrivesIdle,
+>(
+    h: &mut crate::harness::ConformanceHarness<D>,
+) {
+    let reopen = |h: &mut crate::harness::ConformanceHarness<D>| {
+        assert!(h
+            .engine
+            .borrow_mut()
+            .plugin_run_command("Zq2141DsmOpenModal", ""));
+        h.driver.repaint();
+    };
+
+    assert_paints(
+        &h.driver,
+        &[DISMISS_HEADER, DISMISS_COUNT_0],
+        "a view opened with location = \"modal\"",
+    );
+
+    h.driver.press_named(quadraui::NamedKey::Escape);
+    assert!(
+        !h.driver.screen_has(DISMISS_HEADER),
+        "Escape must dismiss the modal; painted runs were {:?}",
+        painted(&h.driver)
+    );
+    reopen(h);
+    assert!(
+        h.driver.screen_has(DISMISS_COUNT_1),
+        "Escape must reach the view's on_event as one Dismissed event; \
+         painted runs were {:?}",
+        painted(&h.driver)
+    );
+
+    // The modal covers 60 % of the height, so the status bar's mode
+    // indicator at the bottom edge is on the scrim outside it.
+    h.driver.click_text("NORMAL");
+    assert!(
+        !h.driver.screen_has(DISMISS_HEADER),
+        "a click outside the modal must dismiss it; painted runs were {:?}",
+        painted(&h.driver)
+    );
+    reopen(h);
+    assert!(
+        h.driver.screen_has(DISMISS_COUNT_2),
+        "a click outside the modal must reach the view's on_event as a \
+         second Dismissed event; painted runs were {:?}",
+        painted(&h.driver)
+    );
+
+    assert!(h
+        .engine
+        .borrow_mut()
+        .plugin_run_command("Zq2141DsmCloseView", ""));
+    h.driver.repaint();
+    assert!(
+        !h.driver.screen_has(DISMISS_HEADER),
+        "close_view must close the modal; painted runs were {:?}",
+        painted(&h.driver)
+    );
+    reopen(h);
+    assert!(
+        h.driver.screen_has(DISMISS_COUNT_2),
+        "a close_view the plugin issued itself must not count as a \
+         dismissal; painted runs were {:?}",
+        painted(&h.driver)
+    );
+}
+
+/// Scenario 13e — dismissing the modal hands the keyboard back to whoever
+/// held it when the modal opened. Here the Explorer had focus, so after
+/// `Escape` an `i` must *not* put the editor into Insert mode the way it
+/// would if focus had silently moved to the buffer.
+pub fn modal_dismissal_returns_focus_to_the_previous_owner(driver: &mut impl ConformanceDriver) {
+    assert_paints(
+        driver,
+        &[ROW_HEADER],
+        "a view opened with location = \"modal\" over a focused Explorer",
+    );
+    driver.press_named(quadraui::NamedKey::Escape);
+    assert!(
+        !driver.screen_has(ROW_HEADER),
+        "Escape must dismiss the plugin-view modal; painted runs were {:?}",
+        painted(driver)
+    );
+    driver.type_text("i");
+    assert!(
+        !driver.screen_has("INSERT"),
+        "dismissing a modal opened over a focused Explorer must hand the \
+         keyboard back to the Explorer, not to the editor; painted runs \
+         were {:?}",
+        painted(driver)
+    );
+    assert!(
+        driver.screen_has("NORMAL"),
+        "the editor must stay in Normal mode while the Explorer holds the \
+         keyboard; painted runs were {:?}",
+        painted(driver)
+    );
+}
+
 /// Scenario 13c — `vimcode.ui.close_view(name)` closes the modal, then
 /// reports `false` because nothing is open under that name any more.
 pub fn close_view_closes_the_modal<
@@ -4043,6 +4224,21 @@ mod tests {
     fn plugin_view_modal_text_view_scrolls_on_mouse_wheel_on_tui() {
         let (mut h, _dir) = tui_modal(TEXT_VIEW, "Zq2141TextOpenModal");
         dock_scrolls_on_mouse_wheel(&mut h.driver);
+    }
+
+    #[test]
+    fn plugin_view_modal_dismissal_reports_a_dismissed_event_on_tui() {
+        let (mut h, _dir) = tui_modal(DISMISS_VIEW, "Zq2141DsmOpenModal");
+        modal_dismissal_reports_a_dismissed_event(&mut h);
+    }
+
+    #[test]
+    fn plugin_view_modal_dismissal_returns_focus_to_the_previous_owner_on_tui() {
+        let (engine, _dir) =
+            engine_with_plugin_view_modal_over_focused_explorer(VIEW, "Zq2141FormOpenModal");
+        let mut h = crate::tui_main::testing::conformance_harness(engine, TUI_W, TUI_H);
+        h.driver.render();
+        modal_dismissal_returns_focus_to_the_previous_owner(&mut h.driver);
     }
 
     #[test]
@@ -4606,6 +4802,23 @@ mod tests {
     fn plugin_view_modal_text_view_scrolls_on_mouse_wheel_on_gtk() {
         let (mut h, _dir) = gtk_modal(TEXT_VIEW, "Zq2141TextOpenModal");
         dock_scrolls_on_mouse_wheel(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_modal_dismissal_reports_a_dismissed_event_on_gtk() {
+        let (mut h, _dir) = gtk_modal(DISMISS_VIEW, "Zq2141DsmOpenModal");
+        modal_dismissal_reports_a_dismissed_event(&mut h);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_modal_dismissal_returns_focus_to_the_previous_owner_on_gtk() {
+        let (engine, _dir) =
+            engine_with_plugin_view_modal_over_focused_explorer(VIEW, "Zq2141FormOpenModal");
+        let mut h = crate::gtk::testing::conformance_harness(engine, W, H);
+        h.driver.render();
+        modal_dismissal_returns_focus_to_the_previous_owner(&mut h.driver);
     }
 
     /// Bottom-panel dock fixture for [`ROW0_VIEW`] (clickable field at index 0,
