@@ -5154,6 +5154,10 @@ pub struct Engine {
     pub plugin_view_modal_table_col: usize,
     /// Modal twin of `ext_panel_row_focus`.
     pub plugin_view_modal_row_focus: usize,
+    /// Who owned the keyboard when the plugin-view modal took it, so
+    /// dismissing the modal hands focus back there instead of to the
+    /// editor. `None` whenever no modal is open.
+    pub(crate) plugin_view_modal_prev_focus: Option<PluginViewModalFocus>,
     /// Per-panel section expanded state.
     pub ext_panel_sections_expanded: HashMap<String, Vec<bool>>,
     /// Per-panel tree item expand state: (panel_name, item_id) → expanded.
@@ -6039,6 +6043,7 @@ impl Engine {
             plugin_view_modal_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
             plugin_view_modal_table_col: 0,
             plugin_view_modal_row_focus: 0,
+            plugin_view_modal_prev_focus: None,
             ext_panel_sections_expanded: HashMap::new(),
             ext_panel_tree_expanded: HashMap::new(),
             ext_panel_input_text: HashMap::new(),
@@ -7440,7 +7445,7 @@ mod motions;
 mod panels;
 mod picker;
 mod plugins;
-pub(crate) use plugins::PluginViewHost;
+pub(crate) use plugins::{PluginViewHost, PluginViewModalFocus};
 mod search;
 pub use search::{find_word_boundaries, SearchKeyResult};
 mod review_comment_ops;

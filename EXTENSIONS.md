@@ -1088,6 +1088,25 @@ a form is typeable straight away) and every click; `Escape` (when the focused fi
 doesn't claim it), a click outside the dialog, or `close_view(name)` dismisses it.
 `Form` and `text_view` views paint in a modal; other body kinds open an empty one.
 
+When the *user* abandons the dialog — `Escape`, or a click on the scrim outside it —
+the view's `on_event` fires once with `{ kind = "Dismissed", widget_id = "" }` before
+the modal closes, so a plugin can distinguish "the user walked away" from "nothing has
+happened yet" without owning a Cancel button:
+
+```lua
+on_event = function(ctx, event)
+    if event.kind == "Dismissed" then
+        -- drop the half-filled connection form
+    end
+end
+```
+
+`widget_id` is empty because no field was activated — the modal itself was. A
+`close_view(name)` the plugin issued itself does *not* fire `Dismissed` (the plugin
+already knows), and neither does opening a second view into the modal slot. Focus
+returns to whatever had it when the modal opened — a terminal, a focused sidebar
+panel, or the editor.
+
 `close_view(name) -> bool` is the immediate-call counterpart: it closes every tab,
 split window, dock slot and modal currently showing `name`, returning `false` if `name`
 wasn't open anywhere. An unknown view name raises an error, matching `open_view`.

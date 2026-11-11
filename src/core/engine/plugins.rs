@@ -151,6 +151,29 @@ pub(crate) enum PluginViewHost {
     Modal,
 }
 
+/// Who owned the keyboard the moment the plugin-view modal took it
+/// (`Engine::open_plugin_view_modal`), so dismissing the modal can hand
+/// focus back instead of always dropping the user into the editor.
+///
+/// Exactly the flags `Engine::clear_sidebar_focus` and the modal's own
+/// `terminal_has_focus = false` clear. A partially typed `<leader>ai`
+/// gesture (`ai_leader_toggle_pending`) is deliberately *not* captured:
+/// `clear_sidebar_focus` discards it on purpose whenever focus moves.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PluginViewModalFocus {
+    terminal: bool,
+    explorer: bool,
+    search: bool,
+    source_control: bool,
+    debug: bool,
+    extensions: bool,
+    ai: bool,
+    settings: bool,
+    settings_modal_open: bool,
+    ext_panel: bool,
+    activity_bar: bool,
+}
+
 impl Engine {
     // =========================================================================
     // Plugin system
@@ -565,6 +588,13 @@ impl Engine {
     /// outside the modal, or `vimcode.ui.close_view(name)` dismisses it
     /// ([`Self::dismiss_plugin_view_modal`]).
     ///
+    /// Whoever owned the keyboard beforehand (a terminal, a focused sidebar
+    /// panel, or the editor) is remembered in
+    /// [`Engine::plugin_view_modal_prev_focus`] and handed it back on
+    /// dismissal, so a modal opened over a focused panel doesn't silently
+    /// move the user to the editor. Re-opening into an already-open modal
+    /// keeps the *original* owner rather than recording "the modal".
+    ///
     /// The modal paints `Form`- and `TextView`-kind views; other body kinds
     /// are accepted (so a plugin can still open one) but paint an empty
     /// modal, the same "accepted, not yet wired" precedent the dock follows.
@@ -574,6 +604,8 @@ impl Engine {
         }
         if let Some(prev) = self.plugin_view_modal.clone() {
             self.blur_plugin_view_text_edit(&prev, PluginViewHost::Modal);
+        } else {
+            self.plugin_view_modal_prev_focus = Some(self.capture_focus_owner());
         }
         self.clear_sidebar_focus();
         self.terminal_has_focus = false;
@@ -596,19 +628,91 @@ impl Engine {
         true
     }
 
-    /// Dismiss the plugin-view modal, if one is open. A `TextArea` edit in
-    /// progress commits on the way out (the same blur rule every host
-    /// follows); a `Text`/`Password` edit is discarded. Returns whether a
-    /// modal was open.
+    /// Dismiss the plugin-view modal the way the *user* dismisses it —
+    /// `Escape`, or a click on the scrim outside the dialog. The view's
+    /// `on_event` sees a [`crate::core::plugin_ui::ViewEventKind::Dismissed`] event
+    /// (`widget_id = ""`, since no field was activated), which is how a
+    /// plugin tells "the user abandoned the dialog" from "nothing happened".
+    ///
+    /// A `TextArea` edit in progress commits on the way out (the same blur
+    /// rule every host follows); a `Text`/`Password` edit is discarded.
+    /// Focus returns to whoever held it when the modal opened. Returns
+    /// whether a modal was open.
+    ///
+    /// [`Self::close_plugin_view`] uses [`Self::close_plugin_view_modal`]
+    /// instead: a plugin that called `vimcode.ui.close_view` itself already
+    /// knows the dialog is going away.
     pub fn dismiss_plugin_view_modal(&mut self) -> bool {
-        let Some(name) = self.plugin_view_modal.take() else {
+        let Some(name) = self.close_plugin_view_modal() else {
             return false;
         };
+        self.dispatch_plugin_view_event(crate::core::plugin_ui::PluginViewEvent {
+            view: name,
+            widget_id: String::new(),
+            kind: crate::core::plugin_ui::ViewEventKind::Dismissed,
+        });
+        true
+    }
+
+    /// Close the plugin-view modal without telling the view it was
+    /// dismissed, returning the view it was showing (`None` when no modal
+    /// was open). The mechanical half of [`Self::dismiss_plugin_view_modal`]
+    /// — blur the in-progress edit, drop the slot, restore focus.
+    pub(crate) fn close_plugin_view_modal(&mut self) -> Option<String> {
+        let name = self.plugin_view_modal.take()?;
         // `blur_plugin_view_text_edit` reads the modal's selection, which
         // survives `take()` above — only the slot's name is cleared.
         self.blur_plugin_view_text_edit(&name, PluginViewHost::Modal);
         self.plugin_view_combo_edit = None;
-        true
+        if let Some(prev) = self.plugin_view_modal_prev_focus.take() {
+            self.restore_focus_owner(prev);
+        }
+        Some(name)
+    }
+
+    /// Snapshot the keyboard-focus owners [`Self::open_plugin_view_modal`]
+    /// is about to clear.
+    fn capture_focus_owner(&self) -> PluginViewModalFocus {
+        PluginViewModalFocus {
+            terminal: self.terminal_has_focus,
+            explorer: self.explorer_has_focus,
+            search: self.search_has_focus,
+            source_control: self.sc_has_focus,
+            debug: self.dap_sidebar_has_focus,
+            extensions: self.ext_sidebar_has_focus,
+            ai: self.ai_has_focus,
+            settings: self.settings_has_focus,
+            settings_modal_open: self.settings_modal_open,
+            ext_panel: self.ext_panel_has_focus,
+            activity_bar: self.activity_bar_focused,
+        }
+    }
+
+    /// Hand the keyboard back to whoever [`Self::capture_focus_owner`]
+    /// recorded. An all-`false` snapshot (the editor had focus) restores
+    /// nothing, which is exactly right: the modal already left every flag
+    /// cleared.
+    fn restore_focus_owner(&mut self, prev: PluginViewModalFocus) {
+        self.terminal_has_focus = prev.terminal;
+        self.explorer_has_focus = prev.explorer;
+        // Assigned rather than routed through `search_set_focus`: that is a
+        // focus-*grant* path, which re-seeds the search query from the
+        // visual selection. Handing focus back must not rewrite what the
+        // user had typed.
+        self.search_has_focus = prev.search;
+        // `sc_set_focus` keeps the engine flag and `sc_sidebar_system` in
+        // sync; setting the flag alone would leave the panel painting
+        // unfocused.
+        self.sc_set_focus(prev.source_control);
+        self.dap_sidebar_has_focus = prev.debug;
+        self.ext_sidebar_has_focus = prev.extensions;
+        self.ai_has_focus = prev.ai;
+        self.settings_has_focus = prev.settings;
+        self.settings_modal_open = prev.settings_modal_open;
+        self.ext_panel_has_focus = prev.ext_panel;
+        self.activity_bar_focused = prev.activity_bar;
+        self.app_shell
+            .set_activity_keyboard_focused(prev.activity_bar);
     }
 
     /// Route a key to the open plugin-view modal. Every key is consumed
@@ -671,7 +775,8 @@ impl Engine {
         let message_before_close = self.message.clone();
         let mut closed = false;
         if self.plugin_view_modal.as_deref() == Some(name) {
-            self.dismiss_plugin_view_modal();
+            // No `Dismissed` event: the plugin asked for this close itself.
+            self.close_plugin_view_modal();
             closed = true;
         }
         if let BottomPanelKind::Plugin(dock_name) = &self.bottom_panel_kind {

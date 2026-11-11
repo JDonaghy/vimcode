@@ -3572,7 +3572,8 @@ impl PluginManager {
             }
             ViewEventKind::ButtonClicked
             | ViewEventKind::ToolbarButtonClicked
-            | ViewEventKind::FocusChanged => {}
+            | ViewEventKind::FocusChanged
+            | ViewEventKind::Dismissed => {}
         }
         Ok(tbl)
     }
