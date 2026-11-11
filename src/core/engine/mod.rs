@@ -6832,10 +6832,11 @@ impl Engine {
     /// should stop and redraw), `false` if it should fall through to normal
     /// key handling.
     ///
-    /// Cheap to call unconditionally: `ToastStackController::handle` only
-    /// ever consumes a key when the stack has focus (given explicitly via
-    /// `focus_toast_stack`) — every other key, and every key while unfocused,
-    /// comes back `Ignored` untouched, so this can never steal a vim key.
+    /// Cheap to call unconditionally: `ToastStackController::handle_event`
+    /// only ever consumes a key when the stack has focus (given explicitly
+    /// via `focus_toast_stack`) — every other key, and every key while
+    /// unfocused, comes back `Handled::Ignored` untouched, so this can never
+    /// steal a vim key.
     pub fn handle_toast_focus_key(&mut self, ui_event: &quadraui::UiEvent) -> bool {
         if !self.toast_focus.is_focused() {
             return false;
@@ -6846,18 +6847,18 @@ impl Engine {
             self.toast_focus.take_focus();
             return false;
         };
-        match self.toast_focus.handle(ui_event, &stack) {
-            quadraui::compose::ToastStackEvent::Action(id) => {
+        match self.toast_focus.handle_event(ui_event, &stack) {
+            quadraui::Handled::Event(quadraui::compose::ToastStackAction::Action(id)) => {
                 self.handle_toast_hit(quadraui::ToastHit::Action(id));
                 true
             }
-            quadraui::compose::ToastStackEvent::Dismiss(id) => {
+            quadraui::Handled::Event(quadraui::compose::ToastStackAction::Dismiss(id)) => {
                 self.handle_toast_hit(quadraui::ToastHit::Dismiss(id));
                 true
             }
-            quadraui::compose::ToastStackEvent::Consumed
-            | quadraui::compose::ToastStackEvent::FocusReturned => true,
-            quadraui::compose::ToastStackEvent::Ignored => false,
+            quadraui::Handled::Event(quadraui::compose::ToastStackAction::FocusReturned)
+            | quadraui::Handled::Consumed => true,
+            quadraui::Handled::Ignored => false,
         }
     }
 

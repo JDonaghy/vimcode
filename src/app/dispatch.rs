@@ -217,9 +217,12 @@ impl App {
         {
             let rect = self.title_bar_rect.get();
             if rect.width > 0.0 {
-                let action = self.title_bar_interaction.borrow_mut().handle(&event, rect);
+                let action = self
+                    .title_bar_interaction
+                    .borrow_mut()
+                    .handle_event(&event, rect);
                 match action {
-                    quadraui::StatusBarAction::Clicked(id) => {
+                    quadraui::Handled::Event(id) => {
                         match id.as_str() {
                             render::WINDOW_MINIMIZE_ACTION => self.window_minimize(backend),
                             render::WINDOW_MAXIMIZE_ACTION => self.window_toggle_maximize(backend),
@@ -229,11 +232,11 @@ impl App {
                         self.draw_needed.set(true);
                         return quadraui::Reaction::Redraw;
                     }
-                    quadraui::StatusBarAction::Redraw => {
+                    quadraui::Handled::Consumed => {
                         self.draw_needed.set(true);
                         return quadraui::Reaction::Redraw;
                     }
-                    quadraui::StatusBarAction::Ignored => {}
+                    quadraui::Handled::Ignored => {}
                 }
             }
         }

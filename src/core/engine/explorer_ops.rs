@@ -344,13 +344,15 @@ impl Engine {
                 ExplorerKeyResult::Consumed
             }
             "Home" => {
-                self.explorer_tree.borrow_mut().jump_to_edge(true, viewport);
+                self.explorer_tree
+                    .borrow_mut()
+                    .move_selection_to_edge(quadraui::Edge::Start, viewport);
                 ExplorerKeyResult::Consumed
             }
             "End" => {
                 self.explorer_tree
                     .borrow_mut()
-                    .jump_to_edge(false, viewport);
+                    .move_selection_to_edge(quadraui::Edge::End, viewport);
                 ExplorerKeyResult::Consumed
             }
             "Page_Up" | "PageUp" => {

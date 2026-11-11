@@ -676,7 +676,9 @@ pub fn run_pending_platform_action(
         } => {
             let mut notification = quadraui::Notification::new(title, body);
             notification.urgent = urgent;
-            backend.services().send_notification(notification);
+            if let Err(e) = backend.services().send_notification(notification) {
+                engine.message = format!("Could not send notification: {e:?}");
+            }
         }
         PendingPlatformAction::PluginDialog(req) => {
             run_pending_plugin_dialog(engine, req, backend);

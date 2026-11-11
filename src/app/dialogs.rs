@@ -195,11 +195,11 @@ impl App {
     /// Show the in-app folder/workspace picker modal (fallback for TUI).
     pub(crate) fn open_folder_dialog(&mut self) {
         let engine = self.engine.borrow();
-        let controller = quadraui::FolderPickerController::new(
+        let controller = quadraui::FolderPickerController::rooted_at(
             engine.cwd.clone(),
             vec![".vimcode-workspace".to_string()],
-            engine.settings.show_hidden_files,
-        );
+        )
+        .with_show_hidden(engine.settings.show_hidden_files);
         drop(engine);
         *self.folder_picker.borrow_mut() = Some(controller);
         self.draw_needed.set(true);
@@ -225,18 +225,18 @@ impl App {
             let Some(picker) = picker_ref.as_mut() else {
                 return;
             };
-            picker.handle(event, visible_rows)
+            picker.handle_event(event, visible_rows)
         };
         match outcome {
-            quadraui::FolderPickerEvent::Confirmed { path } => {
+            quadraui::Handled::Event(quadraui::PathPickerAction::Confirmed { path }) => {
                 *self.folder_picker.borrow_mut() = None;
                 self.engine.borrow_mut().open_folder(&path);
                 self.refresh_file_tree();
             }
-            quadraui::FolderPickerEvent::Cancelled => {
+            quadraui::Handled::Event(quadraui::PathPickerAction::Cancelled) => {
                 *self.folder_picker.borrow_mut() = None;
             }
-            quadraui::FolderPickerEvent::Consumed | quadraui::FolderPickerEvent::Ignored => {}
+            quadraui::Handled::Consumed | quadraui::Handled::Ignored => {}
         }
     }
 
