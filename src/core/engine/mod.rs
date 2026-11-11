@@ -5126,6 +5126,34 @@ pub struct Engine {
     pub plugin_view_tab_row_focus: usize,
     /// Dock twin of `ext_panel_row_focus`.
     pub plugin_view_dock_row_focus: usize,
+    /// The `vimcode.ui.register_view` view currently shown as a centred
+    /// modal over the editor (`Engine::open_plugin_view_modal`), if any.
+    /// There is a single modal slot: opening another view replaces it, and
+    /// opening the same view again just re-focuses it. While `Some`, the
+    /// modal owns every key (`Engine::handle_key`) and every click
+    /// (`App::handle_mouse_click_msg`) until `Escape`, an outside click or
+    /// `vimcode.ui.close_view` dismisses it.
+    pub plugin_view_modal: Option<String>,
+    /// Flat selection index for the modal-hosted plugin view — the modal
+    /// twin of `plugin_view_dock_selected`.
+    pub plugin_view_modal_selected: usize,
+    /// Scroll offset for the modal-hosted plugin view.
+    pub plugin_view_modal_scroll_top: usize,
+    /// The `quadraui::FormController` the modal-hosted plugin view is
+    /// painted through, kept separate from the tab/dock/sidebar controllers
+    /// so a view painted beneath the modal can't clobber its click geometry.
+    pub plugin_view_modal_form_controller: std::cell::RefCell<quadraui::FormController>,
+    /// The exact rect the last frame painted the modal-hosted view's body
+    /// into — the click router hit-tests against this.
+    pub plugin_view_modal_form_rect: std::cell::Cell<quadraui::Rect>,
+    /// The whole rect (title bar included) the last frame painted the
+    /// plugin-view modal into — a click inside it never dismisses the modal.
+    pub plugin_view_modal_rect: std::cell::Cell<quadraui::Rect>,
+    /// Modal twin of `plugin_view_dock_table_col` (kept for the per-host
+    /// accessor's exhaustiveness; the modal paints `Form` and `TextView`).
+    pub plugin_view_modal_table_col: usize,
+    /// Modal twin of `ext_panel_row_focus`.
+    pub plugin_view_modal_row_focus: usize,
     /// Per-panel section expanded state.
     pub ext_panel_sections_expanded: HashMap<String, Vec<bool>>,
     /// Per-panel tree item expand state: (panel_name, item_id) → expanded.
@@ -5999,6 +6027,18 @@ impl Engine {
             ext_panel_row_focus: 0,
             plugin_view_tab_row_focus: 0,
             plugin_view_dock_row_focus: 0,
+            plugin_view_modal: None,
+            plugin_view_modal_selected: 0,
+            plugin_view_modal_scroll_top: 0,
+            plugin_view_modal_form_controller: std::cell::RefCell::new(
+                quadraui::FormController::new("plugin-view-modal".to_string()),
+            ),
+            plugin_view_modal_form_rect: std::cell::Cell::new(quadraui::Rect::new(
+                0.0, 0.0, 0.0, 0.0,
+            )),
+            plugin_view_modal_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
+            plugin_view_modal_table_col: 0,
+            plugin_view_modal_row_focus: 0,
             ext_panel_sections_expanded: HashMap::new(),
             ext_panel_tree_expanded: HashMap::new(),
             ext_panel_input_text: HashMap::new(),

@@ -1258,6 +1258,7 @@ pub(crate) mod tests {
                 FrameOp::ContextMenu,
                 FrameOp::ChangeReview,
                 FrameOp::SettingsModal,
+                FrameOp::PluginViewModal,
                 FrameOp::Dialog,
                 FrameOp::ToastStack,
             ],
@@ -1352,6 +1353,7 @@ pub(crate) mod tests {
                     | FrameOp::FolderPicker
                     | FrameOp::ChangeReview
                     | FrameOp::SettingsModal
+                    | FrameOp::PluginViewModal
             );
             assert_eq!(
                 arbitrated, !routed_elsewhere,
@@ -1413,6 +1415,7 @@ pub(crate) mod tests {
             context_menu: true,
             change_review: true,
             settings_modal: true,
+            plugin_view_modal: true,
             dialog: true,
             toast_stack: true,
         };

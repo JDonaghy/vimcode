@@ -902,6 +902,21 @@ vimcode.ui.register_view("{VIEW}", {{
 -- `Engine::open_plugin_view_tab` — `open_view` needs a *live* engine loan
 -- (`live_engine`'s doc), which only exists while a callback like this one is
 -- running, not during the top-level load this whole file runs as.
+-- Real `:Command`s around `vimcode.ui.open_view` with `location = "modal"`
+-- — {VIEW} (the `Form`-kind field stack) and {CANCEL_VIEW} (whose own
+-- Cancel button calls `close_view` from `on_event`).
+vimcode.command("Zq2141FormOpenModal", function()
+  vimcode.ui.open_view("{VIEW}", {{ location = "modal" }})
+end)
+
+vimcode.command("Zq2141TextOpenModal", function()
+  vimcode.ui.open_view("{TEXT_VIEW}", {{ location = "modal" }})
+end)
+
+vimcode.command("Zq2141CancelOpenModal", function()
+  vimcode.ui.open_view("{CANCEL_VIEW}", {{ location = "modal" }})
+end)
+
 vimcode.command("Zq146OpenTab", function()
   vimcode.ui.open_view("{VIEW}", {{ location = "tab" }})
 end)
@@ -1368,6 +1383,31 @@ pub fn engine_with_plugin_view_row0_dock() -> (Engine, PathBuf) {
         crate::core::engine::BottomPanelKind::Plugin(ROW0_VIEW.to_string()),
         "vimcode.ui.open_view(..., {{location = \"dock\"}}) must point the bottom \
          panel at the docked view"
+    );
+    (engine, dir)
+}
+
+/// Modal fixture: loads the fixture plugin and runs `command`, a real
+/// `:Command` around `vimcode.ui.open_view(view, {location = "modal"})`.
+/// The sidebar shows the Settings panel, so nothing of `view` is painted
+/// except through the modal.
+pub fn engine_with_plugin_view_modal(view: &str, command: &str) -> (Engine, PathBuf) {
+    let dir = plugin_dir();
+    let mut engine = Engine::new_for_test();
+    load_fixture_plugin(&mut engine, &dir);
+
+    engine.app_shell.show_panel(&quadraui::WidgetId::new(
+        crate::core::engine::sidebar::PANEL_SETTINGS,
+    ));
+
+    assert!(
+        engine.plugin_run_command(command, ""),
+        "fixture plugin must register the {command} command"
+    );
+    assert_eq!(
+        engine.plugin_view_modal.as_deref(),
+        Some(view),
+        "vimcode.ui.open_view(..., {{location = \"modal\"}}) must open the modal"
     );
     (engine, dir)
 }
@@ -2289,10 +2329,10 @@ fn chart_data_point_click_reaches_the_plugin<D>(
         let cached = match host {
             PluginViewHost::Sidebar => engine.plugin_view_chart_layout.borrow(),
             PluginViewHost::Tab => engine.plugin_view_tab_chart_layout.borrow(),
-            PluginViewHost::Dock => unreachable!(
+            PluginViewHost::Dock | PluginViewHost::Modal => unreachable!(
                 "chart_data_point_click_reaches_the_plugin is never called with \
-                 PluginViewHost::Dock -- the bottom-panel dock does not render \
-                 chart-kind views yet"
+                 PluginViewHost::Dock/Modal -- neither renders chart-kind views \
+                 yet"
             ),
         };
         let layout = cached
@@ -2785,10 +2825,10 @@ fn table_divider_drag_resizes_the_column<D>(
         let cached = match host {
             PluginViewHost::Sidebar => engine.plugin_view_table_layout.borrow(),
             PluginViewHost::Tab => engine.plugin_view_tab_table_layout.borrow(),
-            PluginViewHost::Dock => unreachable!(
+            PluginViewHost::Dock | PluginViewHost::Modal => unreachable!(
                 "table_divider_drag_resizes_the_column is never called with \
-                 PluginViewHost::Dock — the bottom-panel dock does not render \
-                 table-kind views yet"
+                 PluginViewHost::Dock/Modal — neither renders table-kind views \
+                 yet"
             ),
         };
         let (rect, layout) = cached
@@ -3516,6 +3556,99 @@ pub fn dock_paints_and_reuses_by_name<
     );
 }
 
+/// Scenario 13 — `location = "modal"` paints the view (title and body) in a
+/// centred modal that owns the keyboard: `Escape` dismisses it, after which
+/// the view is no longer painted and keys reach the editor again.
+pub fn modal_paints_and_escape_dismisses_it(driver: &mut impl ConformanceDriver) {
+    assert_paints(
+        driver,
+        &[VIEW_TITLE, ROW_HEADER, ROW_BUTTON],
+        "a view opened with location = \"modal\"",
+    );
+    driver.press_named(quadraui::NamedKey::Escape);
+    assert!(
+        !driver.screen_has(ROW_HEADER),
+        "Escape must dismiss the plugin-view modal; painted runs were {:?}",
+        painted(driver)
+    );
+    // With the modal gone, `:` reaches the editor's command line again.
+    driver.type_text(":echo \"ZqMdlOk\"");
+    driver.press_named(quadraui::NamedKey::Enter);
+    assert!(
+        driver.screen_has("ZqMdlOk"),
+        "after the modal is dismissed, keys must reach the editor's command \
+         line again; painted runs were {:?}",
+        painted(driver)
+    );
+}
+
+/// Scenario 13b — while the modal is open a key that would otherwise reach
+/// the editor (`:`) is swallowed by the modal rather than opening the
+/// command line beneath it, and a click outside the modal dismisses it.
+pub fn modal_swallows_keys_and_outside_click_dismisses_it(driver: &mut impl ConformanceDriver) {
+    assert_paints(
+        driver,
+        &[ROW_HEADER],
+        "a view opened with location = \"modal\"",
+    );
+    driver.type_text(":q");
+    driver.press_named(quadraui::NamedKey::Enter);
+    assert!(
+        driver.screen_has(ROW_HEADER),
+        "keys typed while the modal is open must not reach the editor \
+         beneath it (`:q<CR>` must not run); painted runs were {:?}",
+        painted(driver)
+    );
+    // The modal is centred over 60 % of the height, so the global status
+    // bar's mode indicator at the bottom edge is outside it.
+    driver.click_text("NORMAL");
+    assert!(
+        !driver.screen_has(ROW_HEADER),
+        "a click outside the modal must dismiss it; painted runs were {:?}",
+        painted(driver)
+    );
+}
+
+/// Scenario 13c — `vimcode.ui.close_view(name)` closes the modal, then
+/// reports `false` because nothing is open under that name any more.
+pub fn close_view_closes_the_modal<
+    D: ConformanceDriver + crate::harness::rest_client::DrivesIdle,
+>(
+    h: &mut crate::harness::ConformanceHarness<D>,
+) {
+    assert_paints(
+        &h.driver,
+        &[ROW_HEADER],
+        "a view opened with location = \"modal\"",
+    );
+    assert!(h
+        .engine
+        .borrow_mut()
+        .plugin_run_command("Zq2139CloseView", ""));
+    h.driver.repaint();
+    assert!(
+        !h.driver.screen_has(ROW_HEADER),
+        "close_view must close the modal; painted runs were {:?}",
+        painted(&h.driver)
+    );
+    assert!(
+        h.driver.screen_has("Zq2139closed:true"),
+        "close_view must report true for the open modal; painted runs were {:?}",
+        painted(&h.driver)
+    );
+    assert!(h
+        .engine
+        .borrow_mut()
+        .plugin_run_command("Zq2139CloseView", ""));
+    h.driver.repaint();
+    assert!(
+        h.driver.screen_has("Zq2139closed:false"),
+        "a second close_view must report false once the modal is gone; \
+         painted runs were {:?}",
+        painted(&h.driver)
+    );
+}
+
 /// Scenario 12b — `vimcode.ui.close_view(name)` closes a docked view,
 /// removing it from the painted bottom panel, and reports `false` the next
 /// time it's called since nothing is open under that name any more.
@@ -3846,6 +3979,70 @@ mod tests {
     fn plugin_view_dock_row0_button_click_reaches_the_plugin_handler_on_tui() {
         let (mut h, _dir) = tui_row0_dock();
         clicking_the_dock_row0_button_reaches_the_plugin_handler(&mut h.driver);
+    }
+
+    /// Plugin-view modal fixture (TUI arm) — see [`engine_with_plugin_view_modal`].
+    fn tui_modal(
+        view: &str,
+        command: &str,
+    ) -> (
+        crate::harness::ConformanceHarness<
+            quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+        >,
+        PathBuf,
+    ) {
+        let (engine, dir) = engine_with_plugin_view_modal(view, command);
+        let mut h = crate::tui_main::testing::conformance_harness(engine, TUI_W, TUI_H);
+        h.driver.render();
+        (h, dir)
+    }
+
+    #[test]
+    fn plugin_view_modal_paints_and_escape_dismisses_it_on_tui() {
+        let (mut h, _dir) = tui_modal(VIEW, "Zq2141FormOpenModal");
+        modal_paints_and_escape_dismisses_it(&mut h.driver);
+    }
+
+    #[test]
+    fn plugin_view_modal_swallows_keys_and_outside_click_dismisses_it_on_tui() {
+        let (mut h, _dir) = tui_modal(VIEW, "Zq2141FormOpenModal");
+        modal_swallows_keys_and_outside_click_dismisses_it(&mut h.driver);
+    }
+
+    #[test]
+    fn plugin_view_modal_button_click_reaches_the_plugin_handler_on_tui() {
+        let (mut h, _dir) = tui_modal(VIEW, "Zq2141FormOpenModal");
+        clicking_a_button_reaches_the_plugin_handler(&mut h.driver);
+    }
+
+    #[test]
+    fn plugin_view_modal_keyboard_activation_reaches_the_plugin_handler_on_tui() {
+        let (mut h, _dir) = tui_modal(VIEW, "Zq2141FormOpenModal");
+        keyboard_activation_reaches_the_plugin_handler(&mut h.driver);
+    }
+
+    #[test]
+    fn plugin_view_modal_typing_edits_the_focused_text_field_on_tui() {
+        let (mut h, _dir) = tui_modal(VIEW, "Zq2141FormOpenModal");
+        typing_edits_the_focused_text_field(&mut h.driver);
+    }
+
+    #[test]
+    fn plugin_view_close_view_closes_the_modal_on_tui() {
+        let (mut h, _dir) = tui_modal(VIEW, "Zq2141FormOpenModal");
+        close_view_closes_the_modal(&mut h);
+    }
+
+    #[test]
+    fn plugin_view_modal_own_cancel_button_closes_it_on_tui() {
+        let (mut h, _dir) = tui_modal(CANCEL_VIEW, "Zq2141CancelOpenModal");
+        clicking_its_own_cancel_button_closes_the_view(&mut h.driver);
+    }
+
+    #[test]
+    fn plugin_view_modal_text_view_scrolls_on_mouse_wheel_on_tui() {
+        let (mut h, _dir) = tui_modal(TEXT_VIEW, "Zq2141TextOpenModal");
+        dock_scrolls_on_mouse_wheel(&mut h.driver);
     }
 
     #[test]
@@ -4336,6 +4533,79 @@ mod tests {
     fn plugin_view_form_dock_button_click_reaches_the_plugin_handler_on_gtk() {
         let (mut h, _dir) = gtk_form_dock();
         clicking_a_button_reaches_the_plugin_handler(&mut h.driver);
+    }
+
+    /// Plugin-view modal fixture (GTK arm) — see [`engine_with_plugin_view_modal`].
+    #[cfg(feature = "gui")]
+    fn gtk_modal(
+        view: &str,
+        command: &str,
+    ) -> (
+        crate::harness::ConformanceHarness<
+            quadraui::gtk::testing::GtkDriver<impl quadraui::AppLogic>,
+        >,
+        PathBuf,
+    ) {
+        let (engine, dir) = engine_with_plugin_view_modal(view, command);
+        let mut h = crate::gtk::testing::conformance_harness(engine, W, H);
+        h.driver.render();
+        (h, dir)
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_modal_paints_and_escape_dismisses_it_on_gtk() {
+        let (mut h, _dir) = gtk_modal(VIEW, "Zq2141FormOpenModal");
+        modal_paints_and_escape_dismisses_it(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_modal_swallows_keys_and_outside_click_dismisses_it_on_gtk() {
+        let (mut h, _dir) = gtk_modal(VIEW, "Zq2141FormOpenModal");
+        modal_swallows_keys_and_outside_click_dismisses_it(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_modal_button_click_reaches_the_plugin_handler_on_gtk() {
+        let (mut h, _dir) = gtk_modal(VIEW, "Zq2141FormOpenModal");
+        clicking_a_button_reaches_the_plugin_handler(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_modal_keyboard_activation_reaches_the_plugin_handler_on_gtk() {
+        let (mut h, _dir) = gtk_modal(VIEW, "Zq2141FormOpenModal");
+        keyboard_activation_reaches_the_plugin_handler(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_modal_typing_edits_the_focused_text_field_on_gtk() {
+        let (mut h, _dir) = gtk_modal(VIEW, "Zq2141FormOpenModal");
+        typing_edits_the_focused_text_field(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_close_view_closes_the_modal_on_gtk() {
+        let (mut h, _dir) = gtk_modal(VIEW, "Zq2141FormOpenModal");
+        close_view_closes_the_modal(&mut h);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_modal_own_cancel_button_closes_it_on_gtk() {
+        let (mut h, _dir) = gtk_modal(CANCEL_VIEW, "Zq2141CancelOpenModal");
+        clicking_its_own_cancel_button_closes_the_view(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_modal_text_view_scrolls_on_mouse_wheel_on_gtk() {
+        let (mut h, _dir) = gtk_modal(TEXT_VIEW, "Zq2141TextOpenModal");
+        dock_scrolls_on_mouse_wheel(&mut h.driver);
     }
 
     /// Bottom-panel dock fixture for [`ROW0_VIEW`] (clickable field at index 0,

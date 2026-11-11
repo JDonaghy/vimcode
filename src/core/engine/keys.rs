@@ -289,6 +289,15 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // A plugin view opened as a modal (`vimcode.ui.open_view(name,
+        // {location = "modal"})`) owns every key until it is dismissed —
+        // below the dialog/picker/context-menu intercepts above so a picker
+        // or confirm dialog a plugin opens *from* the modal still gets the
+        // keyboard, above every panel and buffer intercept below.
+        if self.handle_plugin_view_modal_key(key_name, ctrl, unicode) {
+            return EngineAction::None;
+        }
+
         // Welcome panel (no open workspace) intercepts j/k/Enter to move and
         // activate `welcome_focus` — the keyboard twin of
         // `welcome_panel_click_target`'s mouse hit-testing. Every other key

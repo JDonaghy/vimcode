@@ -94,7 +94,7 @@ pub(crate) fn paint_plugin_view_list(
         PluginViewHost::Sidebar => &engine.plugin_view_list_layout,
         PluginViewHost::Tab => &engine.plugin_view_tab_list_layout,
         // List-kind Dock support isn't implemented.
-        PluginViewHost::Dock => return false,
+        PluginViewHost::Dock | PluginViewHost::Modal => return false,
     };
     cache.replace(Some((rect, layout)));
     true
@@ -116,7 +116,7 @@ pub(crate) fn route_plugin_view_list_click(
         PluginViewHost::Sidebar => &engine.plugin_view_list_layout,
         PluginViewHost::Tab => &engine.plugin_view_tab_list_layout,
         // List-kind Dock support isn't implemented.
-        PluginViewHost::Dock => return false,
+        PluginViewHost::Dock | PluginViewHost::Modal => return false,
     };
     let idx = {
         let borrowed = cache.borrow();
@@ -307,7 +307,7 @@ pub(crate) fn populate_plugin_view_tree_controller(
         PluginViewHost::Sidebar => &engine.plugin_view_tree_controller,
         PluginViewHost::Tab => &engine.plugin_view_tab_tree_controller,
         // Tree-kind Dock support isn't implemented.
-        PluginViewHost::Dock => return false,
+        PluginViewHost::Dock | PluginViewHost::Modal => return false,
     };
     let mut tc = controller.borrow_mut();
     tc.set_has_focus(has_focus);
@@ -341,7 +341,7 @@ pub(crate) fn route_plugin_view_tree_event(
         // Tree-kind Dock support isn't implemented; the
         // `populate_plugin_view_tree_controller` call above already bailed
         // out for `Dock`, so this arm is unreachable in practice.
-        PluginViewHost::Dock => return false,
+        PluginViewHost::Dock | PluginViewHost::Modal => return false,
     };
     let tree_event = controller.borrow_mut().handle(event, backend, rect);
 
@@ -431,7 +431,7 @@ pub(crate) fn handle_plugin_view_tree_key(
         // Tree-kind Dock support isn't implemented; the
         // `populate_plugin_view_tree_controller` call above already bailed
         // out for `Dock`, so this arm is unreachable in practice.
-        PluginViewHost::Dock => return false,
+        PluginViewHost::Dock | PluginViewHost::Modal => return false,
     };
     let (rows, selected_path) = {
         let tc = controller.borrow();
@@ -786,7 +786,7 @@ pub(crate) fn paint_plugin_view_table(
         PluginViewHost::Sidebar => &engine.plugin_view_table_layout,
         PluginViewHost::Tab => &engine.plugin_view_tab_table_layout,
         // Table-kind Dock support isn't implemented.
-        PluginViewHost::Dock => return false,
+        PluginViewHost::Dock | PluginViewHost::Modal => return false,
     };
     cache.replace(Some((rect, layout)));
     true
@@ -808,7 +808,7 @@ pub(crate) fn route_plugin_view_table_click(
         PluginViewHost::Sidebar => &engine.plugin_view_table_layout,
         PluginViewHost::Tab => &engine.plugin_view_tab_table_layout,
         // Table-kind Dock support isn't implemented.
-        PluginViewHost::Dock => return false,
+        PluginViewHost::Dock | PluginViewHost::Modal => return false,
     };
     let Some(ViewBody::Table {
         columns,
@@ -1482,7 +1482,7 @@ pub(crate) fn paint_plugin_view_chart(
         PluginViewHost::Sidebar => &engine.plugin_view_chart_layout,
         PluginViewHost::Tab => &engine.plugin_view_tab_chart_layout,
         // Chart-kind Dock support isn't implemented.
-        PluginViewHost::Dock => return false,
+        PluginViewHost::Dock | PluginViewHost::Modal => return false,
     };
     cache.replace(Some(layout));
     true
@@ -1520,7 +1520,7 @@ pub(crate) fn route_plugin_view_chart_click(
         PluginViewHost::Sidebar => &engine.plugin_view_chart_layout,
         PluginViewHost::Tab => &engine.plugin_view_tab_chart_layout,
         // Chart-kind Dock support isn't implemented.
-        PluginViewHost::Dock => return false,
+        PluginViewHost::Dock | PluginViewHost::Modal => return false,
     };
     let kind = {
         let borrowed = cache.borrow();
@@ -1578,7 +1578,7 @@ fn plugin_view_body_rect(engine: &Engine, host: PluginViewHost) -> Option<quadra
     match host {
         PluginViewHost::Sidebar => Some(engine.plugin_view_form_rect.get()),
         PluginViewHost::Tab => Some(engine.plugin_view_tab_form_rect.get()),
-        PluginViewHost::Dock => None,
+        PluginViewHost::Dock | PluginViewHost::Modal => None,
     }
 }
 
@@ -1591,7 +1591,7 @@ fn plugin_view_message_list_line_height_cache(
     match host {
         PluginViewHost::Sidebar => Some(&engine.plugin_view_message_list_line_height),
         PluginViewHost::Tab => Some(&engine.plugin_view_tab_message_list_line_height),
-        PluginViewHost::Dock => None,
+        PluginViewHost::Dock | PluginViewHost::Modal => None,
     }
 }
 

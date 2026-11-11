@@ -91,6 +91,7 @@ pub(crate) fn frame_sequence_fixture() -> Vec<FrameOp> {
         context_menu: true,
         change_review: false,
         settings_modal: false,
+        plugin_view_modal: false,
         dialog: true,
         toast_stack: false,
     })
