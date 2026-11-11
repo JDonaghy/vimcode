@@ -544,6 +544,10 @@ fn lua_table_to_view_field(
             options: options("options"),
             selected,
         },
+        "radio_group" => ViewFieldKind::RadioGroup {
+            options: options("options"),
+            selected,
+        },
         "buttons" => {
             let mut buttons = Vec::new();
             if let Ok(t) = row.get::<_, LuaTable>("buttons") {
@@ -3543,7 +3547,8 @@ impl PluginManager {
         match &event.kind {
             ViewEventKind::ToggleChanged { value } => tbl.set("value", *value)?,
             ViewEventKind::DropdownChanged { selected }
-            | ViewEventKind::SegmentedChanged { selected } => {
+            | ViewEventKind::SegmentedChanged { selected }
+            | ViewEventKind::RadioGroupChanged { selected } => {
                 // 0-based, matching the `selected` the plugin authored.
                 tbl.set("value", *selected as i64)?
             }

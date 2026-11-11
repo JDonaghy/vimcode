@@ -327,6 +327,35 @@ pub fn plugin_view_to_form_with_row_focus(
                     options: options.clone(),
                     selected_idx: (*selected).min(options.len().saturating_sub(1)),
                 },
+                // A radio option carries no declared id of its own on the
+                // wire (just a bare `options: Vec<String>`, mirroring
+                // `Segmented`), so each `RadioOption::id` is synthesized
+                // from the field's own id plus the option's index — a
+                // click-hit-testing detail `quadraui::RadioGroup::select`
+                // consumes internally. `FormEvent::RadioChanged` carries
+                // the resolved *index* alongside the *field's* own id, not
+                // an option id, so `plugin_view_event_from_form_event`
+                // never needs to decode this suffix back.
+                ViewFieldKind::RadioGroup { options, selected } => {
+                    let group_id = wid(&f.id);
+                    let radio_options = options
+                        .iter()
+                        .enumerate()
+                        .map(|(i, label)| {
+                            quadraui::RadioOption::new(
+                                WidgetId::new(format!("{}:{i}", group_id.as_str())),
+                                label.clone(),
+                            )
+                        })
+                        .collect();
+                    let mut group = quadraui::RadioGroup::new(group_id, radio_options);
+                    group.selected = if options.is_empty() {
+                        None
+                    } else {
+                        Some((*selected).min(options.len() - 1))
+                    };
+                    FieldKind::RadioGroup(group)
+                }
                 ViewFieldKind::Buttons { buttons } => FieldKind::ButtonRow {
                     buttons: buttons
                         .iter()
@@ -1568,6 +1597,17 @@ pub(crate) fn plugin_view_event_from_form_event(
             id,
             ViewEventKind::SegmentedChanged {
                 selected: *selected_idx,
+            },
+        ),
+        // `id` is the group's own field id, not an option id — `selected`
+        // already carries the resolved option index, the same shape
+        // `SegmentedControlChanged` uses, so no decoding of the
+        // synthesized per-option `WidgetId` (see `plugin_view_to_form_with_
+        // row_focus`'s `RadioGroup` arm) is needed here.
+        quadraui::FormEvent::RadioChanged { id, selected } => (
+            id,
+            ViewEventKind::RadioGroupChanged {
+                selected: *selected,
             },
         ),
         quadraui::FormEvent::TextInputChanged { id, value } => (
