@@ -325,12 +325,12 @@ pub fn route_sc_sidebar_click(
 /// [`route_explorer_tree_event`] and [`dispatch_dap_sidebar_body_event`]:
 /// `rect` must be the same rect the caller's last `ai_chat.borrow().render(
 /// backend, rect)` used (both backends cache it in `Engine::ai_chat_rect`), so
-/// `ChatController::handle` re-derives the identical layout `render()` painted
-/// rather than risking drift a second hand-rolled geometry pass invites.
+/// `ChatController::handle_event` re-derives the identical layout `render()`
+/// painted rather than risking drift a second hand-rolled geometry pass invites.
 ///
 /// Returns whether the panel should keep keyboard focus — see
 /// [`Engine::dispatch_ai_chat_event`], which this delegates the semantic
-/// event to after `ChatController::handle` resolves it.
+/// event to after `ChatController::handle_event` resolves it.
 ///
 /// On GTK, `backend`'s "current" `line_height`/`char_width` — what
 /// [`quadraui::Backend::line_height`]/`char_width` actually read — are
@@ -463,6 +463,12 @@ pub fn route_ai_chat_event(
         }
     }
 
-    let chat_event = engine.ai_chat.borrow_mut().handle(event, backend, rect);
-    engine.dispatch_ai_chat_event(chat_event)
+    let result = engine
+        .ai_chat
+        .borrow_mut()
+        .handle_event(event, backend, rect);
+    match result {
+        quadraui::Handled::Ignored | quadraui::Handled::Consumed => true,
+        quadraui::Handled::Event(action) => engine.dispatch_ai_chat_event(action),
+    }
 }

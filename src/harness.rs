@@ -1888,7 +1888,7 @@ pub fn make_conflicted_repo(tag: &str) -> PathBuf {
 
 pub(crate) fn install_folder_picker(app: &App, dir: PathBuf) {
     *app.folder_picker.borrow_mut() =
-        Some(quadraui::FolderPickerController::new(dir, vec![], false));
+        Some(quadraui::FolderPickerController::rooted_at(dir, vec![]));
 }
 
 /// Scenario 1: opening the shared folder/workspace picker paints

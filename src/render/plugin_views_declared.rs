@@ -482,6 +482,7 @@ pub fn plugin_view_to_form_with_row_focus(
                 control_width: f.control_width.map(|w| w.into_quadraui()),
                 min_control_width: f.min_control_width,
                 tab_index: None,
+                row_align: None,
             }
         })
         .collect();
@@ -520,6 +521,7 @@ pub fn plugin_view_to_form_with_row_focus(
             .map(|w| w.into_quadraui())
             .unwrap_or_default(),
         min_control_width: view.min_control_width,
+        spacing: quadraui::FormSpacing::default(),
     }
 }
 
@@ -681,7 +683,7 @@ pub fn handle_plugin_view_ui_event(
     let result = engine
         .plugin_view_form_controller
         .borrow_mut()
-        .handle_cached(&probe, rect);
+        .handle_cached_event(&probe, rect);
 
     let sync_scroll = |engine: &mut Engine| {
         let offset = engine.plugin_view_form_controller.borrow().scroll_offset();
@@ -689,12 +691,13 @@ pub fn handle_plugin_view_ui_event(
     };
 
     let action = match result {
-        quadraui::FormControllerEvent::Ignored => return false,
-        quadraui::FormControllerEvent::ScrollChanged | quadraui::FormControllerEvent::Consumed => {
+        quadraui::Handled::Ignored => return false,
+        quadraui::Handled::Event(quadraui::FormControllerAction::ScrollChanged)
+        | quadraui::Handled::Consumed => {
             sync_scroll(engine);
             return true;
         }
-        quadraui::FormControllerEvent::FormAction(action) => action,
+        quadraui::Handled::Event(quadraui::FormControllerAction::FormAction(action)) => action,
     };
     sync_scroll(engine);
     apply_combo_box_form_action(engine, &action);
@@ -765,7 +768,7 @@ pub fn handle_plugin_view_tab_ui_event(
     let result = engine
         .plugin_view_tab_form_controller
         .borrow_mut()
-        .handle_cached(&probe, rect);
+        .handle_cached_event(&probe, rect);
 
     let sync_scroll = |engine: &mut Engine| {
         let offset = engine
@@ -776,12 +779,13 @@ pub fn handle_plugin_view_tab_ui_event(
     };
 
     let action = match result {
-        quadraui::FormControllerEvent::Ignored => return false,
-        quadraui::FormControllerEvent::ScrollChanged | quadraui::FormControllerEvent::Consumed => {
+        quadraui::Handled::Ignored => return false,
+        quadraui::Handled::Event(quadraui::FormControllerAction::ScrollChanged)
+        | quadraui::Handled::Consumed => {
             sync_scroll(engine);
             return true;
         }
-        quadraui::FormControllerEvent::FormAction(action) => action,
+        quadraui::Handled::Event(quadraui::FormControllerAction::FormAction(action)) => action,
     };
     sync_scroll(engine);
     apply_combo_box_form_action(engine, &action);
@@ -848,7 +852,7 @@ pub fn handle_plugin_view_dock_ui_event(
     let result = engine
         .plugin_view_dock_form_controller
         .borrow_mut()
-        .handle_cached(&probe, rect);
+        .handle_cached_event(&probe, rect);
 
     let sync_scroll = |engine: &mut Engine| {
         let offset = engine
@@ -859,12 +863,13 @@ pub fn handle_plugin_view_dock_ui_event(
     };
 
     let action = match result {
-        quadraui::FormControllerEvent::Ignored => return false,
-        quadraui::FormControllerEvent::ScrollChanged | quadraui::FormControllerEvent::Consumed => {
+        quadraui::Handled::Ignored => return false,
+        quadraui::Handled::Event(quadraui::FormControllerAction::ScrollChanged)
+        | quadraui::Handled::Consumed => {
             sync_scroll(engine);
             return true;
         }
-        quadraui::FormControllerEvent::FormAction(action) => action,
+        quadraui::Handled::Event(quadraui::FormControllerAction::FormAction(action)) => action,
     };
     sync_scroll(engine);
     apply_combo_box_form_action(engine, &action);
@@ -1058,7 +1063,7 @@ pub fn handle_plugin_view_modal_ui_event(
     let result = engine
         .plugin_view_modal_form_controller
         .borrow_mut()
-        .handle_cached(&probe, rect);
+        .handle_cached_event(&probe, rect);
 
     let sync_scroll = |engine: &mut Engine| {
         let offset = engine
@@ -1069,12 +1074,13 @@ pub fn handle_plugin_view_modal_ui_event(
     };
 
     let action = match result {
-        quadraui::FormControllerEvent::Ignored => return false,
-        quadraui::FormControllerEvent::ScrollChanged | quadraui::FormControllerEvent::Consumed => {
+        quadraui::Handled::Ignored => return false,
+        quadraui::Handled::Event(quadraui::FormControllerAction::ScrollChanged)
+        | quadraui::Handled::Consumed => {
             sync_scroll(engine);
             return true;
         }
-        quadraui::FormControllerEvent::FormAction(action) => action,
+        quadraui::Handled::Event(quadraui::FormControllerAction::FormAction(action)) => action,
     };
     sync_scroll(engine);
     apply_combo_box_form_action(engine, &action);

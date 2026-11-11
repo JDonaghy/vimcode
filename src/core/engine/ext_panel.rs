@@ -4144,7 +4144,7 @@ impl Engine {
     /// buffered keystrokes" guarantee to keys outside its own dispatch.
     ///
     /// Callers must not use this for `Escape`: that key is about to fire
-    /// `ChatControllerEvent::Cancelled` and leave the panel, so the buffer
+    /// `ChatControllerAction::Cancelled` and leave the panel, so the buffer
     /// should be discarded (`ai_leader_toggle_pending.clear()`) rather than
     /// replayed into an input the user is walking away from — see
     /// `dispatch_ai_chat_event`'s `Cancelled` arm, which does exactly that.
@@ -4155,16 +4155,16 @@ impl Engine {
         }
     }
 
-    /// Apply a [`quadraui::ChatControllerEvent`] the AI panel's `ChatController`
-    /// returned from `handle()`. Shared by GTK and TUI via
-    /// `render::route_ai_chat_event`.
+    /// Apply a [`quadraui::ChatControllerAction`] the AI panel's `ChatController`
+    /// returned from `handle_event()` under `Handled::Event`. Shared by GTK and
+    /// TUI via `render::route_ai_chat_event`.
     ///
     /// Returns whether the panel should keep keyboard focus — `false` only on
     /// `Cancelled` (Escape), mirroring every other panel's "Escape leaves"
     /// convention now that the always-focused `ChatController` input has no
     /// separate "not editing" mode.
-    pub fn dispatch_ai_chat_event(&mut self, event: quadraui::ChatControllerEvent) -> bool {
-        use quadraui::ChatControllerEvent as Ev;
+    pub fn dispatch_ai_chat_event(&mut self, event: quadraui::ChatControllerAction) -> bool {
+        use quadraui::ChatControllerAction as Ev;
         match event {
             Ev::Submit { text } => {
                 self.ai_send_message(text);
@@ -4266,7 +4266,7 @@ impl Engine {
         }
     }
 
-    /// Apply a [`quadraui::ChatControllerEvent::TurnClicked`]: a
+    /// Apply a [`quadraui::ChatControllerAction::TurnClicked`]: a
     /// click or the equivalent focused-turn `Enter` (see
     /// `render::route_ai_chat_event`'s Enter intercept, which resolves the
     /// same way this does before calling this method) landed on transcript
@@ -4976,7 +4976,8 @@ mod ai_leader_toggle_key_tests {
         assert!(engine.ai_leader_toggle_key('a'));
         assert_eq!(engine.ai_leader_toggle_pending, " a");
 
-        let still_focused = engine.dispatch_ai_chat_event(quadraui::ChatControllerEvent::Cancelled);
+        let still_focused =
+            engine.dispatch_ai_chat_event(quadraui::ChatControllerAction::Cancelled);
 
         assert!(!still_focused);
         assert!(!engine.ai_has_focus);

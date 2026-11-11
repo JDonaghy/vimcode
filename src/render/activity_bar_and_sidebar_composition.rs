@@ -588,6 +588,7 @@ pub fn settings_to_form(engine: &Engine) -> quadraui::Form {
                     control_width: None,
                     min_control_width: None,
                     tab_index: None,
+                    row_align: None,
                 }
             }
             SettingsRow::ExtCategory(name) => {
@@ -616,6 +617,7 @@ pub fn settings_to_form(engine: &Engine) -> quadraui::Form {
                     control_width: None,
                     min_control_width: None,
                     tab_index: None,
+                    row_align: None,
                 }
             }
             SettingsRow::CoreSetting(idx) => {
@@ -651,6 +653,7 @@ pub fn settings_to_form(engine: &Engine) -> quadraui::Form {
                     control_width: None,
                     min_control_width: None,
                     tab_index: None,
+                    row_align: None,
                 }
             }
             SettingsRow::ExtSetting(ext_name, key) => {
@@ -702,6 +705,7 @@ pub fn settings_to_form(engine: &Engine) -> quadraui::Form {
                     control_width: None,
                     min_control_width: None,
                     tab_index: None,
+                    row_align: None,
                 }
             }
         };
@@ -721,6 +725,7 @@ pub fn settings_to_form(engine: &Engine) -> quadraui::Form {
         label_width: None,
         control_width: Default::default(),
         min_control_width: None,
+        spacing: quadraui::FormSpacing::default(),
     }
 }
 
@@ -786,7 +791,7 @@ pub fn handle_settings_form_ui_event(
     let result = engine
         .settings_form_controller
         .borrow_mut()
-        .handle_cached(&probe, rect);
+        .handle_cached_event(&probe, rect);
 
     let sync_scroll = |engine: &mut Engine| {
         let offset = engine.settings_form_controller.borrow().scroll_offset();
@@ -794,12 +799,13 @@ pub fn handle_settings_form_ui_event(
     };
 
     match result {
-        quadraui::FormControllerEvent::Ignored => false,
-        quadraui::FormControllerEvent::ScrollChanged | quadraui::FormControllerEvent::Consumed => {
+        quadraui::Handled::Ignored => false,
+        quadraui::Handled::Event(quadraui::FormControllerAction::ScrollChanged)
+        | quadraui::Handled::Consumed => {
             sync_scroll(engine);
             true
         }
-        quadraui::FormControllerEvent::FormAction(action) => {
+        quadraui::Handled::Event(quadraui::FormControllerAction::FormAction(action)) => {
             let (id, activates) = match action {
                 quadraui::FormEvent::ToggleChanged { id, .. } => (id, true),
                 quadraui::FormEvent::ButtonClicked { id } => (id, true),

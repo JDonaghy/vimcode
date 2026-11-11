@@ -3884,15 +3884,16 @@ mod tests {
         engine.ai_attach_range(0, 1, "");
         assert!(engine.acp_pending_attachment.is_some());
 
-        let kept_focus = engine.dispatch_ai_chat_event(quadraui::ChatControllerEvent::KeyPressed {
-            key: "Char('r')".to_string(),
-            modifiers: quadraui::Modifiers {
-                ctrl: true,
-                shift: false,
-                alt: false,
-                cmd: false,
-            },
-        });
+        let kept_focus =
+            engine.dispatch_ai_chat_event(quadraui::ChatControllerAction::KeyPressed {
+                key: "Char('r')".to_string(),
+                modifiers: quadraui::Modifiers {
+                    ctrl: true,
+                    shift: false,
+                    alt: false,
+                    cmd: false,
+                },
+            });
 
         assert!(kept_focus, "Ctrl+R must not drop panel focus");
         assert!(
@@ -3937,15 +3938,16 @@ mod tests {
         );
         assert!(engine.acp_pending_attachment.is_none());
 
-        let kept_focus = engine.dispatch_ai_chat_event(quadraui::ChatControllerEvent::KeyPressed {
-            key: "Char('r')".to_string(),
-            modifiers: quadraui::Modifiers {
-                ctrl: true,
-                shift: false,
-                alt: false,
-                cmd: false,
-            },
-        });
+        let kept_focus =
+            engine.dispatch_ai_chat_event(quadraui::ChatControllerAction::KeyPressed {
+                key: "Char('r')".to_string(),
+                modifiers: quadraui::Modifiers {
+                    ctrl: true,
+                    shift: false,
+                    alt: false,
+                    cmd: false,
+                },
+            });
 
         assert!(kept_focus, "Ctrl+R must not drop panel focus");
         assert_eq!(
@@ -4133,15 +4135,16 @@ mod tests {
         assert!(engine.acp_pending_attachment.is_none());
         assert!(engine.acp_manual_attachments.is_empty());
 
-        let kept_focus = engine.dispatch_ai_chat_event(quadraui::ChatControllerEvent::KeyPressed {
-            key: "Char('r')".to_string(),
-            modifiers: quadraui::Modifiers {
-                ctrl: true,
-                shift: false,
-                alt: false,
-                cmd: false,
-            },
-        });
+        let kept_focus =
+            engine.dispatch_ai_chat_event(quadraui::ChatControllerAction::KeyPressed {
+                key: "Char('r')".to_string(),
+                modifiers: quadraui::Modifiers {
+                    ctrl: true,
+                    shift: false,
+                    alt: false,
+                    cmd: false,
+                },
+            });
 
         assert!(kept_focus, "Ctrl+R must not drop panel focus");
         assert!(
@@ -4201,15 +4204,16 @@ mod tests {
         engine.ai_send_message("second".to_string());
         assert!(engine.acp_mut().queued_prompt.is_some());
 
-        let kept_focus = engine.dispatch_ai_chat_event(quadraui::ChatControllerEvent::KeyPressed {
-            key: "Char('g')".to_string(),
-            modifiers: quadraui::Modifiers {
-                ctrl: true,
-                shift: false,
-                alt: false,
-                cmd: false,
-            },
-        });
+        let kept_focus =
+            engine.dispatch_ai_chat_event(quadraui::ChatControllerAction::KeyPressed {
+                key: "Char('g')".to_string(),
+                modifiers: quadraui::Modifiers {
+                    ctrl: true,
+                    shift: false,
+                    alt: false,
+                    cmd: false,
+                },
+            });
 
         assert!(kept_focus, "Ctrl+G must not drop panel focus");
         assert!(
@@ -5170,7 +5174,7 @@ mod tests {
     /// (`src/core/engine/ext_panel.rs`) must actually route through
     /// `acp_cancel_turn` while a live ACP turn is streaming, not just exist
     /// as an unreferenced method. This exercises it exactly the way the AI panel
-    /// does: a `ChatControllerEvent::KeyPressed` for Ctrl+C dispatched while
+    /// does: a `ChatControllerAction::KeyPressed` for Ctrl+C dispatched while
     /// `acp_client.is_some() && ai_streaming` — with a permission dialog
     /// parked mid-turn, so this also covers "session cancelled while a
     /// prompt is open -> close the dialog, reply cancelled".
@@ -5187,7 +5191,7 @@ mod tests {
             "sanity: the turn must still be streaming/parked before Ctrl+C"
         );
 
-        engine.dispatch_ai_chat_event(quadraui::ChatControllerEvent::KeyPressed {
+        engine.dispatch_ai_chat_event(quadraui::ChatControllerAction::KeyPressed {
             key: "Char('c')".to_string(),
             modifiers: quadraui::Modifiers {
                 ctrl: true,

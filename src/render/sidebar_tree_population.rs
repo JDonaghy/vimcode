@@ -140,7 +140,9 @@ pub fn populate_sc_sidebar_system(engine: &Engine, theme: &Theme) {
 /// frame before `sidebar.render()`.
 pub fn populate_search_sidebar_system(engine: &Engine, root: &std::path::Path, theme: &Theme) {
     use quadraui::primitives::form::{ButtonRowItem, FieldKind, ToggleGroupItem};
-    use quadraui::{Badge, Decoration, Form, FormField, StyledSpan, StyledText, TreeRow, WidgetId};
+    use quadraui::{
+        Badge, Decoration, Form, FormField, FormSpacing, StyledSpan, StyledText, TreeRow, WidgetId,
+    };
 
     let opts = &engine.project_search_options;
     let results = &engine.project_search_results;
@@ -175,6 +177,7 @@ pub fn populate_search_sidebar_system(engine: &Engine, root: &std::path::Path, t
                 control_width: None,
                 min_control_width: None,
                 tab_index: None,
+                row_align: None,
             },
             FormField {
                 id: WidgetId::new("search:replace"),
@@ -198,6 +201,7 @@ pub fn populate_search_sidebar_system(engine: &Engine, root: &std::path::Path, t
                 control_width: None,
                 min_control_width: None,
                 tab_index: None,
+                row_align: None,
             },
             FormField {
                 id: WidgetId::new("search:toggles"),
@@ -230,6 +234,7 @@ pub fn populate_search_sidebar_system(engine: &Engine, root: &std::path::Path, t
                 control_width: None,
                 min_control_width: None,
                 tab_index: None,
+                row_align: None,
             },
             FormField {
                 id: WidgetId::new("search:buttons"),
@@ -268,6 +273,7 @@ pub fn populate_search_sidebar_system(engine: &Engine, root: &std::path::Path, t
                 control_width: None,
                 min_control_width: None,
                 tab_index: None,
+                row_align: None,
             },
             FormField {
                 id: WidgetId::new("search:status"),
@@ -294,6 +300,7 @@ pub fn populate_search_sidebar_system(engine: &Engine, root: &std::path::Path, t
                 control_width: None,
                 min_control_width: None,
                 tab_index: None,
+                row_align: None,
             },
         ],
         focused_field: form_focus.as_deref().map(WidgetId::new),
@@ -304,6 +311,7 @@ pub fn populate_search_sidebar_system(engine: &Engine, root: &std::path::Path, t
         label_width: None,
         control_width: Default::default(),
         min_control_width: None,
+        spacing: FormSpacing::default(),
     };
 
     // ── Section 1: TreeView (results grouped by file) ───────────────────

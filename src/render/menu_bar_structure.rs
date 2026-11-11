@@ -577,6 +577,7 @@ mod tests {
                 ToolbarButton::Label { .. } => {
                     panic!("unexpected Label variant in debug toolbar");
                 }
+                other => panic!("unexpected ToolbarButton variant in debug toolbar: {other:?}"),
             }
         }
         assert_eq!(action_idx, 7, "expected 7 action buttons");
