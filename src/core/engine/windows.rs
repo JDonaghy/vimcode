@@ -3245,7 +3245,7 @@ impl Engine {
             .apply_language_map(buffer_id, &self.settings.language_map);
 
         // If this buffer is the current preview, just promote it in-place.
-        if self.preview_tab.is_preview(&buffer_id.to_string()) {
+        if self.preview_tab.is_preview(buffer_id.to_string()) {
             self.preview_tab_promote(buffer_id);
             self.refresh_git_diff(buffer_id);
             self.message = format!("\"{}\"", path.display());
@@ -3871,7 +3871,7 @@ impl Engine {
 
         // Drop the deleted buffer from the shared preview tier — clears its
         // preview flag if it held one, and stops its doc entry from lingering.
-        self.preview_tab.close(&id.to_string());
+        self.preview_tab.close(id.to_string());
         self.sync_preview_buffer_id();
 
         self.lsp_did_close(id);

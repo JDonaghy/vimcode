@@ -1,6 +1,12 @@
 use super::construction::app_icon_image_for_paint;
 use super::*;
 
+/// Cells of row chrome the completion popup needs on top of its longest
+/// candidate label: two side borders, the kind icon's two-cell mnemonic
+/// plus its one-cell trailing gap, and one pad cell before the right
+/// border.
+pub(crate) const COMPLETION_POPUP_CHROME_CELLS: usize = 6;
+
 impl App {
     pub(crate) fn handle_poll_tick(&mut self, backend: &mut dyn quadraui::Backend) {
         // Schedule a redraw if the colorscheme changed (e.g. via `:colorscheme`).
@@ -1199,15 +1205,21 @@ impl App {
         // modal stack.
         let completion = screen.completion.as_ref().and_then(|menu| {
             let (cursor_x, cursor_y) = anchor_points.completion?;
-            // Longest candidate + 4 cells of padding/border, floored at 12 cells.
-            // Both the `+4`/`.max(12.0)` match `tui_main::render_impl`'s completion
-            // width calculation. Scaling the `12.0` floor by `cw` keeps GTK's effective
-            // minimum close to its old ~100px while giving TUI-via-`App` the same
-            // sane 12-cell floor `render_impl` already ships.
+            // Longest candidate + the row chrome every backend's
+            // completion rasteriser paints around it, floored at 12 cells:
+            // two side borders, the kind icon (a two-cell mnemonic, since
+            // `CompletionItem::resolved_icon` always resolves to *some*
+            // icon) plus its one-cell trailing gap, and one trailing pad
+            // cell before the right border — 6 cells in total. Anything
+            // narrower truncates the candidate label itself.
+            // Scaling the `12.0` floor by `cw` keeps GTK's effective
+            // minimum close to ~100px while giving TUI the same sane
+            // 12-cell floor.
             // `Completions::layout` clamps position but never clamps `popup_w` itself,
             // so a long candidate can still render past the window's right edge — a gap
             // in the shared quadraui primitive, not something to patch per-backend.
-            let popup_w = ((menu.max_width + 4) as f64 * cw).max(12.0 * cw);
+            let popup_w =
+                ((menu.max_width + COMPLETION_POPUP_CHROME_CELLS) as f64 * cw).max(12.0 * cw);
             let max_popup_h = 10.0 * lh;
             Some((
                 render::PopupAnchor {
