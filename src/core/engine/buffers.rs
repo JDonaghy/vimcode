@@ -3549,7 +3549,7 @@ impl Engine {
     /// shared preview tier, then sync buffer/tab state to match. A no-op
     /// when `buffer_id` isn't currently the preview.
     pub(super) fn preview_tab_promote(&mut self, buffer_id: BufferId) {
-        if self.preview_tab.promote(&buffer_id.to_string()).is_some() {
+        if self.preview_tab.promote(buffer_id.to_string()).is_some() {
             if let Some(state) = self.buffer_manager.get_mut(buffer_id) {
                 state.preview = false;
             }
@@ -3641,7 +3641,7 @@ impl Engine {
         }
 
         // If buffer already exists as permanent, just switch to it
-        if is_already_permanent && !self.preview_tab.is_preview(&buffer_id.to_string()) {
+        if is_already_permanent && !self.preview_tab.is_preview(buffer_id.to_string()) {
             if current != buffer_id {
                 self.buffer_manager.alternate_buffer = Some(current);
             }
