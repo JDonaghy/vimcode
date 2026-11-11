@@ -119,7 +119,7 @@ pub fn plugin_view_to_form_with_combo_edit(
     combo_edit: Option<&crate::core::plugin_ui::PluginViewComboBoxEditState>,
 ) -> quadraui::Form {
     plugin_view_to_form_with_row_focus(
-        view_name, view, selected, scroll_top, has_focus, text_edit, combo_edit, 0,
+        view_name, view, selected, scroll_top, has_focus, text_edit, combo_edit, 0, None,
     )
 }
 
@@ -145,6 +145,11 @@ pub fn plugin_view_to_form_with_combo_edit(
 /// `buttons` row's own `ButtonRowItem` already paints bracket chrome
 /// around every item's label regardless of focus, so `[…]` here would
 /// nest into an ambiguous `[[Label]]` instead of standing out.
+///
+/// `number_edit` is the `number_input` field kind's own live interaction
+/// state (`draft`) — see
+/// [`crate::core::plugin_ui::PluginViewNumberEditState`]'s doc for why it
+/// needs one, the same reason `combo_edit` does.
 #[allow(clippy::too_many_arguments)]
 pub fn plugin_view_to_form_with_row_focus(
     view_name: &str,
@@ -155,6 +160,7 @@ pub fn plugin_view_to_form_with_row_focus(
     text_edit: Option<&crate::core::plugin_ui::PluginViewTextEditState>,
     combo_edit: Option<&crate::core::plugin_ui::PluginViewComboBoxEditState>,
     row_focus: usize,
+    number_edit: Option<&crate::core::plugin_ui::PluginViewNumberEditState>,
 ) -> quadraui::Form {
     use crate::core::plugin_ui::{namespaced_widget_id, ViewFieldKind};
     use quadraui::{
@@ -166,6 +172,8 @@ pub fn plugin_view_to_form_with_row_focus(
     let live = |field_id: &str| text_edit.filter(|e| e.view == view_name && e.field_id == field_id);
     let live_combo =
         |field_id: &str| combo_edit.filter(|e| e.view == view_name && e.field_id == field_id);
+    let live_number =
+        |field_id: &str| number_edit.filter(|e| e.view == view_name && e.field_id == field_id);
 
     let visible = view.visible_field_indices();
     let fields: Vec<FormField> = visible
@@ -378,6 +386,26 @@ pub fn plugin_view_to_form_with_row_focus(
                     max: *max,
                     step: *step,
                 },
+                // `value` seeds from the plugin's own declared value every
+                // render, the same "declared value is authoritative unless
+                // vimcode is actively editing it" contract `text`/`combo`
+                // fields follow — only the in-progress typed `draft` comes
+                // from `number_edit`, since that is the one bit of live
+                // state quadraui's `NumberInput` needs fed back each frame
+                // (see `ViewFieldKind::NumberInput`'s own doc).
+                ViewFieldKind::NumberInput {
+                    value,
+                    min,
+                    max,
+                    step,
+                } => {
+                    let mut number = quadraui::NumberInput::new(wid(&f.id), *min, *max);
+                    number.value = *value;
+                    number.step = *step;
+                    number.disabled = f.disabled;
+                    number.draft = live_number(&f.id).and_then(|e| e.draft.clone());
+                    FieldKind::NumberInput(number)
+                }
                 // A collapsible header is a `Button` so activating it (click,
                 // Enter/Space) raises `FormEvent::ButtonClicked` through
                 // quadraui's existing machinery; `handle_plugin_view_ui_event`
@@ -546,6 +574,7 @@ pub fn populate_plugin_view_form_controller(engine: &Engine) -> bool {
         engine.plugin_view_text_edit.as_ref(),
         engine.plugin_view_combo_edit.as_ref(),
         engine.plugin_view_row_focus(PluginViewHost::Sidebar),
+        engine.plugin_view_number_edit.as_ref(),
     );
     let mut fc = engine.plugin_view_form_controller.borrow_mut();
     fc.set_form(form);
@@ -580,6 +609,7 @@ pub fn populate_plugin_view_tab_form_controller(
         engine.plugin_view_text_edit.as_ref(),
         engine.plugin_view_combo_edit.as_ref(),
         engine.plugin_view_row_focus(PluginViewHost::Tab),
+        engine.plugin_view_number_edit.as_ref(),
     );
     let mut fc = engine.plugin_view_tab_form_controller.borrow_mut();
     fc.set_form(form);
@@ -612,6 +642,7 @@ pub fn populate_plugin_view_dock_form_controller(
         engine.plugin_view_text_edit.as_ref(),
         engine.plugin_view_combo_edit.as_ref(),
         engine.plugin_view_row_focus(PluginViewHost::Dock),
+        engine.plugin_view_number_edit.as_ref(),
     );
     let mut fc = engine.plugin_view_dock_form_controller.borrow_mut();
     fc.set_form(form);
@@ -640,6 +671,7 @@ pub fn populate_plugin_view_modal_form_controller(engine: &Engine, name: &str) -
         engine.plugin_view_text_edit.as_ref(),
         engine.plugin_view_combo_edit.as_ref(),
         engine.plugin_view_row_focus(PluginViewHost::Modal),
+        engine.plugin_view_number_edit.as_ref(),
     );
     let mut fc = engine.plugin_view_modal_form_controller.borrow_mut();
     fc.set_form(form);
@@ -701,6 +733,7 @@ pub fn handle_plugin_view_ui_event(
     };
     sync_scroll(engine);
     apply_combo_box_form_action(engine, &action);
+    apply_number_input_form_action(engine, &action);
 
     let Some((view_name, field_id, mut kind)) = plugin_view_event_from_form_event(&action) else {
         return true;
@@ -789,6 +822,7 @@ pub fn handle_plugin_view_tab_ui_event(
     };
     sync_scroll(engine);
     apply_combo_box_form_action(engine, &action);
+    apply_number_input_form_action(engine, &action);
 
     let Some((view_name, field_id, mut kind)) = plugin_view_event_from_form_event(&action) else {
         return true;
@@ -873,6 +907,7 @@ pub fn handle_plugin_view_dock_ui_event(
     };
     sync_scroll(engine);
     apply_combo_box_form_action(engine, &action);
+    apply_number_input_form_action(engine, &action);
 
     let Some((view_name, field_id, mut kind)) = plugin_view_event_from_form_event(&action) else {
         return true;
@@ -1084,6 +1119,7 @@ pub fn handle_plugin_view_modal_ui_event(
     };
     sync_scroll(engine);
     apply_combo_box_form_action(engine, &action);
+    apply_number_input_form_action(engine, &action);
 
     let Some((view_name, field_id, mut kind)) = plugin_view_event_from_form_event(&action) else {
         return true;
@@ -1429,6 +1465,66 @@ fn apply_combo_box_form_action(engine: &mut Engine, action: &quadraui::FormEvent
     }
 }
 
+/// Apply a `quadraui::FormEvent::Number*` action to
+/// `Engine::plugin_view_number_edit` — the `number_input` twin of
+/// [`apply_combo_box_form_action`], same "quadraui's `FormController` keeps
+/// no shadow cache of its own" reasoning (see that function's doc).
+///
+/// Called by every `handle_plugin_view_*_ui_event` before
+/// [`plugin_view_event_from_form_event`], so the shadow state is updated
+/// even for `NumberDraftChanged` — the one variant that function
+/// deliberately does *not* turn into a `ViewEventKind` the plugin sees (see
+/// [`crate::core::plugin_ui::ViewFieldKind::NumberInput`]'s doc).
+///
+/// `NumberChanged`/`NumberCommitted`/`NumberCancelled` all *clear* the
+/// state rather than freeze it at the final value: the next render rebuilds
+/// the `NumberInput` from the plugin's own declared `value` (which
+/// `on_event` is expected to update to match, for `Changed`/`Committed`)
+/// with no pending draft — the same "declared value is authoritative once
+/// vimcode stops actively editing it" contract every other field kind here
+/// follows.
+fn apply_number_input_form_action(engine: &mut Engine, action: &quadraui::FormEvent) {
+    use crate::core::plugin_ui::{split_widget_id, PluginViewNumberEditState};
+
+    match action {
+        quadraui::FormEvent::NumberDraftChanged { id, draft } => {
+            let Some((view, field)) = split_widget_id(id.as_str()) else {
+                return;
+            };
+            let stale = !matches!(
+                &engine.plugin_view_number_edit,
+                Some(s) if s.view == view && s.field_id == field
+            );
+            if stale {
+                engine.plugin_view_number_edit = Some(PluginViewNumberEditState {
+                    view: view.to_string(),
+                    field_id: field.to_string(),
+                    draft: None,
+                });
+            }
+            engine
+                .plugin_view_number_edit
+                .as_mut()
+                .expect("just set above")
+                .draft = Some(draft.clone());
+        }
+        quadraui::FormEvent::NumberChanged { id, .. }
+        | quadraui::FormEvent::NumberCommitted { id, .. }
+        | quadraui::FormEvent::NumberCancelled { id } => {
+            let Some((view, field)) = split_widget_id(id.as_str()) else {
+                return;
+            };
+            if matches!(
+                &engine.plugin_view_number_edit,
+                Some(s) if s.view == view && s.field_id == field
+            ) {
+                engine.plugin_view_number_edit = None;
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Decompose a `quadraui::FormEvent` into `(view, plugin-authored field id,
 /// event kind)`, or `None` when the event's widget is not in the plugin
 /// namespace (a Settings field, say) or carries no plugin meaning.
@@ -1494,6 +1590,19 @@ pub(crate) fn plugin_view_event_from_form_event(
         ),
         quadraui::FormEvent::SliderChanged { id, value } => {
             (id, ViewEventKind::SliderChanged { value: *value })
+        }
+        // `NumberDraftChanged`/`NumberCancelled` fall to the `_` arm below:
+        // they're vimcode-owned interaction detail
+        // (`Engine::plugin_view_number_edit`, applied by
+        // `apply_number_input_form_action` before this function ever
+        // runs), not something the plugin needs to hear about — same
+        // convention as `ComboBoxHighlightChanged`/`ComboBoxCancelled`
+        // above.
+        quadraui::FormEvent::NumberChanged { id, value } => {
+            (id, ViewEventKind::NumberChanged { value: *value })
+        }
+        quadraui::FormEvent::NumberCommitted { id, value } => {
+            (id, ViewEventKind::NumberCommitted { value: *value })
         }
         quadraui::FormEvent::FocusChanged { id } => (id, ViewEventKind::FocusChanged),
         // The clicked button's own id is the dispatched event's widget id —
@@ -2614,6 +2723,203 @@ mod combo_box_translation_tests {
             },
         );
         assert!(engine.plugin_view_combo_edit.is_none());
+    }
+}
+
+#[cfg(test)]
+mod number_input_translation_tests {
+    use super::*;
+    use crate::core::engine::Engine;
+    use crate::core::plugin_ui::{
+        namespaced_widget_id, PluginView, PluginViewNumberEditState, ViewField, ViewFieldKind,
+    };
+
+    fn number_field(id: &str, value: f64, min: f64, max: f64, step: f64) -> ViewField {
+        ViewField {
+            id: id.into(),
+            label: "Volume".into(),
+            hint: String::new(),
+            disabled: false,
+            error: None,
+            warning: None,
+            kind: ViewFieldKind::NumberInput {
+                value,
+                min,
+                max,
+                step,
+            },
+            ..Default::default()
+        }
+    }
+
+    fn number_view(value: f64) -> PluginView {
+        PluginView {
+            id: "v".into(),
+            schema_version: 1,
+            fields: vec![number_field("vol", value, 0.0, 10.0, 1.0)],
+            body: None,
+            ..Default::default()
+        }
+    }
+
+    /// `number_edit: None` — no typed edit in progress — seeds `value` from
+    /// the plugin's own declared value, with no pending draft: the same
+    /// "declared value paints read-only" contract every other field kind
+    /// here follows.
+    #[test]
+    fn no_live_edit_paints_the_declared_value_with_no_draft() {
+        let view = number_view(6.0);
+        let form = plugin_view_to_form("myview", &view, 0, 0, false, None);
+        let quadraui::FieldKind::NumberInput(number) = &form.fields[0].kind else {
+            panic!(
+                "expected FieldKind::NumberInput, got {:?}",
+                form.fields[0].kind
+            );
+        };
+        assert_eq!(number.value, 6.0);
+        assert_eq!(number.min, 0.0);
+        assert_eq!(number.max, 10.0);
+        assert_eq!(number.step, 1.0);
+        assert_eq!(number.draft, None);
+    }
+
+    /// `number_edit: Some(state)` naming this field overrides `draft`, but
+    /// `value` still comes from the plugin's own declared value — a
+    /// mid-edit number input must still know what it's editing *toward*.
+    #[test]
+    fn a_live_edit_overrides_draft_but_not_the_declared_value() {
+        let view = number_view(6.0);
+        let edit = PluginViewNumberEditState {
+            view: "myview".into(),
+            field_id: "vol".into(),
+            draft: Some("7".into()),
+        };
+        let form = plugin_view_to_form_with_row_focus(
+            "myview",
+            &view,
+            0,
+            0,
+            false,
+            None,
+            None,
+            0,
+            Some(&edit),
+        );
+        let quadraui::FieldKind::NumberInput(number) = &form.fields[0].kind else {
+            panic!(
+                "expected FieldKind::NumberInput, got {:?}",
+                form.fields[0].kind
+            );
+        };
+        assert_eq!(number.value, 6.0);
+        assert_eq!(number.draft, Some("7".into()));
+    }
+
+    /// `NumberDraftChanged` primes the shadow state from the typed value —
+    /// the `number_input` twin of `combo_box_translation_tests`'s
+    /// `text_changed_primes_text_from_the_typed_value_and_opens`.
+    #[test]
+    fn draft_changed_primes_the_shadow_state() {
+        let mut engine = Engine::new_for_test();
+        engine
+            .plugin_views
+            .insert("myview".into(), number_view(6.0));
+        assert!(engine.plugin_view_number_edit.is_none());
+
+        let id = quadraui::WidgetId::new(namespaced_widget_id("myview", "vol"));
+        apply_number_input_form_action(
+            &mut engine,
+            &quadraui::FormEvent::NumberDraftChanged {
+                id,
+                draft: "7".into(),
+            },
+        );
+
+        let state = engine
+            .plugin_view_number_edit
+            .as_ref()
+            .expect("a typed digit must prime the shadow state");
+        assert_eq!(state.draft, Some("7".into()));
+    }
+
+    /// `NumberChanged`/`NumberCommitted`/`NumberCancelled` all clear the
+    /// shadow state so the next render falls back to the plugin's own
+    /// declared value with no pending draft — the `number_input` twin of
+    /// `combo_box_translation_tests`'s
+    /// `committed_and_cancelled_both_clear_the_shadow_state`.
+    #[test]
+    fn changed_committed_and_cancelled_all_clear_the_shadow_state() {
+        let mut engine = Engine::new_for_test();
+        engine
+            .plugin_views
+            .insert("myview".into(), number_view(6.0));
+        let id = quadraui::WidgetId::new(namespaced_widget_id("myview", "vol"));
+
+        apply_number_input_form_action(
+            &mut engine,
+            &quadraui::FormEvent::NumberDraftChanged {
+                id,
+                draft: "7".into(),
+            },
+        );
+        assert!(engine.plugin_view_number_edit.is_some());
+
+        apply_number_input_form_action(
+            &mut engine,
+            &quadraui::FormEvent::NumberCommitted { id, value: 7.0 },
+        );
+        assert!(engine.plugin_view_number_edit.is_none());
+    }
+
+    /// The forward event map: a stepper/arrow-key step reaches the plugin
+    /// as `NumberChanged`, and a typed-and-confirmed value reaches it as
+    /// `NumberCommitted` — both carrying the `f64` value verbatim.
+    #[test]
+    fn number_changed_and_committed_map_to_the_matching_view_event() {
+        let id = quadraui::WidgetId::new(namespaced_widget_id("myview", "vol"));
+
+        let (view, field, kind) =
+            plugin_view_event_from_form_event(&quadraui::FormEvent::NumberChanged {
+                id,
+                value: 7.0,
+            })
+            .expect("NumberChanged must map to a ViewEventKind");
+        assert_eq!(view, "myview");
+        assert_eq!(field, "vol");
+        assert_eq!(
+            kind,
+            crate::core::plugin_ui::ViewEventKind::NumberChanged { value: 7.0 }
+        );
+
+        let (_, _, kind) =
+            plugin_view_event_from_form_event(&quadraui::FormEvent::NumberCommitted {
+                id,
+                value: 5.0,
+            })
+            .expect("NumberCommitted must map to a ViewEventKind");
+        assert_eq!(
+            kind,
+            crate::core::plugin_ui::ViewEventKind::NumberCommitted { value: 5.0 }
+        );
+    }
+
+    /// `NumberDraftChanged`/`NumberCancelled` are vimcode-owned interaction
+    /// detail, like `ComboBoxHighlightChanged`/`ComboBoxCancelled` — they
+    /// never surface as a `ViewEventKind` the plugin sees.
+    #[test]
+    fn draft_changed_and_cancelled_do_not_reach_the_plugin() {
+        let id = quadraui::WidgetId::new(namespaced_widget_id("myview", "vol"));
+        assert!(
+            plugin_view_event_from_form_event(&quadraui::FormEvent::NumberDraftChanged {
+                id,
+                draft: "7".into(),
+            })
+            .is_none()
+        );
+        assert!(
+            plugin_view_event_from_form_event(&quadraui::FormEvent::NumberCancelled { id })
+                .is_none()
+        );
     }
 }
 

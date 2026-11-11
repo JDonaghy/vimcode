@@ -604,6 +604,26 @@ fn lua_table_to_view_field(
                 step: row.get::<_, f64>("step").unwrap_or(1.0) as f32,
             }
         }
+        "number_input" => {
+            // `value`/`min`/`max` are required on the
+            // `ViewFieldKind::NumberInput` wire shape (only `step` carries
+            // a serde default) — reject a missing one here, the same
+            // reason the `slider` arm above does.
+            let require_f64 = |key: &str| -> LuaResult<f64> {
+                row.get::<_, f64>(key).map_err(|_| {
+                    LuaError::RuntimeError(format!(
+                        "view field {} (id {field_id:?}): number_input requires a numeric `{key}`",
+                        idx + 1
+                    ))
+                })
+            };
+            ViewFieldKind::NumberInput {
+                value: require_f64("value")?,
+                min: require_f64("min")?,
+                max: require_f64("max")?,
+                step: row.get::<_, f64>("step").unwrap_or(1.0),
+            }
+        }
         "color" => ViewFieldKind::Color {
             value: value_str("value"),
         },
@@ -3551,6 +3571,9 @@ impl PluginManager {
                 tbl.set("value", value.as_str())?;
             }
             ViewEventKind::SliderChanged { value } => tbl.set("value", *value as f64)?,
+            ViewEventKind::NumberChanged { value } | ViewEventKind::NumberCommitted { value } => {
+                tbl.set("value", *value)?
+            }
             ViewEventKind::HeaderClicked { col } => tbl.set("col", *col as i64)?,
             ViewEventKind::SectionToggled { collapsed } => tbl.set("collapsed", *collapsed)?,
             ViewEventKind::DataPointClicked {
@@ -7996,6 +8019,90 @@ mod tests {
         assert!(
             err.contains("max"),
             "the error must name the missing field: {err}"
+        );
+    }
+
+    #[test]
+    fn a_number_input_field_parses_value_min_max_step_through_lua() {
+        use crate::core::plugin_ui::ViewFieldKind;
+        let pm = pm_with_view(
+            "number_input_ok",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return {
+                        fields = {
+                            { type = "number_input", id = "vol", value = 6.0, min = 0.0, max = 10.0, step = 3.0 },
+                        },
+                    }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let view = view.expect("render must succeed");
+        assert_eq!(
+            view.fields[0].kind,
+            ViewFieldKind::NumberInput {
+                value: 6.0,
+                min: 0.0,
+                max: 10.0,
+                step: 3.0,
+            }
+        );
+    }
+
+    #[test]
+    fn a_number_input_field_missing_max_is_an_error_not_a_silent_default() {
+        let pm = pm_with_view(
+            "number_input_missing_max",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return {
+                        fields = {
+                            { type = "number_input", id = "vol", value = 6.0, min = 0.0 },
+                        },
+                    }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let err = view.expect_err("a missing `max` must not silently snap the field's range");
+        assert!(
+            err.contains("max"),
+            "the error must name the missing field: {err}"
+        );
+    }
+
+    #[test]
+    fn a_number_input_field_defaults_step_to_one() {
+        use crate::core::plugin_ui::ViewFieldKind;
+        let pm = pm_with_view(
+            "number_input_default_step",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return {
+                        fields = {
+                            { type = "number_input", id = "vol", value = 6.0, min = 0.0, max = 10.0 },
+                        },
+                    }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let view = view.expect("render must succeed");
+        assert_eq!(
+            view.fields[0].kind,
+            ViewFieldKind::NumberInput {
+                value: 6.0,
+                min: 0.0,
+                max: 10.0,
+                step: 1.0,
+            }
         );
     }
 

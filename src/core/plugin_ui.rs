@@ -873,6 +873,13 @@ fn default_slider_step() -> f32 {
     1.0
 }
 
+/// Default step for a `number_input` field — matches quadraui's own
+/// `NumberInput::default_step` so an author who omits `step` gets the same
+/// behaviour on both sides of the translation.
+fn default_number_input_step() -> f64 {
+    1.0
+}
+
 /// Default `collapsible` for a `section` field — a header an author declares
 /// with no `collapsible` key gets the more useful behaviour (a disclosure
 /// triangle the user can act on) rather than silently being a dead label.
@@ -1066,6 +1073,34 @@ pub enum ViewFieldKind {
         #[serde(default = "default_slider_step")]
         step: f32,
     },
+    /// A bounded numeric field with increment/decrement stepper buttons
+    /// plus typed entry, stepping by `step` and clamping to `[min, max]`.
+    /// Translated to `quadraui::FieldKind::NumberInput`.
+    ///
+    /// Unlike [`Self::Slider`], `quadraui::FormController` drives this
+    /// field's keyboard handling natively — digits/`-`/`.` accumulate a
+    /// typed draft, `Up`/`Down` step the committed value immediately,
+    /// `Enter` parses/clamps/commits the draft, `Escape` discards it. See
+    /// `Engine::handle_plugin_view_key`'s number-input branch for where
+    /// vimcode forwards keys into it, and
+    /// [`PluginViewNumberEditState`]'s doc for why the in-progress draft
+    /// needs its own vimcode-owned shadow state across renders, the same
+    /// reason [`Self::ComboBox`]'s `text`/`open`/`highlighted` do.
+    ///
+    /// A stepper click or `Up`/`Down` reaches the plugin immediately as
+    /// [`ViewEventKind::NumberChanged`] — no separate confirm step, the
+    /// same shape [`Self::Slider`]'s own `SliderChanged` uses. Typed entry
+    /// reaches the plugin only once confirmed (`Enter`), as
+    /// [`ViewEventKind::NumberCommitted`]; the in-progress draft itself
+    /// never reaches the plugin — there is no per-keystroke echo the way
+    /// [`Self::Text`]'s `TextChanged` gives every other typed field.
+    NumberInput {
+        value: f64,
+        min: f64,
+        max: f64,
+        #[serde(default = "default_number_input_step")]
+        step: f64,
+    },
     /// A color swatch. `value` is a `"#rrggbb"` hex string. A valid value is
     /// translated to `quadraui::FieldKind::ColorPicker`; an empty or malformed
     /// value falls back to a read-only row echoing the raw string, so the
@@ -1154,6 +1189,7 @@ impl ViewFieldKind {
             ViewFieldKind::Toggles { .. } => "toggles",
             ViewFieldKind::Date { .. } => "date",
             ViewFieldKind::Slider { .. } => "slider",
+            ViewFieldKind::NumberInput { .. } => "number_input",
             ViewFieldKind::Color { .. } => "color",
             ViewFieldKind::Toolbar { .. } => "toolbar",
             ViewFieldKind::Section { .. } => "section",
@@ -1304,6 +1340,20 @@ pub enum ViewEventKind {
     SliderChanged {
         value: f32,
     },
+    /// A `number_input` field's committed value changed via a stepper
+    /// click or an `Up`/`Down` arrow-key step — immediate, not waiting for
+    /// a confirm step, the same shape [`Self::SliderChanged`] uses.
+    /// `value` is already clamped to the field's declared `[min, max]`.
+    NumberChanged {
+        value: f64,
+    },
+    /// A `number_input` field's typed draft was confirmed (`Enter`):
+    /// parsed and clamped to `[min, max]`. See
+    /// [`ViewFieldKind::NumberInput`]'s doc for why the in-progress draft
+    /// itself never reaches the plugin.
+    NumberCommitted {
+        value: f64,
+    },
     /// A collapsible `section` header was activated (Enter/Space/click).
     /// `collapsed` is the *proposed* next state (`!collapsed` of the
     /// field as currently declared) — same convention as every other
@@ -1418,6 +1468,8 @@ impl ViewEventKind {
             ViewEventKind::TextCommitted { .. } => "TextCommitted",
             ViewEventKind::DateChanged { .. } => "DateChanged",
             ViewEventKind::SliderChanged { .. } => "SliderChanged",
+            ViewEventKind::NumberChanged { .. } => "NumberChanged",
+            ViewEventKind::NumberCommitted { .. } => "NumberCommitted",
             ViewEventKind::SectionToggled { .. } => "SectionToggled",
             ViewEventKind::ToolbarButtonClicked => "ToolbarButtonClicked",
             ViewEventKind::FocusChanged => "FocusChanged",
@@ -1529,6 +1581,26 @@ pub struct PluginViewComboBoxEditState {
     pub highlighted: Option<usize>,
 }
 
+/// vimcode-owned interaction state for whichever `number_input` field
+/// currently has keyboard focus, in either the sidebar or an editor-area
+/// tab — the `number_input` twin of [`PluginViewComboBoxEditState`], same
+/// "quadraui's `FormController` keeps no shadow cache of its own" reasoning
+/// (see that struct's doc): the embedded `quadraui::NumberInput`'s `draft`
+/// field is documented as "supplied fresh by the app each frame", so
+/// vimcode is that app. Plugins never see this, only the committed value,
+/// via [`ViewEventKind::NumberChanged`]/[`ViewEventKind::NumberCommitted`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct PluginViewNumberEditState {
+    /// The view that owns the focused field.
+    pub view: String,
+    /// The plugin-authored field id (not the namespaced `quadraui::WidgetId`).
+    pub field_id: String,
+    /// The live, possibly-uncommitted typed text — `None` mirrors
+    /// `quadraui::NumberInput::draft`'s own "showing `value` verbatim, no
+    /// pending edit" meaning.
+    pub draft: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1627,6 +1699,34 @@ mod tests {
             value: "Apricot".into(),
         };
         assert_eq!(event.kind_name(), "ComboBoxChanged");
+    }
+
+    #[test]
+    fn number_input_field_kind_tag_is_the_lua_type_string() {
+        let json = r#"{"type":"number_input","value":6.0,"min":0.0,"max":10.0,"step":3.0}"#;
+        let kind: ViewFieldKind = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(kind.type_name(), "number_input");
+        assert_eq!(
+            kind,
+            ViewFieldKind::NumberInput {
+                value: 6.0,
+                min: 0.0,
+                max: 10.0,
+                step: 3.0,
+            }
+        );
+    }
+
+    #[test]
+    fn number_changed_event_kind_name_is_the_lua_facing_string() {
+        let event = ViewEventKind::NumberChanged { value: 9.0 };
+        assert_eq!(event.kind_name(), "NumberChanged");
+    }
+
+    #[test]
+    fn number_committed_event_kind_name_is_the_lua_facing_string() {
+        let event = ViewEventKind::NumberCommitted { value: 5.0 };
+        assert_eq!(event.kind_name(), "NumberCommitted");
     }
 
     #[test]
