@@ -726,7 +726,6 @@ fn plugin_view_to_table(
         h_scroll: 0.0,
         column_overrides: column_overrides.to_vec(),
         footer: q_footer,
-        bordered: false,
     }
 }
 
