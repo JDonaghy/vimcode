@@ -2624,10 +2624,10 @@ fn chart_data_point_click_reaches_the_plugin<D>(
         let cached = match host {
             PluginViewHost::Sidebar => engine.plugin_view_chart_layout.borrow(),
             PluginViewHost::Tab => engine.plugin_view_tab_chart_layout.borrow(),
-            PluginViewHost::Dock | PluginViewHost::Modal => unreachable!(
+            PluginViewHost::Dock | PluginViewHost::Modal | PluginViewHost::Float => unreachable!(
                 "chart_data_point_click_reaches_the_plugin is never called with \
-                 PluginViewHost::Dock/Modal -- neither renders chart-kind views \
-                 yet"
+                 PluginViewHost::Dock/Modal/Float -- none of those render \
+                 chart-kind views yet"
             ),
         };
         let layout = cached
@@ -3120,10 +3120,10 @@ fn table_divider_drag_resizes_the_column<D>(
         let cached = match host {
             PluginViewHost::Sidebar => engine.plugin_view_table_layout.borrow(),
             PluginViewHost::Tab => engine.plugin_view_tab_table_layout.borrow(),
-            PluginViewHost::Dock | PluginViewHost::Modal => unreachable!(
+            PluginViewHost::Dock | PluginViewHost::Modal | PluginViewHost::Float => unreachable!(
                 "table_divider_drag_resizes_the_column is never called with \
-                 PluginViewHost::Dock/Modal — neither renders table-kind views \
-                 yet"
+                 PluginViewHost::Dock/Modal/Float — none of those render \
+                 table-kind views yet"
             ),
         };
         let (rect, layout) = cached

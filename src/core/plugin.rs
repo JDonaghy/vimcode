@@ -354,6 +354,108 @@ fn lua_control_width(
     }
 }
 
+/// Parse a `location = "float"` call's required `anchor` key into a
+/// [`crate::core::plugin_ui::PluginViewFloatAnchor`]. `anchor` is itself a
+/// table: `{type = "cursor", dx = n, dy = n}` (both default `0`), `{type =
+/// "cell", row = n, col = n}`, or `{type = "window_edge", edge = "top" |
+/// "bottom" | "left" | "right"}`. A missing `anchor`, a missing/unrecognised
+/// `type`, or a type missing its own required keys, is a loud Lua error
+/// naming the key, matching `register_view`'s "fail loudly at the Lua/Rust
+/// boundary" convention.
+fn lua_float_anchor(
+    opts: &LuaTable,
+    context: &str,
+) -> LuaResult<crate::core::plugin_ui::PluginViewFloatAnchor> {
+    use crate::core::plugin_ui::{PluginViewFloatAnchor, PluginViewFloatEdge};
+    let anchor: LuaTable = opts.get("anchor").map_err(|_| {
+        LuaError::RuntimeError(format!(
+            "{context}: `anchor` is required for location \"float\" (a table with a \
+             `type` of \"cursor\", \"cell\" or \"window_edge\")"
+        ))
+    })?;
+    let kind: String = anchor.get("type").map_err(|_| {
+        LuaError::RuntimeError(format!(
+            "{context}: `anchor` table requires a string `type` key (\"cursor\", \
+             \"cell\" or \"window_edge\")"
+        ))
+    })?;
+    match kind.as_str() {
+        "cursor" => {
+            let dx: i64 = anchor.get("dx").unwrap_or(0);
+            let dy: i64 = anchor.get("dy").unwrap_or(0);
+            Ok(PluginViewFloatAnchor::Cursor {
+                dx: dx as i32,
+                dy: dy as i32,
+            })
+        }
+        "cell" => {
+            let row: i64 = anchor.get("row").map_err(|_| {
+                LuaError::RuntimeError(format!(
+                    "{context}: anchor type \"cell\" requires numeric `row` and `col` keys"
+                ))
+            })?;
+            let col: i64 = anchor.get("col").map_err(|_| {
+                LuaError::RuntimeError(format!(
+                    "{context}: anchor type \"cell\" requires numeric `row` and `col` keys"
+                ))
+            })?;
+            Ok(PluginViewFloatAnchor::Cell {
+                row: row.max(0) as u32,
+                col: col.max(0) as u32,
+            })
+        }
+        "window_edge" => {
+            let edge: String = anchor.get("edge").map_err(|_| {
+                LuaError::RuntimeError(format!(
+                    "{context}: anchor type \"window_edge\" requires an `edge` key \
+                     (\"top\", \"bottom\", \"left\" or \"right\")"
+                ))
+            })?;
+            let edge = match edge.as_str() {
+                "top" => PluginViewFloatEdge::Top,
+                "bottom" => PluginViewFloatEdge::Bottom,
+                "left" => PluginViewFloatEdge::Left,
+                "right" => PluginViewFloatEdge::Right,
+                other => {
+                    return Err(LuaError::RuntimeError(format!(
+                        "{context}: unsupported anchor `edge` {other:?} (expected \"top\", \
+                         \"bottom\", \"left\" or \"right\")"
+                    )));
+                }
+            };
+            Ok(PluginViewFloatAnchor::WindowEdge { edge })
+        }
+        other => Err(LuaError::RuntimeError(format!(
+            "{context}: unsupported anchor `type` {other:?} (expected \"cursor\", \"cell\" \
+             or \"window_edge\")"
+        ))),
+    }
+}
+
+/// Parse a `location = "float"` call's full `opts` table into a
+/// [`crate::core::plugin_ui::PluginViewFloatSpec`]: the required `anchor`
+/// (see [`lua_float_anchor`]) plus optional `focusable`/`border`/`bg`
+/// booleans, defaulting to
+/// [`crate::core::plugin_ui::PluginViewFloatSpec::new`]'s own defaults when
+/// omitted.
+fn lua_float_spec(
+    opts: &LuaTable,
+    context: &str,
+) -> LuaResult<crate::core::plugin_ui::PluginViewFloatSpec> {
+    let anchor = lua_float_anchor(opts, context)?;
+    let mut spec = crate::core::plugin_ui::PluginViewFloatSpec::new(anchor);
+    if let Some(focusable) = opts.get::<_, Option<bool>>("focusable")? {
+        spec.focusable = focusable;
+    }
+    if let Some(border) = opts.get::<_, Option<bool>>("border")? {
+        spec.border = border;
+    }
+    if let Some(bg) = opts.get::<_, Option<bool>>("bg")? {
+        spec.bg = bg;
+    }
+    Ok(spec)
+}
+
 /// Parse the table a view's `render()` returned into a
 /// [`crate::core::plugin_ui::PluginView`].
 ///
@@ -5668,10 +5770,13 @@ impl PluginManager {
         // window split alongside the active window (`{location = "split"}`
         // for a horizontal/top-bottom split, `{location = "vsplit"}` for a
         // vertical/left-right split — vim's own `:split`/`:vsplit` naming),
-        // the single reusable bottom-panel slot (`{location = "dock"}`), or
-        // the single reusable centred modal over the editor (`{location =
+        // the single reusable bottom-panel slot (`{location = "dock"}`), the
+        // single reusable centred modal over the editor (`{location =
         // "modal"}` — takes keyboard focus; `Escape`, a click outside it or
-        // `close_view` dismisses it).
+        // `close_view` dismisses it), or a floating overlay (`{location =
+        // "float", anchor = {...}}` — see `lua_float_anchor`'s doc for the
+        // `anchor` vocabulary; any number of distinctly named floats may be
+        // open at once, unlike every other location).
         // An optional `side` (`"above"`/`"below"` for `"split"`, `"left"`/
         // `"right"` for `"vsplit"`) pins which sibling the new window lands
         // on, overriding `splitbelow`/`splitright`; omitting it falls back
@@ -5686,11 +5791,12 @@ impl PluginManager {
         // Lua/Rust boundary" convention.
         //
         // Immediate ("live engine") API, like `vimcode.buffer.*`: opening a
-        // tab, split, dock or modal is a structural engine mutation
+        // tab, split, dock, modal or float is a structural engine mutation
         // (`Engine::open_plugin_view_tab`/`open_plugin_view_split`/
-        // `open_plugin_view_dock`), not queued output data, so it needs
-        // `live_engine` the way `vimcode.buffer.create` does rather than a
-        // `PluginCallContext` field `apply_plugin_ctx` applies later.
+        // `open_plugin_view_dock`/`open_plugin_view_float`), not queued
+        // output data, so it needs `live_engine` the way `vimcode.buffer.
+        // create` does rather than a `PluginCallContext` field
+        // `apply_plugin_ctx` applies later.
         ui_tbl.set(
             "open_view",
             lua.create_function(|_, (name, opts): (String, Option<LuaTable>)| {
@@ -5710,6 +5816,18 @@ impl PluginManager {
                     "modal" => live_engine("vimcode.ui.open_view", move |e| {
                         e.open_plugin_view_modal(&name)
                     })?,
+                    "float" => {
+                        let context = format!("vimcode.ui.open_view({name:?})");
+                        let opts_table = opts.as_ref().ok_or_else(|| {
+                            LuaError::RuntimeError(format!(
+                                "{context}: location \"float\" requires an `anchor` in opts"
+                            ))
+                        })?;
+                        let spec = lua_float_spec(opts_table, &context)?;
+                        live_engine("vimcode.ui.open_view", move |e| {
+                            e.open_plugin_view_float(&name, spec)
+                        })?
+                    }
                     "split" | "vsplit" => {
                         let direction = if location == "vsplit" {
                             SplitDirection::Vertical
@@ -5755,8 +5873,8 @@ impl PluginManager {
                     other => {
                         return Err(LuaError::RuntimeError(format!(
                             "vimcode.ui.open_view({name:?}): unsupported location {other:?} \
-                             (expected \"tab\", \"dock\", \"modal\", \"split\" or \
-                             \"vsplit\")"
+                             (expected \"tab\", \"dock\", \"modal\", \"float\", \"split\" \
+                             or \"vsplit\")"
                         )));
                     }
                 };
@@ -9105,5 +9223,135 @@ mod tests {
             err.contains("button"),
             "error must explain that a row needs button children: {err}"
         );
+    }
+
+    // ── `location = "float"` anchor parsing (`lua_float_anchor`/
+    // `lua_float_spec`) ──────────────────────────────────────────────────
+
+    fn float_opts<'lua>(lua: &'lua Lua, src: &str) -> LuaTable<'lua> {
+        lua.load(src).eval::<LuaTable>().unwrap()
+    }
+
+    #[test]
+    fn cursor_anchor_defaults_dx_dy_to_zero() {
+        use crate::core::plugin_ui::PluginViewFloatAnchor;
+        let lua = Lua::new();
+        let opts = float_opts(&lua, "return { anchor = { type = 'cursor' } }");
+        let anchor = lua_float_anchor(&opts, "ctx").unwrap();
+        assert_eq!(anchor, PluginViewFloatAnchor::Cursor { dx: 0, dy: 0 });
+    }
+
+    #[test]
+    fn cursor_anchor_reads_explicit_dx_dy() {
+        use crate::core::plugin_ui::PluginViewFloatAnchor;
+        let lua = Lua::new();
+        let opts = float_opts(
+            &lua,
+            "return { anchor = { type = 'cursor', dx = 2, dy = -1 } }",
+        );
+        let anchor = lua_float_anchor(&opts, "ctx").unwrap();
+        assert_eq!(anchor, PluginViewFloatAnchor::Cursor { dx: 2, dy: -1 });
+    }
+
+    #[test]
+    fn cell_anchor_requires_row_and_col() {
+        let lua = Lua::new();
+        let opts = float_opts(&lua, "return { anchor = { type = 'cell' } }");
+        let err = lua_float_anchor(&opts, "ctx").unwrap_err().to_string();
+        assert!(
+            err.contains("row") && err.contains("col"),
+            "error must name the missing `row`/`col` keys: {err}"
+        );
+    }
+
+    #[test]
+    fn cell_anchor_reads_row_and_col() {
+        use crate::core::plugin_ui::PluginViewFloatAnchor;
+        let lua = Lua::new();
+        let opts = float_opts(
+            &lua,
+            "return { anchor = { type = 'cell', row = 3, col = 7 } }",
+        );
+        let anchor = lua_float_anchor(&opts, "ctx").unwrap();
+        assert_eq!(anchor, PluginViewFloatAnchor::Cell { row: 3, col: 7 });
+    }
+
+    #[test]
+    fn window_edge_anchor_reads_each_named_edge() {
+        use crate::core::plugin_ui::{PluginViewFloatAnchor, PluginViewFloatEdge};
+        let lua = Lua::new();
+        for (name, edge) in [
+            ("top", PluginViewFloatEdge::Top),
+            ("bottom", PluginViewFloatEdge::Bottom),
+            ("left", PluginViewFloatEdge::Left),
+            ("right", PluginViewFloatEdge::Right),
+        ] {
+            let opts = float_opts(
+                &lua,
+                &format!("return {{ anchor = {{ type = 'window_edge', edge = '{name}' }} }}"),
+            );
+            let anchor = lua_float_anchor(&opts, "ctx").unwrap();
+            assert_eq!(anchor, PluginViewFloatAnchor::WindowEdge { edge });
+        }
+    }
+
+    #[test]
+    fn window_edge_anchor_rejects_an_unknown_edge_name() {
+        let lua = Lua::new();
+        let opts = float_opts(
+            &lua,
+            "return { anchor = { type = 'window_edge', edge = 'center' } }",
+        );
+        let err = lua_float_anchor(&opts, "ctx").unwrap_err().to_string();
+        assert!(
+            err.contains("center"),
+            "error must name the offending edge value: {err}"
+        );
+    }
+
+    #[test]
+    fn missing_anchor_table_is_a_loud_error() {
+        let lua = Lua::new();
+        let opts = float_opts(&lua, "return {}");
+        let err = lua_float_anchor(&opts, "ctx").unwrap_err().to_string();
+        assert!(
+            err.contains("anchor"),
+            "error must name the missing `anchor` key: {err}"
+        );
+    }
+
+    #[test]
+    fn unrecognised_anchor_type_is_a_loud_error() {
+        let lua = Lua::new();
+        let opts = float_opts(&lua, "return { anchor = { type = 'teleport' } }");
+        let err = lua_float_anchor(&opts, "ctx").unwrap_err().to_string();
+        assert!(
+            err.contains("teleport"),
+            "error must name the offending `type` value: {err}"
+        );
+    }
+
+    #[test]
+    fn spec_applies_focusable_border_bg_overrides_over_the_defaults() {
+        let lua = Lua::new();
+        let opts = float_opts(
+            &lua,
+            "return { anchor = { type = 'cursor' }, focusable = true, border = false, \
+             bg = false }",
+        );
+        let spec = lua_float_spec(&opts, "ctx").unwrap();
+        assert!(spec.focusable);
+        assert!(!spec.border);
+        assert!(!spec.bg);
+    }
+
+    #[test]
+    fn spec_keeps_documented_defaults_when_overrides_are_omitted() {
+        let lua = Lua::new();
+        let opts = float_opts(&lua, "return { anchor = { type = 'cursor' } }");
+        let spec = lua_float_spec(&opts, "ctx").unwrap();
+        assert!(!spec.focusable);
+        assert!(spec.border);
+        assert!(spec.bg);
     }
 }

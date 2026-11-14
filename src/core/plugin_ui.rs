@@ -787,6 +787,108 @@ impl ViewControlWidth {
     }
 }
 
+// ─── Floating views (`location = "float"`) ──────────────────────────────────
+//
+// A float is not a window, tab, split, dock slot or modal — it has no
+// `BufferId`/`WindowId` of its own (unlike tab/split) and is not a single
+// reusable slot (unlike dock/modal): any number may be open at once, each
+// keyed by its own view `name`, the way `Engine::plugin_views_float` stores
+// them. `PluginViewFloatSpec` is the whole declaration a
+// `vimcode.ui.open_view(name, {location = "float", ...})` call builds from
+// its `opts` table and hands to `Engine::open_plugin_view_float` — resolving
+// it into an actual on-screen rect, and painting/routing keys and clicks
+// into it, is later wiring this module does not do.
+
+/// Where a `location = "float"` view's top-left corner is pinned. Re-resolved
+/// against live engine state every frame (the cursor's current position, the
+/// active window's current bounds) rather than captured once at open time, so
+/// e.g. a cursor-anchored float tracks the cursor as it moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum PluginViewFloatAnchor {
+    /// Anchored to the primary cursor's current screen cell in the active
+    /// window, offset by `dx` columns / `dy` rows. `{dx = 0, dy = 1}` is the
+    /// natural position for a completion-style popup: directly below the
+    /// cursor's own cell.
+    Cursor { dx: i32, dy: i32 },
+    /// Anchored to a fixed screen cell, 0-based from the whole window's own
+    /// top-left corner — for a plugin that already knows exactly where it
+    /// wants the float (e.g. beside a gutter icon it just painted) rather
+    /// than relative to any live cursor/window state.
+    Cell { row: u32, col: u32 },
+    /// Anchored to one edge of the active window's own content rect.
+    WindowEdge { edge: PluginViewFloatEdge },
+}
+
+/// Which edge of the active window [`PluginViewFloatAnchor::WindowEdge`]
+/// pins a float to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginViewFloatEdge {
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
+/// The full declaration of one `location = "float"` view, built by
+/// `core::plugin`'s `vimcode.ui.open_view` binding from its Lua `opts` table
+/// and stored verbatim (keyed by view name) in `Engine::plugin_views_float`
+/// by `Engine::open_plugin_view_float`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginViewFloatSpec {
+    pub anchor: PluginViewFloatAnchor,
+    /// Whether the float may take keyboard focus. `false` (the default)
+    /// keeps it a purely informational overlay — a hover tooltip, say —
+    /// that can never steal the keyboard from whatever already holds it.
+    #[serde(default)]
+    pub focusable: bool,
+    /// Whether to paint a border/frame around the float. Defaults to `true`.
+    #[serde(default = "default_float_border")]
+    pub border: bool,
+    /// Whether to paint an opaque background fill behind the float's
+    /// content, occluding whatever is underneath, instead of a transparent
+    /// overlay that lets it show through. Defaults to `true`.
+    #[serde(default = "default_float_bg")]
+    pub bg: bool,
+}
+
+fn default_float_border() -> bool {
+    true
+}
+
+fn default_float_bg() -> bool {
+    true
+}
+
+impl PluginViewFloatSpec {
+    /// Build a spec from just its (mandatory) anchor, with every other
+    /// field at its documented default — the shape a plugin gets from
+    /// `vimcode.ui.open_view(name, {location = "float", anchor = {...}})`
+    /// when it declares no `focusable`/`border`/`bg` override.
+    pub fn new(anchor: PluginViewFloatAnchor) -> Self {
+        Self {
+            anchor,
+            focusable: false,
+            border: true,
+            bg: true,
+        }
+    }
+}
+
+#[cfg(test)]
+mod plugin_view_float_tests {
+    use super::*;
+
+    #[test]
+    fn new_applies_documented_defaults() {
+        let spec = PluginViewFloatSpec::new(PluginViewFloatAnchor::Cursor { dx: 0, dy: 1 });
+        assert!(!spec.focusable);
+        assert!(spec.border);
+        assert!(spec.bg);
+    }
+}
+
 /// A single row: a label plus an input.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ViewField {

@@ -5166,6 +5166,17 @@ pub struct Engine {
     /// dismissing the modal hands focus back there instead of to the
     /// editor. `None` whenever no modal is open.
     pub(crate) plugin_view_modal_prev_focus: Option<PluginViewModalFocus>,
+    /// Every currently-open `location = "float"` view, keyed by name — see
+    /// `vimcode.ui.open_view`'s `"float"` location and
+    /// `crate::core::plugin_ui::PluginViewFloatSpec`'s doc. Unlike the
+    /// dock/modal's single reusable slot, any number of floats may be open
+    /// at once under different names (e.g. a completion popup and a
+    /// signature-help popup together), so this is a map rather than flat
+    /// `Engine` fields the way `plugin_view_modal_*`/`bottom_panel_kind`
+    /// are. Populated by `Engine::open_plugin_view_float`, removed by
+    /// `Engine::close_plugin_view_float` and by `Engine::close_plugin_view`
+    /// when its `name` argument matches.
+    pub(crate) plugin_views_float: HashMap<String, crate::core::plugin_ui::PluginViewFloatSpec>,
     /// Per-panel section expanded state.
     pub ext_panel_sections_expanded: HashMap<String, Vec<bool>>,
     /// Per-panel tree item expand state: (panel_name, item_id) → expanded.
@@ -6053,6 +6064,7 @@ impl Engine {
             plugin_view_modal_table_col: 0,
             plugin_view_modal_row_focus: 0,
             plugin_view_modal_prev_focus: None,
+            plugin_views_float: HashMap::new(),
             ext_panel_sections_expanded: HashMap::new(),
             ext_panel_tree_expanded: HashMap::new(),
             ext_panel_input_text: HashMap::new(),
