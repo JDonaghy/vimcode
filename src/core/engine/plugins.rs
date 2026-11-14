@@ -174,6 +174,18 @@ pub(crate) enum PluginViewHost {
     /// Unlike the dock it *does* take keyboard focus — a modal owns every
     /// key until it is dismissed.
     Modal,
+    /// A floating overlay anchored to the cursor, a screen cell, or a
+    /// window edge (`Engine::open_plugin_view_float`). Unlike every other
+    /// host, any number of named floats can be open at once — see
+    /// `Engine::plugin_views_float`'s doc — so this variant carries no
+    /// per-host selection/scroll/focus state of its own yet: nothing in
+    /// this crate dispatches a key or click with this host today (the
+    /// `focusable` flag on `crate::core::plugin_ui::PluginViewFloatSpec` is
+    /// stored for a later rung to read), so every exhaustive match over
+    /// `PluginViewHost` below treats it the same way the dock treats a key
+    /// it can never actually receive: present only to keep the match
+    /// exhaustive.
+    Float,
 }
 
 /// Who owned the keyboard the moment the plugin-view modal took it
@@ -696,6 +708,59 @@ impl Engine {
         Some(name)
     }
 
+    /// Open (or re-declare) `name` (a `vimcode.ui.register_view` view) as a
+    /// floating overlay, the way `vimcode.ui.open_view(name, {location =
+    /// "float", anchor = {...}, ...})` is wired.
+    ///
+    /// Unlike every other host, calling this again for a `name` that is
+    /// already an open float does not re-focus anything — a float never
+    /// takes the keyboard by itself (`spec.focusable` is stored for a later
+    /// rung to read, nothing in this crate consults it yet) — it just
+    /// overwrites the stored [`crate::core::plugin_ui::PluginViewFloatSpec`],
+    /// so re-opening with a new `anchor` moves it. Any number of distinctly
+    /// named floats may be open at once; see [`Engine::plugin_views_float`]'s
+    /// doc for why this is a map rather than a single reusable slot.
+    ///
+    /// Resolving `spec.anchor` into an on-screen rect and actually painting
+    /// the view's content is later wiring this method does not do — it only
+    /// records that `name` is now a declared float and (deferred-)refreshes
+    /// its content, the same as every other `open_plugin_view_*`.
+    pub fn open_plugin_view_float(
+        &mut self,
+        name: &str,
+        spec: crate::core::plugin_ui::PluginViewFloatSpec,
+    ) -> bool {
+        if !self.is_plugin_view(name) {
+            return false;
+        }
+        self.plugin_views_float.insert(name.to_string(), spec);
+        // See `open_plugin_view_tab`'s doc for why the refresh must be
+        // deferred when called from inside an already-running plugin
+        // callback.
+        if self.plugin_dispatch_depth == 0 {
+            self.refresh_plugin_view(name);
+        } else {
+            self.plugin_view_tab_pending_refresh.push(name.to_string());
+        }
+        true
+    }
+
+    /// Close the float named `name`, the way `vimcode.ui.close_view(name)`
+    /// is wired for a `location = "float"` view. Returns whether a float by
+    /// that name was open.
+    pub(crate) fn close_plugin_view_float(&mut self, name: &str) -> bool {
+        if self.plugin_views_float.remove(name).is_none() {
+            return false;
+        }
+        // Mirrors `close_plugin_view_modal`'s own blur call — a no-op today
+        // since nothing primes `plugin_view_text_edit` for a float-hosted
+        // field yet (`PluginViewHost::Float`'s doc), but kept so a closed
+        // float can never leave behind a stale text-edit buffer tagged with
+        // its own view name once that wiring exists.
+        self.blur_plugin_view_text_edit(name, PluginViewHost::Float);
+        true
+    }
+
     /// Snapshot the keyboard-focus owners [`Self::open_plugin_view_modal`]
     /// is about to clear.
     fn capture_focus_owner(&self) -> PluginViewModalFocus {
@@ -805,6 +870,9 @@ impl Engine {
             self.close_plugin_view_modal();
             closed = true;
         }
+        if self.close_plugin_view_float(name) {
+            closed = true;
+        }
         if let BottomPanelKind::Plugin(dock_name) = &self.bottom_panel_kind {
             if self.bottom_panel_open && dock_name == name {
                 self.bottom_panel_open = false;
@@ -864,45 +932,50 @@ impl Engine {
         crate::render::scroll_plugin_view_text(self, &name, PluginViewHost::Dock, step);
     }
 
-    /// Read the selection index for `host`.
+    /// Read the selection index for `host`. Always `0` for `Float` — see
+    /// `PluginViewHost::Float`'s doc.
     pub(crate) fn plugin_view_selected(&self, host: PluginViewHost) -> usize {
         match host {
             PluginViewHost::Sidebar => self.ext_panel_selected,
             PluginViewHost::Tab => self.plugin_view_tab_selected,
             PluginViewHost::Dock => self.plugin_view_dock_selected,
             PluginViewHost::Modal => self.plugin_view_modal_selected,
+            PluginViewHost::Float => 0,
         }
     }
 
-    /// Write the selection index for `host`.
+    /// Write the selection index for `host`. A no-op for `Float`.
     pub(crate) fn set_plugin_view_selected(&mut self, host: PluginViewHost, idx: usize) {
         match host {
             PluginViewHost::Sidebar => self.ext_panel_selected = idx,
             PluginViewHost::Tab => self.plugin_view_tab_selected = idx,
             PluginViewHost::Dock => self.plugin_view_dock_selected = idx,
             PluginViewHost::Modal => self.plugin_view_modal_selected = idx,
+            PluginViewHost::Float => {}
         }
     }
 
     /// Read the scroll offset for `host` (#1631 — `List`/`Table`/`TextView`
     /// body kinds reuse the same flat scroll state a field-stack view uses,
-    /// rather than a parallel field per body kind).
+    /// rather than a parallel field per body kind). Always `0` for `Float`.
     pub(crate) fn plugin_view_scroll_top(&self, host: PluginViewHost) -> usize {
         match host {
             PluginViewHost::Sidebar => self.ext_panel_scroll_top,
             PluginViewHost::Tab => self.plugin_view_tab_scroll_top,
             PluginViewHost::Dock => self.plugin_view_dock_scroll_top,
             PluginViewHost::Modal => self.plugin_view_modal_scroll_top,
+            PluginViewHost::Float => 0,
         }
     }
 
-    /// Write the scroll offset for `host`.
+    /// Write the scroll offset for `host`. A no-op for `Float`.
     pub(crate) fn set_plugin_view_scroll_top(&mut self, host: PluginViewHost, offset: usize) {
         match host {
             PluginViewHost::Sidebar => self.ext_panel_scroll_top = offset,
             PluginViewHost::Tab => self.plugin_view_tab_scroll_top = offset,
             PluginViewHost::Dock => self.plugin_view_dock_scroll_top = offset,
             PluginViewHost::Modal => self.plugin_view_modal_scroll_top = offset,
+            PluginViewHost::Float => {}
         }
     }
 
@@ -911,46 +984,52 @@ impl Engine {
     /// editable column (`render::handle_plugin_view_table_key`'s
     /// `current_col`) do that themselves, the same "read-time clamp"
     /// contract `Engine::plugin_view_selected` uses for a stale row index.
+    /// Always `0` for `Float`.
     pub(crate) fn plugin_view_table_col(&self, host: PluginViewHost) -> usize {
         match host {
             PluginViewHost::Sidebar => self.ext_panel_table_col,
             PluginViewHost::Tab => self.plugin_view_tab_table_col,
             PluginViewHost::Dock => self.plugin_view_dock_table_col,
             PluginViewHost::Modal => self.plugin_view_modal_table_col,
+            PluginViewHost::Float => 0,
         }
     }
 
-    /// Write the selected-column index for `host`'s `Table`-kind view.
+    /// Write the selected-column index for `host`'s `Table`-kind view. A
+    /// no-op for `Float`.
     pub(crate) fn set_plugin_view_table_col(&mut self, host: PluginViewHost, col: usize) {
         match host {
             PluginViewHost::Sidebar => self.ext_panel_table_col = col,
             PluginViewHost::Tab => self.plugin_view_tab_table_col = col,
             PluginViewHost::Dock => self.plugin_view_dock_table_col = col,
             PluginViewHost::Modal => self.plugin_view_modal_table_col = col,
+            PluginViewHost::Float => {}
         }
     }
 
     /// Read the sub-focus index within `host`'s currently-focused `Buttons`/
     /// `Toggles` row — see `Engine::ext_panel_row_focus`'s doc. Meaningless
     /// when the focused field isn't one of those two kinds; callers that
-    /// care always check the field kind first.
+    /// care always check the field kind first. Always `0` for `Float`.
     pub(crate) fn plugin_view_row_focus(&self, host: PluginViewHost) -> usize {
         match host {
             PluginViewHost::Sidebar => self.ext_panel_row_focus,
             PluginViewHost::Tab => self.plugin_view_tab_row_focus,
             PluginViewHost::Dock => self.plugin_view_dock_row_focus,
             PluginViewHost::Modal => self.plugin_view_modal_row_focus,
+            PluginViewHost::Float => 0,
         }
     }
 
     /// Write the sub-focus index within `host`'s currently-focused `Buttons`/
-    /// `Toggles` row.
+    /// `Toggles` row. A no-op for `Float`.
     pub(crate) fn set_plugin_view_row_focus(&mut self, host: PluginViewHost, idx: usize) {
         match host {
             PluginViewHost::Sidebar => self.ext_panel_row_focus = idx,
             PluginViewHost::Tab => self.plugin_view_tab_row_focus = idx,
             PluginViewHost::Dock => self.plugin_view_dock_row_focus = idx,
             PluginViewHost::Modal => self.plugin_view_modal_row_focus = idx,
+            PluginViewHost::Float => {}
         }
     }
 
@@ -994,6 +1073,7 @@ impl Engine {
                     self.plugin_view_modal_scroll_top = sel.saturating_sub(ROWS - 1);
                 }
             }
+            PluginViewHost::Float => {}
         }
     }
 
@@ -1302,10 +1382,11 @@ impl Engine {
                         let rect = self.plugin_view_modal_form_rect.get();
                         crate::render::handle_plugin_view_modal_ui_event(self, name, &event, rect)
                     }
-                    // The dock never holds keyboard focus, so a
-                    // Date-field key never actually reaches this arm in
-                    // practice; it exists only to keep the match exhaustive.
-                    PluginViewHost::Dock => false,
+                    // Neither the dock nor a float holds keyboard focus
+                    // (see `PluginViewHost::Float`'s doc), so a Date-field
+                    // key never actually reaches this arm in practice; it
+                    // exists only to keep the match exhaustive.
+                    PluginViewHost::Dock | PluginViewHost::Float => false,
                 };
             }
         }
@@ -1341,10 +1422,11 @@ impl Engine {
                         let rect = self.plugin_view_modal_form_rect.get();
                         crate::render::handle_plugin_view_modal_ui_event(self, name, &event, rect)
                     }
-                    // The dock never holds keyboard focus (see the `Date`
-                    // arm's identical comment above), so a `combo_box` key
-                    // never actually reaches this arm in practice.
-                    PluginViewHost::Dock => false,
+                    // Neither the dock nor a float holds keyboard focus
+                    // (see the `Date` arm's identical comment above), so a
+                    // `combo_box` key never actually reaches this arm in
+                    // practice.
+                    PluginViewHost::Dock | PluginViewHost::Float => false,
                 };
             }
         }
@@ -1380,10 +1462,11 @@ impl Engine {
                         let rect = self.plugin_view_modal_form_rect.get();
                         crate::render::handle_plugin_view_modal_ui_event(self, name, &event, rect)
                     }
-                    // The dock never holds keyboard focus (see the `Date`
-                    // arm's identical comment above), so a `number_input`
-                    // key never actually reaches this arm in practice.
-                    PluginViewHost::Dock => false,
+                    // Neither the dock nor a float holds keyboard focus
+                    // (see the `Date` arm's identical comment above), so a
+                    // `number_input` key never actually reaches this arm in
+                    // practice.
+                    PluginViewHost::Dock | PluginViewHost::Float => false,
                 };
             }
         }
@@ -1427,10 +1510,11 @@ impl Engine {
                         let rect = self.plugin_view_modal_form_rect.get();
                         crate::render::handle_plugin_view_modal_ui_event(self, name, &event, rect)
                     }
-                    // The dock never holds keyboard focus (see the `Date`
-                    // arm's identical comment above), so a `radio_group`
-                    // key never actually reaches this arm in practice.
-                    PluginViewHost::Dock => false,
+                    // Neither the dock nor a float holds keyboard focus
+                    // (see the `Date` arm's identical comment above), so a
+                    // `radio_group` key never actually reaches this arm in
+                    // practice.
+                    PluginViewHost::Dock | PluginViewHost::Float => false,
                 };
             }
         }
@@ -1506,6 +1590,7 @@ impl Engine {
                     PluginViewHost::Tab => self.plugin_view_tab_scroll_top = 0,
                     PluginViewHost::Dock => self.plugin_view_dock_scroll_top = 0,
                     PluginViewHost::Modal => self.plugin_view_modal_scroll_top = 0,
+                    PluginViewHost::Float => {}
                 }
                 true
             }
@@ -5026,5 +5111,102 @@ mod settings_snapshot_tests {
             Some("claude-code-acp"),
             "settings_snapshot() must surface acp_agent_command: {snapshot:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod plugin_view_float_tests {
+    use super::*;
+    use crate::core::plugin_ui::{PluginView, PluginViewFloatAnchor, PluginViewFloatSpec};
+
+    fn engine_with_registered_view(name: &str) -> Engine {
+        let mut engine = Engine::new_for_test();
+        engine
+            .plugin_views
+            .insert(name.to_string(), PluginView::default());
+        engine
+    }
+
+    #[test]
+    fn open_rejects_a_name_that_is_not_a_registered_view() {
+        let mut engine = Engine::new_for_test();
+        let spec = PluginViewFloatSpec::new(PluginViewFloatAnchor::Cursor { dx: 0, dy: 1 });
+        assert!(!engine.open_plugin_view_float("nope", spec));
+        assert!(engine.plugin_views_float.is_empty());
+    }
+
+    #[test]
+    fn open_stores_the_spec_under_the_view_name() {
+        let mut engine = engine_with_registered_view("popup");
+        let spec = PluginViewFloatSpec::new(PluginViewFloatAnchor::Cell { row: 3, col: 7 });
+        assert!(engine.open_plugin_view_float("popup", spec));
+        assert_eq!(engine.plugin_views_float.get("popup"), Some(&spec));
+    }
+
+    #[test]
+    fn opening_the_same_name_again_overwrites_the_stored_spec() {
+        let mut engine = engine_with_registered_view("popup");
+        engine.open_plugin_view_float(
+            "popup",
+            PluginViewFloatSpec::new(PluginViewFloatAnchor::Cell { row: 0, col: 0 }),
+        );
+        let moved = PluginViewFloatSpec::new(PluginViewFloatAnchor::Cell { row: 9, col: 9 });
+        engine.open_plugin_view_float("popup", moved);
+        assert_eq!(engine.plugin_views_float.get("popup"), Some(&moved));
+        assert_eq!(engine.plugin_views_float.len(), 1);
+    }
+
+    #[test]
+    fn distinctly_named_floats_can_be_open_at_the_same_time() {
+        let mut engine = Engine::new_for_test();
+        engine
+            .plugin_views
+            .insert("completion".to_string(), PluginView::default());
+        engine
+            .plugin_views
+            .insert("signature-help".to_string(), PluginView::default());
+        engine.open_plugin_view_float(
+            "completion",
+            PluginViewFloatSpec::new(PluginViewFloatAnchor::Cursor { dx: 0, dy: 1 }),
+        );
+        engine.open_plugin_view_float(
+            "signature-help",
+            PluginViewFloatSpec::new(PluginViewFloatAnchor::Cursor { dx: 0, dy: -1 }),
+        );
+        assert_eq!(engine.plugin_views_float.len(), 2);
+        assert!(engine.plugin_views_float.contains_key("completion"));
+        assert!(engine.plugin_views_float.contains_key("signature-help"));
+    }
+
+    #[test]
+    fn close_removes_only_the_named_float() {
+        let mut engine = Engine::new_for_test();
+        engine
+            .plugin_views
+            .insert("a".to_string(), PluginView::default());
+        engine
+            .plugin_views
+            .insert("b".to_string(), PluginView::default());
+        let spec = PluginViewFloatSpec::new(PluginViewFloatAnchor::Cell { row: 0, col: 0 });
+        engine.open_plugin_view_float("a", spec);
+        engine.open_plugin_view_float("b", spec);
+        assert!(engine.close_plugin_view_float("a"));
+        assert!(!engine.plugin_views_float.contains_key("a"));
+        assert!(engine.plugin_views_float.contains_key("b"));
+    }
+
+    #[test]
+    fn close_on_a_name_with_no_open_float_returns_false() {
+        let mut engine = Engine::new_for_test();
+        assert!(!engine.close_plugin_view_float("nothing-open"));
+    }
+
+    #[test]
+    fn generic_close_plugin_view_also_closes_a_float_by_name() {
+        let mut engine = engine_with_registered_view("popup");
+        let spec = PluginViewFloatSpec::new(PluginViewFloatAnchor::Cursor { dx: 0, dy: 1 });
+        engine.open_plugin_view_float("popup", spec);
+        assert_eq!(engine.close_plugin_view("popup"), Some(true));
+        assert!(engine.plugin_views_float.is_empty());
     }
 }
