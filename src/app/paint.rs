@@ -460,6 +460,13 @@ impl App {
                                 .plugin_view_tab_form_controller
                                 .borrow_mut()
                                 .render_and_cache(backend, rect);
+                            render::paint_plugin_view_combo_box_dropdown(
+                                &engine,
+                                view_name,
+                                &engine.plugin_view_tab_form_controller.borrow(),
+                                rect,
+                                backend,
+                            );
                         }
                     }
                 }
@@ -977,6 +984,13 @@ impl App {
                                     .plugin_view_form_controller
                                     .borrow_mut()
                                     .render_and_cache(backend, body_rect);
+                                render::paint_plugin_view_combo_box_dropdown(
+                                    engine,
+                                    &name,
+                                    &engine.plugin_view_form_controller.borrow(),
+                                    body_rect,
+                                    backend,
+                                );
                             }
                         }
                     }
