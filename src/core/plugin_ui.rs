@@ -1090,19 +1090,22 @@ pub enum ViewFieldKind {
     /// `FormController` carries no shadow cache for this field kind the way
     /// it does for [`Self::Date`]'s `DatePicker`.
     ///
-    /// **The filtered dropdown itself is not painted.** quadraui 0.9's
-    /// `Form` paints only the compact text row plus a chevron; the open
-    /// overlay is an app-painted popup this crate doesn't paint yet (see
-    /// `EXTENSIONS.md`'s combo-box section). So the live text is visible as
-    /// it's typed, but which options match and which one `Up`/`Down`
-    /// highlights have no visible feedback today. `placeholder` is accepted
-    /// but has no `quadraui::ComboBox` field to land in — reserved, ignored.
+    /// quadraui's own `Form` paints only the compact text row plus a
+    /// chevron; the open filtered-option overlay is an app-painted popup,
+    /// `render::paint_plugin_view_combo_box_dropdown` — anchored to the
+    /// field's own on-screen rect via `FormController::field_rect`, built
+    /// from vimcode's shadow `text`/`open`/`highlighted` state through
+    /// `quadraui::ComboBox::layout`/`Backend::draw_combo_box`, the same
+    /// primitive every backend already shares. A click on a filtered
+    /// option in that popup commits it
+    /// (`render::route_plugin_view_combo_box_dropdown_click`), the same as
+    /// `Enter`; a click elsewhere closes the dropdown with no event, like
+    /// `Escape`. `placeholder` is accepted but has no `quadraui::ComboBox`
+    /// field to land in — reserved, ignored.
     ///
     /// Per-keystroke filter text reaches the plugin as
     /// [`ViewEventKind::TextChanged`] — the same shape every other
-    /// text-backed field already uses. The confirmed value (`Enter` only —
-    /// see [`ViewEventKind::ComboBoxChanged`]'s doc for why a dropdown-item
-    /// click doesn't commit yet) reaches it as
+    /// text-backed field already uses. The confirmed value reaches it as
     /// [`ViewEventKind::ComboBoxChanged`], a dedicated variant rather than
     /// reusing [`ViewEventKind::DropdownChanged`] (that one carries an
     /// option *index*; a combo box's committed value may be free text with
@@ -1435,19 +1438,15 @@ pub enum ViewEventKind {
     DropdownChanged {
         selected: usize,
     },
-    /// A `combo_box` field confirmed a value via `Enter`. Carries the
+    /// A `combo_box` field confirmed a value — via `Enter`, or a click on
+    /// an open dropdown's filtered option
+    /// (`render::route_plugin_view_combo_box_dropdown_click`). Carries the
     /// committed free-text value, which need not be one of the field's
     /// declared `options` verbatim. See [`ViewFieldKind::ComboBox`]'s doc
     /// for why this isn't [`Self::DropdownChanged`] (index, not text) or
     /// [`Self::TextCommitted`] (also fires on `TextArea` blur). Per-keystroke
     /// filter typing reaches the plugin as [`Self::TextChanged`] instead,
     /// reusing that shape rather than adding a second one.
-    ///
-    /// A dropdown-item *click* does not reach this yet: `quadraui::
-    /// ComboBox::click`/`ComboBoxLayout::hit_test` have no caller anywhere
-    /// in this crate, and `FormController` does not route pointer hits into
-    /// them for `FieldKind::ComboBox`. `Enter` is the only commit path
-    /// until that wiring lands.
     ComboBoxChanged {
         value: String,
     },

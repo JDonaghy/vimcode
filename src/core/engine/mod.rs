@@ -4903,6 +4903,17 @@ pub struct Engine {
     /// on demand by the first key that touches a focused `combo_box` field;
     /// cleared on blur, commit (Enter) or cancel (Escape).
     pub plugin_view_combo_edit: Option<crate::core::plugin_ui::PluginViewComboBoxEditState>,
+    /// The on-screen layout (field rect, plus the open dropdown's own
+    /// bounds and per-option rects) the last frame painted
+    /// `plugin_view_combo_edit`'s field into, cached for the click router
+    /// the same way `plugin_view_modal_rect`/`plugin_view_*_form_rect`
+    /// cache their own paint-time geometry — a live `Backend` (needed to
+    /// resolve it via `FormController::field_rect`) isn't available at
+    /// click time. `None` whenever no `combo_box` field is being edited or
+    /// its dropdown is closed. Written by
+    /// `render::paint_plugin_view_combo_box_dropdown`; read by
+    /// `render::route_plugin_view_combo_box_dropdown_click`.
+    pub plugin_view_combo_dropdown_layout: std::cell::RefCell<Option<quadraui::ComboBoxLayout>>,
     /// Local interaction state for whichever plugin-view `number_input`
     /// field currently has keyboard focus — the `number_input` twin of
     /// `plugin_view_combo_edit`, same "quadraui's `FormController` keeps no
@@ -6005,6 +6016,7 @@ impl Engine {
             plugin_view_render_depth: 0,
             plugin_view_text_edit: None,
             plugin_view_combo_edit: None,
+            plugin_view_combo_dropdown_layout: std::cell::RefCell::new(None),
             plugin_view_number_edit: None,
             plugin_view_tab_selected: 0,
             plugin_view_tab_scroll_top: 0,

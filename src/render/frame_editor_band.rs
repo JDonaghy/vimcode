@@ -1052,6 +1052,13 @@ pub fn paint_bottom_panel_rung(
                             .plugin_view_dock_form_controller
                             .borrow_mut()
                             .render_and_cache(b, body);
+                        paint_plugin_view_combo_box_dropdown(
+                            engine,
+                            name.as_str(),
+                            &engine.plugin_view_dock_form_controller.borrow(),
+                            body,
+                            b,
+                        );
                     }
                 }
                 Some(view_body) => match view_body.kind_name() {

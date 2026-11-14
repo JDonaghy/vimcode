@@ -300,8 +300,8 @@ pub fn plugin_view_to_form_with_row_focus(
                 // `placeholder` has no `quadraui::ComboBox` field to land in
                 // (unlike `TextInput`/`TextArea`'s own `placeholder`) — kept
                 // on the Lua-facing vocabulary for parity with every other
-                // text-backed field kind, but it paints nothing yet; see
-                // `ViewFieldKind::ComboBox`'s own doc. `committed` seeds from
+                // text-backed field kind, but reserved rather than painted;
+                // see `ViewFieldKind::ComboBox`'s own doc. `committed` seeds from
                 // the plugin's declared `value` every render; `text`/`open`/
                 // `highlighted` come from `combo_edit` whenever it names this
                 // field (an edit in progress), falling back to the declared
@@ -709,6 +709,183 @@ pub fn populate_plugin_view_modal_form_controller(engine: &Engine, name: &str) -
     true
 }
 
+/// Paint the open `combo_box` field's filtered dropdown as an overlay on
+/// top of whichever host just painted its compact row via
+/// `FormController::render_and_cache` — the visible half EXTENSIONS.md's
+/// `combo_box` section used to flag as missing. A no-op unless
+/// `Engine::plugin_view_combo_edit` names a field in `view_name` with
+/// `open == true` and at least one filtered option, matching
+/// `quadraui::ComboBox::layout`'s own "no filtered matches, no dropdown"
+/// contract — in every other case the compact row `Form`'s own paint path
+/// (quadraui's `draw_field_combo_box`) already drew is left untouched.
+///
+/// Anchors via `FormController::field_rect`, so the popup always lines up
+/// with whatever rect the field's compact row actually painted into. `fc`
+/// must be the *same*, already-populated `FormController` `rect`'s
+/// `render_and_cache` call just rendered through — same contract
+/// `field_rect`'s own doc states.
+///
+/// Caches the resolved `quadraui::ComboBoxLayout` onto
+/// `Engine::plugin_view_combo_dropdown_layout` so the click router
+/// (`route_plugin_view_combo_box_dropdown_click`) can hit-test it without a
+/// `Backend` of its own — the same paint-caches/click-reads split
+/// `plugin_view_modal_rect` and the `plugin_view_*_form_rect` cells here
+/// already follow.
+pub(crate) fn paint_plugin_view_combo_box_dropdown(
+    engine: &Engine,
+    view_name: &str,
+    fc: &quadraui::FormController,
+    rect: quadraui::Rect,
+    backend: &mut dyn quadraui::Backend,
+) {
+    use crate::core::plugin_ui::{namespaced_widget_id, ViewFieldKind};
+
+    let clear_and_return = || {
+        engine.plugin_view_combo_dropdown_layout.replace(None);
+    };
+
+    let Some(edit) = engine
+        .plugin_view_combo_edit
+        .as_ref()
+        .filter(|e| e.view == view_name && e.open)
+    else {
+        clear_and_return();
+        return;
+    };
+    let Some(view) = engine.plugin_views.get(view_name) else {
+        clear_and_return();
+        return;
+    };
+    let Some(field) = view.fields.iter().find(|f| f.id == edit.field_id) else {
+        clear_and_return();
+        return;
+    };
+    let ViewFieldKind::ComboBox { options, .. } = &field.kind else {
+        clear_and_return();
+        return;
+    };
+
+    let wid = quadraui::WidgetId::new(namespaced_widget_id(view_name, &field.id));
+    let Some(field_bounds) = fc.field_rect(wid, backend, rect) else {
+        clear_and_return();
+        return;
+    };
+
+    let mut combo = quadraui::ComboBox::new(wid, options.clone());
+    combo.text = edit.text.clone();
+    combo.open = true;
+    combo.highlighted = edit.highlighted;
+    combo.focused = true;
+
+    let filtered_count = combo.filtered_indices().len();
+    if filtered_count == 0 {
+        clear_and_return();
+        return;
+    }
+
+    let lh = backend.line_height();
+    // Enough room for every filtered option plus half a row of breathing
+    // space, clamped to the host's own rect — `ComboBox::layout` clamps
+    // the popup height to `max_popup_height` itself, same as
+    // `paint_editor_popups`'s completion-menu sizing.
+    let max_popup_height = (lh * (filtered_count as f32 + 0.5)).min(rect.height.max(lh));
+    let layout = combo.layout(
+        field_bounds,
+        rect,
+        field_bounds.width,
+        max_popup_height,
+        |_| quadraui::CompletionItemMeasure::new(lh),
+    );
+    backend.draw_combo_box(&combo, &layout);
+    engine
+        .plugin_view_combo_dropdown_layout
+        .replace(Some(layout));
+}
+
+/// Route a left-button press at `position` against the open `combo_box`
+/// dropdown [`paint_plugin_view_combo_box_dropdown`] cached onto
+/// `Engine::plugin_view_combo_dropdown_layout`. Returns `true` when the
+/// press was consumed: either a filtered option was hit, which commits it
+/// exactly as `Enter` does (dispatching the same
+/// [`crate::core::plugin_ui::ViewEventKind::ComboBoxChanged`] event), or
+/// the press missed the dropdown and the field's own row alike, which
+/// closes it with no event — the pointer twin of `Escape`
+/// (`quadraui::FormEvent::ComboBoxCancelled`'s own
+/// `apply_combo_box_form_action` arm). Returns `false` when nothing is
+/// cached (no dropdown is open), so the caller falls through to its own
+/// ordinary `FormController` click routing — including a press on the
+/// field's own row, which this function deliberately leaves unconsumed so
+/// that routing still runs (matching `quadraui::ComboBox::click`'s own
+/// "a hit on the field itself produces no event, focusing it is the
+/// host's job" contract).
+///
+/// Must run *before* that ordinary routing in every
+/// `handle_plugin_view_*_ui_event`/`handle_plugin_view_modal_ui_event`: an
+/// open dropdown is painted on top of the rest of the form, so a press
+/// anywhere inside it belongs to the dropdown even where it overlaps
+/// another field's row underneath.
+pub(crate) fn route_plugin_view_combo_box_dropdown_click(
+    engine: &mut Engine,
+    position: quadraui::Point,
+) -> bool {
+    use crate::core::plugin_ui::{PluginViewEvent, ViewEventKind};
+
+    if !engine
+        .plugin_view_combo_edit
+        .as_ref()
+        .is_some_and(|e| e.open)
+    {
+        return false;
+    }
+    let Some(layout) = engine.plugin_view_combo_dropdown_layout.borrow().clone() else {
+        return false;
+    };
+    match layout.hit_test(position) {
+        quadraui::ComboBoxHit::DropdownItem(idx) => {
+            let edit = engine
+                .plugin_view_combo_edit
+                .clone()
+                .expect("checked open above");
+            let Some(view) = engine.plugin_views.get(&edit.view) else {
+                return false;
+            };
+            let Some(field) = view.fields.iter().find(|f| f.id == edit.field_id) else {
+                return false;
+            };
+            let crate::core::plugin_ui::ViewFieldKind::ComboBox { options, .. } = &field.kind
+            else {
+                return false;
+            };
+            // Resolve the filtered-list `idx` back to a committed value
+            // through the real primitive's own `click` rather than
+            // re-deriving `filtered_indices` by hand here — the same
+            // "call into the primitive" contract
+            // `paint_plugin_view_combo_box_dropdown` follows for `layout`.
+            let mut combo = quadraui::ComboBox::new(quadraui::WidgetId::new(""), options.clone());
+            combo.text = edit.text.clone();
+            let Some(quadraui::ComboBoxEvent::Committed { value, .. }) =
+                combo.click(quadraui::ComboBoxHit::DropdownItem(idx))
+            else {
+                return false;
+            };
+            engine.plugin_view_combo_edit = None;
+            engine.plugin_view_combo_dropdown_layout.replace(None);
+            engine.dispatch_plugin_view_event(PluginViewEvent {
+                view: edit.view,
+                widget_id: edit.field_id,
+                kind: ViewEventKind::ComboBoxChanged { value },
+            });
+            true
+        }
+        quadraui::ComboBoxHit::Field => false,
+        quadraui::ComboBoxHit::Outside => {
+            engine.plugin_view_combo_edit = None;
+            engine.plugin_view_combo_dropdown_layout.replace(None);
+            true
+        }
+    }
+}
+
 /// Route a pointer event over a plugin view through the shared
 /// `quadraui::FormController` and dispatch whatever widget event it resolves to
 /// the plugin's `on_event` callback.
@@ -741,6 +918,20 @@ pub fn handle_plugin_view_ui_event(
         },
         other => other.clone(),
     };
+    // An open `combo_box` dropdown paints on top of the rest of the
+    // form, so a press anywhere inside it must be resolved before
+    // `FormController`'s own row-based routing runs — see
+    // `route_plugin_view_combo_box_dropdown_click`'s own doc.
+    if let quadraui::UiEvent::MouseDown {
+        button: quadraui::MouseButton::Left,
+        position,
+        ..
+    } = probe
+    {
+        if route_plugin_view_combo_box_dropdown_click(engine, position) {
+            return true;
+        }
+    }
     let result = engine
         .plugin_view_form_controller
         .borrow_mut()
@@ -827,6 +1018,18 @@ pub fn handle_plugin_view_tab_ui_event(
         },
         other => other.clone(),
     };
+    // See `handle_plugin_view_ui_event`'s own comment at the equivalent
+    // point for why this must run first.
+    if let quadraui::UiEvent::MouseDown {
+        button: quadraui::MouseButton::Left,
+        position,
+        ..
+    } = probe
+    {
+        if route_plugin_view_combo_box_dropdown_click(engine, position) {
+            return true;
+        }
+    }
     let result = engine
         .plugin_view_tab_form_controller
         .borrow_mut()
@@ -912,6 +1115,18 @@ pub fn handle_plugin_view_dock_ui_event(
         },
         other => other.clone(),
     };
+    // See `handle_plugin_view_ui_event`'s own comment at the equivalent
+    // point for why this must run first.
+    if let quadraui::UiEvent::MouseDown {
+        button: quadraui::MouseButton::Left,
+        position,
+        ..
+    } = probe
+    {
+        if route_plugin_view_combo_box_dropdown_click(engine, position) {
+            return true;
+        }
+    }
     let result = engine
         .plugin_view_dock_form_controller
         .borrow_mut()
@@ -1025,6 +1240,13 @@ pub fn paint_plugin_view_modal(
                         .plugin_view_modal_form_controller
                         .borrow_mut()
                         .render_and_cache(backend, body);
+                    paint_plugin_view_combo_box_dropdown(
+                        engine,
+                        name,
+                        &engine.plugin_view_modal_form_controller.borrow(),
+                        body,
+                        backend,
+                    );
                 }
             }
             Some("text_view") => {
@@ -1124,6 +1346,18 @@ pub fn handle_plugin_view_modal_ui_event(
         },
         other => other.clone(),
     };
+    // See `handle_plugin_view_ui_event`'s own comment at the equivalent
+    // point for why this must run first.
+    if let quadraui::UiEvent::MouseDown {
+        button: quadraui::MouseButton::Left,
+        position,
+        ..
+    } = probe
+    {
+        if route_plugin_view_combo_box_dropdown_click(engine, position) {
+            return true;
+        }
+    }
     let result = engine
         .plugin_view_modal_form_controller
         .borrow_mut()

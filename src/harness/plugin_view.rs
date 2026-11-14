@@ -2190,6 +2190,112 @@ pub fn combo_box_filter_and_commit_reaches_the_plugin_handler(driver: &mut impl 
     );
 }
 
+/// Scenario 4d2 — the open `combo_box` dropdown is a real painted overlay,
+/// not merely internal state: typing a filter that narrows the option list
+/// down to one option paints that option's *full* text — the compact row
+/// itself only ever shows the typed filter, never a full option — and
+/// clicking that painted option commits it exactly as `Enter` does,
+/// reaching the plugin's `on_event` handler as `ComboBoxChanged`.
+///
+/// RED-verified: before `render::paint_plugin_view_combo_box_dropdown`
+/// existed, the compact row never painted [`ROW_COMBO_OPTION_A`] at all —
+/// only the typed filter text [`ROW_COMBO_FILTER`] — so the dropdown
+/// visibility assertion below already fails on unfixed `develop`, before
+/// the click-commit assertions that follow it even run.
+pub fn combo_box_dropdown_is_painted_and_click_commits_the_option(
+    driver: &mut impl ConformanceDriver,
+) {
+    assert!(
+        driver.screen_has(COUNT_0),
+        "precondition: the counter row must start at {COUNT_0:?}; painted runs \
+         were {:?}",
+        painted(driver)
+    );
+    for _ in 0..8 {
+        driver.press_named(quadraui::NamedKey::Tab);
+    }
+    driver.type_text(ROW_COMBO_FILTER);
+    assert!(
+        driver.screen_has(ROW_COMBO_OPTION_A),
+        "typing {ROW_COMBO_FILTER:?} (a prefix only of {ROW_COMBO_OPTION_A:?}) \
+         must open a dropdown overlay painting the one filtered option's \
+         full text, anchored under the field's own row; painted runs were \
+         {:?}",
+        painted(driver)
+    );
+    assert!(
+        !driver.screen_has(ROW_COMBO_OPTION_B),
+        "the filtered-out option {ROW_COMBO_OPTION_B:?} must not appear in \
+         the painted dropdown; painted runs were {:?}",
+        painted(driver)
+    );
+
+    driver.click_text(ROW_COMBO_OPTION_A);
+    assert!(
+        driver.screen_has(ROW_COMBO_COMMITTED),
+        "clicking the dropdown's filtered option must commit it — exactly \
+         as Enter does — and repaint the row with it \
+         ({ROW_COMBO_COMMITTED:?}); painted runs were {:?}",
+        painted(driver)
+    );
+    assert!(
+        driver.screen_has(COUNT_1),
+        "clicking a dropdown option must reach the plugin's on_event \
+         handler as ComboBoxChanged, same as Enter ({COUNT_1:?}); painted \
+         runs were {:?}",
+        painted(driver)
+    );
+}
+
+/// Scenario 4d3 — a click outside the open `combo_box` dropdown closes it
+/// with no event, the pointer twin of `Escape`'s own "revert with no
+/// event" contract.
+///
+/// RED-verified: before the dropdown was painted at all (see
+/// [`combo_box_dropdown_is_painted_and_click_commits_the_option`]'s own
+/// doc), there was nothing for an outside click to close — the dropdown
+/// visibility assertion below already fails on unfixed `develop`.
+pub fn combo_box_dropdown_outside_click_closes_it_with_no_event(
+    driver: &mut impl ConformanceDriver,
+) {
+    assert!(
+        driver.screen_has(COUNT_0),
+        "precondition: the counter row must start at {COUNT_0:?}; painted runs \
+         were {:?}",
+        painted(driver)
+    );
+    for _ in 0..8 {
+        driver.press_named(quadraui::NamedKey::Tab);
+    }
+    driver.type_text(ROW_COMBO_FILTER);
+    assert!(
+        driver.screen_has(ROW_COMBO_OPTION_A),
+        "typing {ROW_COMBO_FILTER:?} must open a dropdown painting the \
+         filtered option {ROW_COMBO_OPTION_A:?}; painted runs were {:?}",
+        painted(driver)
+    );
+
+    // A different field's own row, well above the combo box's and the
+    // dropdown painted under it — inside the panel's form (so the click
+    // reaches `FormController`-based routing at all, unlike a click on the
+    // global status bar outside the panel entirely) but outside both the
+    // field and the dropdown, so `ComboBoxLayout::hit_test` resolves it to
+    // `Outside`.
+    driver.click_text(ROW_COLOR_LABEL);
+    assert!(
+        !driver.screen_has(ROW_COMBO_OPTION_A),
+        "a click outside the open dropdown must close it, the same as \
+         Escape; painted runs were {:?}",
+        painted(driver)
+    );
+    assert!(
+        driver.screen_has(COUNT_0),
+        "a click outside the dropdown must fire no event — the counter \
+         must still read {COUNT_0:?}; painted runs were {:?}",
+        painted(driver)
+    );
+}
+
 /// Scenario 4e — a focused `number_input` field: `Up` steps its committed
 /// value by `step` (clamped to `[min, max]`) immediately, reaching the
 /// plugin's `on_event` handler as `NumberChanged` — unlike the `slider`
@@ -4728,6 +4834,18 @@ mod tests {
     }
 
     #[test]
+    fn plugin_view_combo_box_dropdown_is_painted_and_click_commits_on_tui() {
+        let (mut h, _dir) = tui();
+        combo_box_dropdown_is_painted_and_click_commits_the_option(&mut h.driver);
+    }
+
+    #[test]
+    fn plugin_view_combo_box_dropdown_outside_click_closes_it_on_tui() {
+        let (mut h, _dir) = tui();
+        combo_box_dropdown_outside_click_closes_it_with_no_event(&mut h.driver);
+    }
+
+    #[test]
     fn plugin_view_number_input_step_and_commit_reaches_the_handler_on_tui() {
         let (mut h, _dir) = tui();
         number_input_step_and_commit_reaches_the_plugin_handler(&mut h.driver);
@@ -5398,6 +5516,20 @@ mod tests {
     fn plugin_view_combo_box_filter_and_commit_reaches_the_handler_on_gtk() {
         let (mut h, _dir) = gtk();
         combo_box_filter_and_commit_reaches_the_plugin_handler(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_combo_box_dropdown_is_painted_and_click_commits_on_gtk() {
+        let (mut h, _dir) = gtk();
+        combo_box_dropdown_is_painted_and_click_commits_the_option(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_combo_box_dropdown_outside_click_closes_it_on_gtk() {
+        let (mut h, _dir) = gtk();
+        combo_box_dropdown_outside_click_closes_it_with_no_event(&mut h.driver);
     }
 
     #[cfg(feature = "gui")]

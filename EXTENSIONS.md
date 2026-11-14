@@ -1361,22 +1361,18 @@ necessarily one of `options`. While focused:
   filtered list.
 - `Enter` commits — the highlighted option if one is filtered and
   highlighted, otherwise the typed text verbatim — reaching your callback as
-  `ComboBoxChanged` (`event.value` = the committed string). A dropdown-item
-  *click* does not commit yet (no pointer wiring exists for this field).
-- `Escape` reverts the live text back to your declared `value`, with no
-  event.
+  `ComboBoxChanged` (`event.value` = the committed string).
+- Clicking a filtered option in the open dropdown commits it the same way,
+  reaching your callback as `ComboBoxChanged` with that option's text.
+- `Escape`, or clicking outside the open dropdown, closes it and reverts the
+  live text back to your declared `value`, with no event.
 
-**The filtered popup is not painted yet.** quadraui 0.9's `Form` paints only
-the compact text row (plus a chevron); the open dropdown overlay — the list
-of filtered options, and which one is highlighted — is left to the app to
-paint, which needs a per-field resolved rect quadraui doesn't expose yet
-(tracked upstream as quadraui#2202). Until that lands, the typed text itself
-is visible in the row as you type, but which options it filters to and
-`Up`/`Down`'s highlighted-option cursor have **no visible feedback** — a
-plugin can still use `combo_box` for a free-text field with fixed-list
-validation, but there is no visible dropdown and no visible highlight.
-`placeholder` is accepted but ignored (reserved for when the text-input half
-of the row paints it).
+**The filtered popup is painted.** The open dropdown — the list of filtered
+options, and which one is highlighted — is an app-painted overlay anchored to
+the field's own on-screen row, shared by every backend: typing shows which
+options match, and `Up`/`Down`'s highlighted-option cursor is visible as you
+move it. `placeholder` is accepted but ignored — quadraui's `ComboBox` row has
+no placeholder field to paint it into, so it stays reserved.
 
 vimcode owns the live filter/open/highlight state the same way it owns
 `text`/`password` edit state; your declared `value` is what paints whenever
