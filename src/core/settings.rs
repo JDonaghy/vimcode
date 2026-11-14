@@ -1730,14 +1730,13 @@ fn default_ui_font_size() -> u8 {
 
 /// VS Code's cross-platform UI-chrome convention, in the units `ui_font_size`
 /// is exposed to users in — a macOS-style "1pt == 1px" point, not whatever a
-/// given backend's native font API happens to take. [`Settings::effective_ui_font_size`]
-/// scales an *explicit* `ui_font_size` against this baseline so `13` always
-/// means "the VS Code convention" on every backend, matching what the
-/// *uncustomized* branch already gets for free by reading
-/// `Backend::default_fonts().ui_size_pt` directly. Needed because GTK/Win-GUI
-/// (quadraui#2384/#2385) advertise `ui_size_pt` as `9.75`, the native Pango/
-/// DirectWrite point that *renders* at 13px given their 96/72 DPI scaling —
-/// not `13.0` itself.
+/// given backend's native font API happens to take.
+/// [`Settings::effective_ui_font_size`] scales an *explicit* `ui_font_size`
+/// against this baseline so `13` always means "the VS Code convention" on
+/// every backend, matching what the *uncustomized* branch already gets for
+/// free by reading `Backend::default_fonts().ui_size_pt` directly: on GTK
+/// and Win-GUI that value is `9.75`, the native Pango/DirectWrite point
+/// that renders at 13px given their 96/72 DPI scaling, not `13.0` itself.
 const VS_CODE_UI_CHROME_PT: f32 = 13.0;
 
 /// `0.0` is [`Settings::effective_line_height_multiplier`]'s "auto"
