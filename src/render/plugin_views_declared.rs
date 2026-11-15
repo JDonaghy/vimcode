@@ -711,8 +711,8 @@ pub fn populate_plugin_view_modal_form_controller(engine: &Engine, name: &str) -
 
 /// Paint the open `combo_box` field's filtered dropdown as an overlay on
 /// top of whichever host just painted its compact row via
-/// `FormController::render_and_cache` — the visible half EXTENSIONS.md's
-/// `combo_box` section used to flag as missing. A no-op unless
+/// `FormController::render_and_cache` — see EXTENSIONS.md's `combo_box`
+/// section for what this is the visible half of. A no-op unless
 /// `Engine::plugin_view_combo_edit` names a field in `view_name` with
 /// `open == true` and at least one filtered option, matching
 /// `quadraui::ComboBox::layout`'s own "no filtered matches, no dropdown"
@@ -726,11 +726,17 @@ pub fn populate_plugin_view_modal_form_controller(engine: &Engine, name: &str) -
 /// `field_rect`'s own doc states.
 ///
 /// Caches the resolved `quadraui::ComboBoxLayout` onto
-/// `Engine::plugin_view_combo_dropdown_layout` so the click router
+/// `Engine::plugin_view_combo_dropdown_layout`, keyed by `(view_name,
+/// field.id)`, so the click router
 /// (`route_plugin_view_combo_box_dropdown_click`) can hit-test it without a
 /// `Backend` of its own — the same paint-caches/click-reads split
 /// `plugin_view_modal_rect` and the `plugin_view_*_form_rect` cells here
-/// already follow.
+/// already follow. Unlike those per-host cells, this one is shared across
+/// every form host, since all of them paint in the same frame and
+/// `Engine::plugin_view_combo_edit` is itself global; `clear_layout` only
+/// clears an entry this `view_name` itself owns, so a host painting some
+/// *other* (non-edited) view can't wipe the cache a different host just
+/// populated for the one actually being edited.
 pub(crate) fn paint_plugin_view_combo_box_dropdown(
     engine: &Engine,
     view_name: &str,
@@ -740,8 +746,14 @@ pub(crate) fn paint_plugin_view_combo_box_dropdown(
 ) {
     use crate::core::plugin_ui::{namespaced_widget_id, ViewFieldKind};
 
-    let clear_and_return = || {
-        engine.plugin_view_combo_dropdown_layout.replace(None);
+    let clear_layout = || {
+        let mut cache = engine.plugin_view_combo_dropdown_layout.borrow_mut();
+        if cache
+            .as_ref()
+            .is_some_and(|(cached_view, _, _)| cached_view == view_name)
+        {
+            *cache = None;
+        }
     };
 
     let Some(edit) = engine
@@ -749,25 +761,25 @@ pub(crate) fn paint_plugin_view_combo_box_dropdown(
         .as_ref()
         .filter(|e| e.view == view_name && e.open)
     else {
-        clear_and_return();
+        clear_layout();
         return;
     };
     let Some(view) = engine.plugin_views.get(view_name) else {
-        clear_and_return();
+        clear_layout();
         return;
     };
     let Some(field) = view.fields.iter().find(|f| f.id == edit.field_id) else {
-        clear_and_return();
+        clear_layout();
         return;
     };
     let ViewFieldKind::ComboBox { options, .. } = &field.kind else {
-        clear_and_return();
+        clear_layout();
         return;
     };
 
     let wid = quadraui::WidgetId::new(namespaced_widget_id(view_name, &field.id));
     let Some(field_bounds) = fc.field_rect(wid, backend, rect) else {
-        clear_and_return();
+        clear_layout();
         return;
     };
 
@@ -779,14 +791,14 @@ pub(crate) fn paint_plugin_view_combo_box_dropdown(
 
     let filtered_count = combo.filtered_indices().len();
     if filtered_count == 0 {
-        clear_and_return();
+        clear_layout();
         return;
     }
 
     let lh = backend.line_height();
-    // Enough room for every filtered option plus half a row of breathing
-    // space, clamped to the host's own rect — `ComboBox::layout` clamps
-    // the popup height to `max_popup_height` itself, same as
+    // An upper bound comfortably above every filtered option's total
+    // height, clamped to the host's own rect — `ComboBox::layout` clamps
+    // the actual popup height to the filtered item count itself, same as
     // `paint_editor_popups`'s completion-menu sizing.
     let max_popup_height = (lh * (filtered_count as f32 + 0.5)).min(rect.height.max(lh));
     let layout = combo.layout(
@@ -796,10 +808,24 @@ pub(crate) fn paint_plugin_view_combo_box_dropdown(
         max_popup_height,
         |_| quadraui::CompletionItemMeasure::new(lh),
     );
-    backend.draw_combo_box(&combo, &layout);
-    engine
-        .plugin_view_combo_dropdown_layout
-        .replace(Some(layout));
+    // `draw_combo_box` paints the field row itself before the dropdown
+    // (`tui::combo_box::draw_combo_box` /
+    // `primitives::combo_box::native_surface_paint::paint`, both gated on
+    // `field.width > 0.0 && field.height > 0.0`), but the field row was
+    // already painted by `FormController::render_and_cache` just before this
+    // call — repainting it here would overwrite that row's label with the
+    // field-only rendering. Hand the rasteriser a zero-sized `field_bounds`
+    // so it skips the field and paints only the dropdown, while caching the
+    // real `layout` (with the real `field_bounds`) for anchoring and for
+    // `route_plugin_view_combo_box_dropdown_click`'s hit-testing.
+    let mut paint_layout = layout.clone();
+    paint_layout.field_bounds = quadraui::Rect::new(field_bounds.x, field_bounds.y, 0.0, 0.0);
+    backend.draw_combo_box(&combo, &paint_layout);
+    engine.plugin_view_combo_dropdown_layout.replace(Some((
+        view_name.to_string(),
+        field.id.clone(),
+        layout,
+    )));
 }
 
 /// Route a left-button press at `position` against the open `combo_box`
@@ -830,14 +856,28 @@ pub(crate) fn route_plugin_view_combo_box_dropdown_click(
 ) -> bool {
     use crate::core::plugin_ui::{PluginViewEvent, ViewEventKind};
 
-    if !engine
+    let Some(edit_key) = engine
         .plugin_view_combo_edit
         .as_ref()
-        .is_some_and(|e| e.open)
-    {
+        .filter(|e| e.open)
+        .map(|e| (e.view.clone(), e.field_id.clone()))
+    else {
         return false;
-    }
-    let Some(layout) = engine.plugin_view_combo_dropdown_layout.borrow().clone() else {
+    };
+    // The cache is shared across every form host (see
+    // `Engine::plugin_view_combo_dropdown_layout`'s doc), so only trust an
+    // entry that was cached for the field currently being edited — a stale
+    // entry left over from a different view/field must never be
+    // hit-tested against this one.
+    let Some(layout) = engine
+        .plugin_view_combo_dropdown_layout
+        .borrow()
+        .as_ref()
+        .filter(|(cached_view, cached_field, _)| {
+            *cached_view == edit_key.0 && *cached_field == edit_key.1
+        })
+        .map(|(_, _, layout)| layout.clone())
+    else {
         return false;
     };
     match layout.hit_test(position) {

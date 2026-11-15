@@ -4905,15 +4905,25 @@ pub struct Engine {
     pub plugin_view_combo_edit: Option<crate::core::plugin_ui::PluginViewComboBoxEditState>,
     /// The on-screen layout (field rect, plus the open dropdown's own
     /// bounds and per-option rects) the last frame painted
-    /// `plugin_view_combo_edit`'s field into, cached for the click router
-    /// the same way `plugin_view_modal_rect`/`plugin_view_*_form_rect`
-    /// cache their own paint-time geometry — a live `Backend` (needed to
-    /// resolve it via `FormController::field_rect`) isn't available at
-    /// click time. `None` whenever no `combo_box` field is being edited or
-    /// its dropdown is closed. Written by
+    /// `plugin_view_combo_edit`'s field into, keyed by `(view, field_id)` and
+    /// cached for the click router the same way
+    /// `plugin_view_modal_rect`/`plugin_view_*_form_rect` cache their own
+    /// paint-time geometry — a live `Backend` (needed to resolve it via
+    /// `FormController::field_rect`) isn't available at click time.
+    ///
+    /// Unlike those per-host cells, this one is shared across all four form
+    /// hosts (tab, sidebar, dock, modal) because `plugin_view_combo_edit`
+    /// itself is global — only one field can hold keyboard focus at a time.
+    /// All hosts paint in the same frame, so the key lets a host that isn't
+    /// painting the edited view tell the cache is simply not its own,
+    /// rather than clearing it out from under whichever host *did* just
+    /// cache it: `None`, or `Some` keyed by a different `(view, field_id)`,
+    /// is left untouched. `None` whenever no `combo_box` field is being
+    /// edited or its dropdown is closed. Written by
     /// `render::paint_plugin_view_combo_box_dropdown`; read by
     /// `render::route_plugin_view_combo_box_dropdown_click`.
-    pub plugin_view_combo_dropdown_layout: std::cell::RefCell<Option<quadraui::ComboBoxLayout>>,
+    pub plugin_view_combo_dropdown_layout:
+        std::cell::RefCell<Option<(String, String, quadraui::ComboBoxLayout)>>,
     /// Local interaction state for whichever plugin-view `number_input`
     /// field currently has keyboard focus — the `number_input` twin of
     /// `plugin_view_combo_edit`, same "quadraui's `FormController` keeps no
