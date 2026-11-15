@@ -655,6 +655,7 @@ fn plugin_view_to_table(
     multi_select: bool,
     multi_selected: &[usize],
     footer: Option<&[String]>,
+    bordered: bool,
 ) -> quadraui::DataTable {
     use crate::core::plugin_ui::namespaced_widget_id;
     use quadraui::{Column, ColumnAlign, DataRow, DataTable, Decoration, StyledText, WidgetId};
@@ -726,7 +727,7 @@ fn plugin_view_to_table(
         h_scroll: 0.0,
         column_overrides: column_overrides.to_vec(),
         footer: q_footer,
-        bordered: false,
+        bordered,
     }
 }
 
@@ -746,6 +747,7 @@ pub(crate) fn paint_plugin_view_table(
         rows,
         multi_select,
         footer,
+        bordered,
     }) = plugin_view_body(engine, name)
     else {
         return false;
@@ -781,6 +783,7 @@ pub(crate) fn paint_plugin_view_table(
         *multi_select,
         &multi_selected,
         footer.as_deref(),
+        *bordered,
     );
     let layout = backend.draw_data_table(rect, &table, None);
     let cache = match host {
