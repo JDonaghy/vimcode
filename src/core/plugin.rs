@@ -1092,11 +1092,13 @@ fn lua_table_to_view_body(
                         .collect::<LuaResult<_>>()
                 })
                 .transpose()?;
+            let bordered: bool = tbl.get("bordered").unwrap_or(false);
             Ok(ViewBody::Table {
                 columns,
                 rows,
                 multi_select,
                 footer,
+                bordered,
             })
         }
         "text_view" => Ok(ViewBody::TextView {
@@ -8564,6 +8566,7 @@ mod tests {
                     return {
                         kind = "table",
                         multi_select = true,
+                        bordered = true,
                         columns = {
                             { title = "Key", align = "left" },
                             { title = "Count", align = "right" },
@@ -8585,9 +8588,11 @@ mod tests {
                 columns,
                 multi_select,
                 footer,
+                bordered,
                 ..
             } => {
                 assert!(multi_select);
+                assert!(bordered);
                 assert_eq!(columns[0].align, TableColumnAlign::Left);
                 assert_eq!(columns[1].align, TableColumnAlign::Right);
                 assert_eq!(columns[2].align, TableColumnAlign::Center);
@@ -8595,6 +8600,33 @@ mod tests {
                     footer,
                     Some(vec!["Total".to_string(), "1".to_string(), "".to_string()])
                 );
+            }
+            other => panic!("expected Table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_table_body_defaults_bordered_to_false() {
+        use crate::core::plugin_ui::ViewBody;
+        let pm = pm_with_view(
+            "table-unbordered",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return {
+                        kind = "table",
+                        columns = { { title = "Key" } },
+                        rows = { { id = "r1", cells = { "a" } } },
+                    }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let view = view.expect("render must succeed");
+        match view.body.expect("table body") {
+            ViewBody::Table { bordered, .. } => {
+                assert!(!bordered, "bordered must default to false when omitted");
             }
             other => panic!("expected Table, got {other:?}"),
         }

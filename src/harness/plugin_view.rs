@@ -368,6 +368,20 @@ pub const ALIGN_COL_RIGHT: &str = "AlR2064";
 pub const ALIGN_CELL_LEFT: &str = "AlLv2064";
 pub const ALIGN_CELL_RIGHT: &str = "AlRv2064";
 
+/// Registered view name for a dedicated table fixture declaring
+/// `bordered = true` — kept separate from [`TABLE_VIEW`] so the reserved
+/// 1-cell/pixel margin never shifts the geometry the sort/resize/header-
+/// click scenarios above were measured against.
+pub const BORDERED_TABLE_VIEW: &str = "zqxw2168bordered";
+pub const BORDERED_COL: &str = "Bc2168";
+pub const BORDERED_ROW0: &str = "Br02168";
+/// Painted once `on_event` has seen `ItemSelected{{index: 0}}` — confirms
+/// hit-testing still resolves a click to the right row through the
+/// `DataTableLayout::inset_x`/`inset_y` margin `bordered = true` reserves.
+pub const BORDERED_ROW0_SELECTED: &str = "BrSel2168";
+/// Painted before any click reaches the plugin.
+pub const BORDERED_NONE_SELECTED: &str = "BrNone2168";
+
 /// `TextView` fixture needles — first and last of 50 generated lines, far
 /// enough apart that only one is visible at a time on a narrow viewport.
 pub const TEXT_FIRST_LINE: &str = "Ln0X1631";
@@ -750,6 +764,27 @@ vimcode.ui.register_view("{ALIGN_VIEW}", {{
         {{ id = "a0", cells = {{ "{ALIGN_CELL_LEFT}", "{ALIGN_CELL_RIGHT}" }} }},
       }},
     }}
+  end,
+}})
+
+local bordered_selected_marker = "{BORDERED_NONE_SELECTED}"
+vimcode.ui.register_view("{BORDERED_TABLE_VIEW}", {{
+  title = "Zq2168B", icon = "B", fallback_icon = "B",
+  render = function()
+    return {{
+      kind = "table",
+      bordered = true,
+      columns = {{ {{ title = "{BORDERED_COL}" }} }},
+      rows = {{
+        {{ id = "b0", cells = {{ "{BORDERED_ROW0}" }} }},
+        {{ id = "b1", cells = {{ bordered_selected_marker }} }},
+      }},
+    }}
+  end,
+  on_event = function(ctx, event)
+    if event.kind == "ItemSelected" and event.index == 0 then
+      bordered_selected_marker = "{BORDERED_ROW0_SELECTED}"
+    end
   end,
 }})
 
@@ -3087,6 +3122,47 @@ pub fn table_right_key_reaches_the_second_editable_column(driver: &mut impl Conf
     );
 }
 
+/// Scenario 10j — `bordered = true` reserves a 1-cell/pixel margin on every
+/// edge (proven for TUI by [`BORDERED_TABLE_VIEW`]'s frame-glyph assertions
+/// alongside this scenario), and a click on the first body row still
+/// resolves to that row through the margin: `DataTableLayout::hit_test`
+/// shifts the incoming pointer position by `inset_x`/`inset_y` before
+/// comparing it against `header_height`/`row_height`, so the click
+/// coordinate here must itself be offset by the same margin the cached
+/// layout reports, or the row index would resolve one cell short.
+pub fn table_bordered_still_resolves_clicks_through_the_inset<D>(
+    h: &mut crate::harness::ConformanceHarness<D>,
+) where
+    D: quadraui::testing::ConformanceDriver + quadraui::testing::DriverInput,
+{
+    assert_paints(
+        &h.driver,
+        &[BORDERED_COL, BORDERED_ROW0],
+        "the bordered table's initial paint",
+    );
+
+    let (x, y) = {
+        let engine = h.engine.borrow();
+        let cached = engine.plugin_view_table_layout.borrow();
+        let (rect, layout) = cached
+            .as_ref()
+            .expect("the bordered table must have painted and cached a layout");
+        let column = &layout.columns[0];
+        (
+            rect.x + layout.inset_x + column.x + column.width / 2.0,
+            rect.y + layout.inset_y + layout.header_height + layout.row_height / 2.0,
+        )
+    };
+    h.driver.click(x, y);
+    assert!(
+        h.driver.screen_has(BORDERED_ROW0_SELECTED),
+        "a click on the bordered table's first body row must still resolve \
+         to row 0 through the reserved margin, dispatching \
+         ItemSelected{{index: 0}} to the plugin; painted runs were {:?}",
+        painted(&h.driver)
+    );
+}
+
 /// Locate `needle`'s painted text run.
 fn painted_run(driver: &impl ConformanceDriver, needle: &str) -> quadraui::event::Rect {
     driver
@@ -4766,6 +4842,35 @@ mod tests {
     }
 
     #[test]
+    fn plugin_view_table_bordered_still_resolves_clicks_through_the_inset_on_tui() {
+        let (mut h, _dir) = tui_named(BORDERED_TABLE_VIEW);
+        table_bordered_still_resolves_clicks_through_the_inset(&mut h);
+    }
+
+    #[test]
+    fn plugin_view_table_bordered_paints_a_rounded_frame_on_tui() {
+        let (h, _dir) = tui_named(BORDERED_TABLE_VIEW);
+        for corner in ['╭', '╮', '╰', '╯'] {
+            assert!(
+                h.driver.screen_contains(&corner.to_string()),
+                "a bordered table must paint the {corner:?} frame corner on TUI; \
+                 screen was:\n{}",
+                h.driver.screen()
+            );
+        }
+
+        let (unbordered, _unbordered_dir) = tui_named(TABLE_VIEW);
+        for corner in ['╭', '╮', '╰', '╯'] {
+            assert!(
+                !unbordered.driver.screen_contains(&corner.to_string()),
+                "an unbordered table must not paint the {corner:?} frame \
+                 corner; screen was:\n{}",
+                unbordered.driver.screen()
+            );
+        }
+    }
+
+    #[test]
     fn plugin_view_table_header_divider_drag_resizes_the_column_on_tui() {
         let (mut h, _dir) = tui_named(TABLE_VIEW);
         table_header_divider_drag_resizes_the_column(&mut h);
@@ -5447,6 +5552,13 @@ mod tests {
     fn plugin_view_table_right_key_reaches_the_second_editable_column_on_gtk() {
         let (mut h, _dir) = gtk_named(TABLE_VIEW);
         table_right_key_reaches_the_second_editable_column(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_table_bordered_still_resolves_clicks_through_the_inset_on_gtk() {
+        let (mut h, _dir) = gtk_named(BORDERED_TABLE_VIEW);
+        table_bordered_still_resolves_clicks_through_the_inset(&mut h);
     }
 
     #[cfg(feature = "gui")]

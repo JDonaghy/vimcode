@@ -397,6 +397,14 @@ pub enum ViewBody {
         /// One string per column; `None` renders no footer.
         #[serde(default)]
         footer: Option<Vec<String>>,
+        /// When true, reserves a 1-cell/pixel margin on every edge and
+        /// paints it as a rounded frame, via `quadraui::DataTable`'s own
+        /// `bordered: bool` field (TUI: `crate::tui::draw_data_table`'s
+        /// `╭─╮ │ ╰─╯` frame; GTK/macOS/Win: the content area is inset by
+        /// the reserved margin). Hit-testing accounts for the inset
+        /// automatically via `DataTableLayout::inset_x`/`inset_y`.
+        #[serde(default)]
+        bordered: bool,
     },
     /// Multi-line read-only text with scrolling. An optional `filetype`
     /// hint enables syntax highlighting (e.g. `"json"`). Painted through
@@ -2415,6 +2423,7 @@ mod tests {
             }],
             multi_select: true,
             footer: Some(vec!["Total".into(), "1 row".into()]),
+            bordered: true,
         };
         let json = serde_json::to_string(&body).unwrap();
         let back: ViewBody = serde_json::from_str(&json).unwrap();

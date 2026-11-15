@@ -1385,7 +1385,7 @@ the field isn't actively being edited.
 |--------|------|--------------------|
 | `"list"` | `title`, `items = {{id=, text=, detail=, icon=}}` (`id` required) | `ItemSelected`, `ItemActivated` (`index`, 0-based) |
 | `"tree"` | `nodes = {{id=, label=, expanded=, children={...}, icon=, badge=}}` (`id` required) | `NodeSelected`, `NodeActivated`, `Expanded`, `Collapsed` (`node_id`) |
-| `"table"` | `columns = {{title=, editable=, align=}}` (`title` required; `align` is `"left"`/`"center"`/`"right"`, default `"left"`), `rows = {{id=, cells={...}}}` (`cells` required), `multi_select`, `footer = {...}` (one string per column, same shape as a row's `cells`) | `ItemSelected`, `ItemActivated` (`index`, `col`), `CellEdited` (`row`, `col`, both 0-based, and `value`), `SelectionChanged` (`indices`, 0-based, only when `multi_select = true`) |
+| `"table"` | `columns = {{title=, editable=, align=}}` (`title` required; `align` is `"left"`/`"center"`/`"right"`, default `"left"`), `rows = {{id=, cells={...}}}` (`cells` required), `multi_select`, `footer = {...}` (one string per column, same shape as a row's `cells`), `bordered` | `ItemSelected`, `ItemActivated` (`index`, `col`), `CellEdited` (`row`, `col`, both 0-based, and `value`), `SelectionChanged` (`indices`, 0-based, only when `multi_select = true`) |
 | `"text_view"` | `text`, `filetype` | none (scrollable, read-only text) |
 | `"chart"` | `chart_kind` (`"sparkline"`, `"line"`, `"bar"`, `"bar_grouped"`; default `"line"`), `series = {{label=, data=, color=, fill=}}`, `x_label`, `y_label`, `show_legend` | `DataPointClicked` (`series_idx`, `data_idx`), `LegendClicked` (`series_idx`, 0-based) |
 | `"message_list"` | `rows = {{text=, fg=, indent=}}` | `ItemSelected`, `ItemActivated` (`index`, 0-based; `col` is always `nil`) |
@@ -1452,6 +1452,15 @@ ascending) right alongside the unconditional `ItemSelected` — a double-click
 only activates and never changes the set. A declared `footer = { "Total", "1",
 "" }` (one string per column) stays pinned below the scrollable body (excluded
 from scrolling and selection) for a totals/summary row.
+
+**`bordered` on `"table"` views.** `bordered = true` reserves a 1-cell/pixel
+margin on every edge of the table, so its own header/first column/last row
+never share a cell with chrome a host paints around the widget (most notably
+a focus ring). On TUI this margin paints as a rounded `╭─╮ │ ╰─╯` frame; on
+GTK/macOS/Windows it only shrinks the content area today — a frame there is
+future work. Clicks and column-divider drags still resolve correctly through
+the reserved margin on every backend. Omit it, or set it `false` (the
+default), for today's unbordered rendering.
 
 ```lua
 vimcode.ui.register_view("my_list", {
