@@ -652,9 +652,23 @@ impl App {
                 .iter_top_down()
                 .find_map(|e| render::plugin_view_float_name_from_widget_id(&e.id));
             if let Some(name) = topmost_float {
-                self.engine.borrow_mut().close_plugin_view_float(name);
-                self.draw_needed.set(true);
-                return;
+                // Gate on the close actually succeeding and pop the stack
+                // entry ourselves — mirrors the mouse path's `DismissAndFall
+                // Through` arm (`mouse_tabs.rs`), which pops explicitly
+                // rather than leaving it for the next paint to notice it's
+                // gone stale. Without this, a ghost entry survives between
+                // this Escape and the next frame: `top_focusable` still
+                // finds it, so the very next keystroke (including a second
+                // Escape, now a no-op since the float is already closed) is
+                // swallowed by the focus-sink rung below.
+                if self.engine.borrow_mut().close_plugin_view_float(name) {
+                    backend
+                        .modal_stack_handle()
+                        .borrow_mut()
+                        .pop(&render::plugin_view_float_widget_id(name));
+                    self.draw_needed.set(true);
+                    return;
+                }
             }
         }
         let focusable_float_open = backend

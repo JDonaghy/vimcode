@@ -5404,6 +5404,106 @@ mod tests {
                 h.engine.borrow().plugin_views_float.is_empty(),
                 "Escape must close the topmost open float"
             );
+            assert!(
+                h.driver.backend().modal_stack_handle().borrow().is_empty(),
+                "Escape must pop the float's own ModalStack entry too, \
+                 mirroring the mouse path's DismissAndFallThrough arm — a \
+                 ghost entry would still report `top_focusable` and \
+                 swallow the very next keystroke"
+            );
+
+            // With the ghost entry gone, the next keystroke must reach the
+            // editor rather than being swallowed by the `focusable_float_
+            // open` keyboard-sink rung re-finding a stale stack entry.
+            h.driver.type_char('i'); // Normal -> Insert
+            for c in "ZQXW_AFTER_ESCAPE".chars() {
+                h.driver.type_char(c);
+            }
+            let screen = h.driver.screen();
+            assert!(
+                screen.contains("ZQXW_AFTER_ESCAPE"),
+                "a stale ModalStack entry must not swallow keys after the \
+                 float it belonged to was closed by Escape; screen:\n{screen}"
+            );
+        }
+
+        /// A non-focusable float (`Focusable::No`, a which-key-style hint
+        /// popup) never steals a keystroke meant for whatever's underneath
+        /// — `ModalStack::top_focusable` skips it, so the `focusable_float_
+        /// open` keyboard-sink rung in `App::handle_key_press` never fires
+        /// for it and the key reaches `Engine::handle_key` as normal.
+        #[test]
+        fn non_focusable_float_does_not_steal_keys_from_the_editor_underneath() {
+            let mut engine = plain_engine();
+            engine.plugin_views.insert(
+                "hint".to_string(),
+                crate::core::plugin_ui::PluginView::default(),
+            );
+            engine.open_plugin_view_float(
+                "hint",
+                crate::core::plugin_ui::PluginViewFloatSpec::new(
+                    crate::core::plugin_ui::PluginViewFloatAnchor::Cell { row: 0, col: 0 },
+                ),
+            );
+            let mut h = harness_no_sidebar(engine);
+            h.driver
+                .backend()
+                .modal_stack_handle()
+                .borrow_mut()
+                .push_with_focusable(
+                    crate::render::plugin_view_float_widget_id("hint"),
+                    quadraui::Rect::new(1.0, 1.0, 5.0, 2.0),
+                    quadraui::Focusable::No,
+                );
+
+            h.driver.type_char('i'); // Normal -> Insert
+            for c in "ZQXW_NONFOCUS_FLOAT".chars() {
+                h.driver.type_char(c);
+            }
+
+            let screen = h.driver.screen();
+            assert!(
+                screen.contains("ZQXW_NONFOCUS_FLOAT"),
+                "a non-focusable float must not swallow keys meant for the \
+                 editor underneath; screen:\n{screen}"
+            );
+        }
+
+        /// The converse of the test above: a focusable float (`Focusable::
+        /// Yes`, the default `ModalStack::push`) is a total keyboard sink
+        /// while it is topmost — every key but Escape is swallowed by the
+        /// `focusable_float_open` rung, so none of this typed text ever
+        /// reaches the editor.
+        #[test]
+        fn focusable_float_swallows_keys_meant_for_the_editor_underneath() {
+            let mut engine = plain_engine();
+            engine.plugin_views.insert(
+                "hint".to_string(),
+                crate::core::plugin_ui::PluginView::default(),
+            );
+            engine.open_plugin_view_float(
+                "hint",
+                crate::core::plugin_ui::PluginViewFloatSpec::new(
+                    crate::core::plugin_ui::PluginViewFloatAnchor::Cell { row: 0, col: 0 },
+                ),
+            );
+            let mut h = harness_no_sidebar(engine);
+            h.driver.backend().modal_stack_handle().borrow_mut().push(
+                crate::render::plugin_view_float_widget_id("hint"),
+                quadraui::Rect::new(1.0, 1.0, 5.0, 2.0),
+            );
+
+            h.driver.type_char('i'); // would be Normal -> Insert, if it got through
+            for c in "ZQXW_FOCUSABLE_FLOAT".chars() {
+                h.driver.type_char(c);
+            }
+
+            let screen = h.driver.screen();
+            assert!(
+                !screen.contains("ZQXW_FOCUSABLE_FLOAT"),
+                "a focusable float must swallow every key but Escape while \
+                 it is topmost; screen:\n{screen}"
+            );
         }
 
         /// The picker popup sizes to ~90% of the combined editor area
