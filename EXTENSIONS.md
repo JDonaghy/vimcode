@@ -1367,12 +1367,12 @@ necessarily one of `options`. While focused:
 - `Escape`, or clicking outside the open dropdown, closes it and reverts the
   live text back to your declared `value`, with no event.
 
-**The filtered popup is painted.** The open dropdown — the list of filtered
-options, and which one is highlighted — is an app-painted overlay anchored to
-the field's own on-screen row, shared by every backend: typing shows which
-options match, and `Up`/`Down`'s highlighted-option cursor is visible as you
-move it. `placeholder` is accepted but ignored — quadraui's `ComboBox` row has
-no placeholder field to paint it into, so it stays reserved.
+**Dropdown rendering.** The open dropdown — the list of filtered options, and
+which one is highlighted — is an app-painted overlay anchored to the field's
+own on-screen row, shared by every backend: typing shows which options match,
+and `Up`/`Down`'s highlighted-option cursor is visible as you move it.
+`placeholder` is accepted but ignored — quadraui's `ComboBox` row has no
+placeholder field to paint it into, so it stays reserved.
 
 vimcode owns the live filter/open/highlight state the same way it owns
 `text`/`password` edit state; your declared `value` is what paints whenever

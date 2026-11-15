@@ -1307,6 +1307,32 @@ pub fn engine_with_plugin_view_tab() -> (Engine, PathBuf) {
     (engine, dir)
 }
 
+/// [`engine_with_plugin_view_tab`], plus a *second*, unrelated view
+/// ([`SECTION_VIEW`]) shown in the sidebar's `ext:` panel at the same time —
+/// so both `render::paint_plugin_view_combo_box_dropdown` call sites
+/// (tab and sidebar) run in the same frame, each against a different
+/// `view_name`. Exercises the "cache is shared across every form host"
+/// contract on `Engine::plugin_view_combo_dropdown_layout`'s own doc: a
+/// `combo_box` dropdown open in the tab must survive the sidebar's
+/// paint of a view that isn't the one being edited.
+///
+/// `ext_panel_has_focus` is left `false` (the default), so keyboard focus —
+/// and the `Tab`-key field navigation the `combo_box` scenarios below
+/// drive — stays on the editor-area tab, never the sidebar.
+pub fn engine_with_plugin_view_tab_and_unrelated_sidebar_form() -> (Engine, PathBuf) {
+    let (mut engine, dir) = engine_with_plugin_view_tab();
+    engine.ext_panel_active = Some(SECTION_VIEW.to_string());
+    // Mirrors `engine_with_named_plugin_view`'s own activation path: without
+    // the first `render()` this triggers, `SECTION_VIEW`'s `fields` stay
+    // whatever they were the last time it was focused (here, never), so the
+    // sidebar would paint the panel's chrome with an empty body. Run before
+    // the scenario's own `Tab` presses so its one-time
+    // `plugin_view_combo_edit`/`plugin_view_text_edit`-clearing side effect
+    // (`Engine::plugin_view_focus_field`) lands while neither is set yet.
+    engine.on_ext_panel_focused(SECTION_VIEW);
+    (engine, dir)
+}
+
 /// [`engine_with_plugin_view_tab`], collapsed down to just the plugin's own
 /// tab/window by closing the original one — so [`VIEW`]'s window becomes
 /// the engine's *sole* remaining window overall. Exercises
@@ -2229,6 +2255,14 @@ pub fn combo_box_dropdown_is_painted_and_click_commits_the_option(
          the painted dropdown; painted runs were {:?}",
         painted(driver)
     );
+    assert!(
+        driver.screen_has(ROW_COMBO_LABEL),
+        "the field's own row label ({ROW_COMBO_LABEL:?}) must stay painted \
+         while the dropdown is open — the dropdown overlay must not \
+         repaint over the compact row FormController::render_and_cache \
+         already drew; painted runs were {:?}",
+        painted(driver)
+    );
 
     driver.click_text(ROW_COMBO_OPTION_A);
     assert!(
@@ -2292,6 +2326,66 @@ pub fn combo_box_dropdown_outside_click_closes_it_with_no_event(
         driver.screen_has(COUNT_0),
         "a click outside the dropdown must fire no event — the counter \
          must still read {COUNT_0:?}; painted runs were {:?}",
+        painted(driver)
+    );
+}
+
+/// Scenario 4d4 — a `combo_box` dropdown open in a tab-hosted form survives
+/// an *unrelated* view's form painting in the sidebar during the same
+/// frame: the fixture is [`engine_with_plugin_view_tab_and_unrelated_sidebar_form`],
+/// which shows [`SECTION_VIEW`] (not [`VIEW`]) in the sidebar's `ext:` panel
+/// alongside the tab-hosted [`VIEW`] this scenario edits. Clicking the open
+/// dropdown's filtered option still commits it, proving
+/// `Engine::plugin_view_combo_dropdown_layout`'s cache the tab's paint
+/// wrote isn't wiped out by the sidebar's paint of a different view later
+/// in the same frame.
+///
+/// RED-verified: when the cache was a single cell any host could clear just
+/// by not being the one being edited, the sidebar's `SECTION_VIEW` paint —
+/// which always runs after the tab's in the same frame — cleared what the
+/// tab had just cached, so this click fell through to ordinary row routing
+/// under the popup instead of committing, and the counter stayed at
+/// [`COUNT_0`].
+pub fn combo_box_dropdown_survives_an_unrelated_sidebar_form_paint(
+    driver: &mut impl ConformanceDriver,
+) {
+    assert!(
+        driver.screen_has(COUNT_0),
+        "precondition: the counter row must start at {COUNT_0:?}; painted runs \
+         were {:?}",
+        painted(driver)
+    );
+    assert!(
+        driver.screen_has(ROW_GROUP_HEADER),
+        "precondition: the fixture's unrelated sidebar form ({ROW_GROUP_HEADER:?}) \
+         must be on screen alongside the tab this scenario edits; painted \
+         runs were {:?}",
+        painted(driver)
+    );
+    for _ in 0..8 {
+        driver.press_named(quadraui::NamedKey::Tab);
+    }
+    driver.type_text(ROW_COMBO_FILTER);
+    assert!(
+        driver.screen_has(ROW_COMBO_OPTION_A),
+        "typing {ROW_COMBO_FILTER:?} must open a dropdown painting the \
+         filtered option {ROW_COMBO_OPTION_A:?}, even with the unrelated \
+         sidebar form also painting this frame; painted runs were {:?}",
+        painted(driver)
+    );
+
+    driver.click_text(ROW_COMBO_OPTION_A);
+    assert!(
+        driver.screen_has(ROW_COMBO_COMMITTED),
+        "clicking the dropdown's filtered option must still commit it even \
+         though an unrelated view's sidebar form painted after the tab's \
+         own form this frame ({ROW_COMBO_COMMITTED:?}); painted runs were {:?}",
+        painted(driver)
+    );
+    assert!(
+        driver.screen_has(COUNT_1),
+        "the click must still reach the plugin's on_event handler as \
+         ComboBoxChanged ({COUNT_1:?}); painted runs were {:?}",
         painted(driver)
     );
 }
@@ -4335,6 +4429,21 @@ mod tests {
         (h, dir)
     }
 
+    /// Editor-tab fixture plus an unrelated sidebar form, both on screen at
+    /// once (TUI arm) — see
+    /// [`engine_with_plugin_view_tab_and_unrelated_sidebar_form`].
+    fn tui_tab_and_unrelated_sidebar_form() -> (
+        crate::harness::ConformanceHarness<
+            quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+        >,
+        PathBuf,
+    ) {
+        let (engine, dir) = engine_with_plugin_view_tab_and_unrelated_sidebar_form();
+        let mut h = crate::tui_main::testing::conformance_harness(engine, TUI_W, TUI_H);
+        h.driver.render();
+        (h, dir)
+    }
+
     /// Editor-tab fixture collapsed to just the plugin's own window (TUI
     /// arm) — see [`engine_with_plugin_view_tab_as_sole_window`].
     fn tui_sole_window() -> (
@@ -4846,6 +4955,12 @@ mod tests {
     }
 
     #[test]
+    fn plugin_view_combo_box_dropdown_survives_an_unrelated_sidebar_form_paint_on_tui() {
+        let (mut h, _dir) = tui_tab_and_unrelated_sidebar_form();
+        combo_box_dropdown_survives_an_unrelated_sidebar_form_paint(&mut h.driver);
+    }
+
+    #[test]
     fn plugin_view_number_input_step_and_commit_reaches_the_handler_on_tui() {
         let (mut h, _dir) = tui();
         number_input_step_and_commit_reaches_the_plugin_handler(&mut h.driver);
@@ -4932,6 +5047,22 @@ mod tests {
         PathBuf,
     ) {
         let (engine, dir) = engine_with_plugin_view_tab();
+        let mut h = crate::gtk::testing::conformance_harness(engine, W, H);
+        h.driver.render();
+        (h, dir)
+    }
+
+    /// Editor-tab fixture plus an unrelated sidebar form, both on screen at
+    /// once (GTK arm) — see
+    /// [`engine_with_plugin_view_tab_and_unrelated_sidebar_form`].
+    #[cfg(feature = "gui")]
+    fn gtk_tab_and_unrelated_sidebar_form() -> (
+        crate::harness::ConformanceHarness<
+            quadraui::gtk::testing::GtkDriver<impl quadraui::AppLogic>,
+        >,
+        PathBuf,
+    ) {
+        let (engine, dir) = engine_with_plugin_view_tab_and_unrelated_sidebar_form();
         let mut h = crate::gtk::testing::conformance_harness(engine, W, H);
         h.driver.render();
         (h, dir)
@@ -5530,6 +5661,13 @@ mod tests {
     fn plugin_view_combo_box_dropdown_outside_click_closes_it_on_gtk() {
         let (mut h, _dir) = gtk();
         combo_box_dropdown_outside_click_closes_it_with_no_event(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_combo_box_dropdown_survives_an_unrelated_sidebar_form_paint_on_gtk() {
+        let (mut h, _dir) = gtk_tab_and_unrelated_sidebar_form();
+        combo_box_dropdown_survives_an_unrelated_sidebar_form_paint(&mut h.driver);
     }
 
     #[cfg(feature = "gui")]
