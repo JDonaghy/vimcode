@@ -828,9 +828,10 @@ pub(crate) fn route_plugin_view_table_click(
     let scroll_offset = engine.plugin_view_scroll_top(host);
     // `DataTableHit` (the pinned quadraui rev's hit-test
     // result) only ever reports `Row { idx }` — no column component — so a
-    // click's column is resolved separately here from the same per-column
-    // `x`/`width` (`ResolvedColumn`) the layout already carries for
-    // painting, rather than a hand-rolled backend-specific hit-test.
+    // click's column is resolved separately here via
+    // `DataTableLayout::column_hit`, which already translates viewport-space
+    // `x` through the border inset (`inset_x`) the same way `hit_test` does,
+    // rather than a hand-rolled backend-specific hit-test.
     // `clicked_col` is unfiltered — it reports whatever column the pointer
     // landed in, read-only or not, for the dispatched event. `editable_col`
     // narrows that to only an `editable` column, since that is the one
@@ -860,10 +861,7 @@ pub(crate) fn route_plugin_view_table_click(
             _ => None,
         };
         let local_x = pos.x - rect.x;
-        let clicked_col = layout
-            .columns
-            .iter()
-            .position(|c| local_x >= c.x && local_x < c.x + c.width);
+        let clicked_col = layout.column_hit(local_x);
         let editable_col = clicked_col.filter(|&c| columns.get(c).is_some_and(|c| c.editable));
         // Snapshotted only for a divider press, which is the only hit that
         // needs the pre-gesture geometry to survive the frames the drag
