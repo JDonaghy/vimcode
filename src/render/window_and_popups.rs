@@ -561,23 +561,46 @@ pub fn editor_hover_popup_paint(
         .min((viewport.width - 4.0 * unit_w).max(10.0 * unit_w));
     let measure = quadraui::RichTextPopupMeasure::new(content_w, unit_h);
     // Measure via the backend's shaped advance, so the hit region tracks
-    // the same font the rasteriser paints with.
-    let layout = popup.layout(
-        popup_x,
-        popup_y,
-        viewport,
-        measure,
-        |line_idx, start_byte, end_byte| {
-            popup
-                .line_text
-                .get(line_idx)
-                .map(|t| {
-                    let slice = &t[start_byte.min(t.len())..end_byte.min(t.len())];
-                    backend.measure_text(slice, quadraui::FontRole::Chrome).0
-                })
-                .unwrap_or(0.0)
-        },
-    );
+    // the same font the rasteriser paints with. Pixel backends measure span
+    // by span with each span's own weight — a bold run ahead of a link is
+    // wider than the same text measured plain, which would shift the link's
+    // hit region left of its painted glyphs.
+    let layout = match backend.paint_surface() {
+        Some(surface) => {
+            let surface: &dyn quadraui::PaintSurface = surface;
+            popup.layout(
+                popup_x,
+                popup_y,
+                viewport,
+                measure,
+                |line_idx, start_byte, end_byte| {
+                    popup
+                        .lines
+                        .get(line_idx)
+                        .map(|styled| {
+                            styled_byte_range_width(surface, styled, start_byte, end_byte)
+                        })
+                        .unwrap_or(0.0)
+                },
+            )
+        }
+        None => popup.layout(
+            popup_x,
+            popup_y,
+            viewport,
+            measure,
+            |line_idx, start_byte, end_byte| {
+                popup
+                    .line_text
+                    .get(line_idx)
+                    .map(|t| {
+                        let slice = &t[start_byte.min(t.len())..end_byte.min(t.len())];
+                        backend.measure_text(slice, quadraui::FontRole::Chrome).0
+                    })
+                    .unwrap_or(0.0)
+            },
+        ),
+    };
 
     backend.draw_rich_text_popup(&popup, &layout);
 
@@ -602,6 +625,30 @@ pub fn editor_hover_popup_paint(
         total: popup.lines.len(),
     });
     (link_rects, popup_rect, scrollbar_hit)
+}
+
+/// Painted width of `styled`'s `[start_byte, end_byte)` byte range, summed
+/// span by span so each span is measured in its own weight.
+fn styled_byte_range_width(
+    surface: &dyn quadraui::PaintSurface,
+    styled: &quadraui::StyledText,
+    start_byte: usize,
+    end_byte: usize,
+) -> f32 {
+    let mut width = 0.0;
+    let mut span_start = 0usize;
+    for span in &styled.spans {
+        let span_end = span_start + span.text.len();
+        let lo = start_byte.max(span_start);
+        let hi = end_byte.min(span_end);
+        if lo < hi {
+            if let Some(part) = span.text.get(lo - span_start..hi - span_start) {
+                width += surface.surface_measure_text_styled(part, span.bold).0;
+            }
+        }
+        span_start = span_end;
+    }
+    width
 }
 
 /// A single editor-anchored popup's already-resolved paint position: the
