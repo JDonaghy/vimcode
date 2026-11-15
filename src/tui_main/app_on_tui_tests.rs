@@ -4396,6 +4396,7 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────────────
     mod popups {
         use super::*;
+        use quadraui::Backend;
 
         /// Mirrors `shell_app.rs`'s test of the same name: opening the command
         /// palette via its accelerator must intercept subsequent keys into the
@@ -5332,6 +5333,76 @@ mod tests {
                          PickerRoute::Dismiss arm); screen:\n{screen}"
                     );
                 },
+            );
+        }
+
+        /// A `vimcode.ui.open_view(name, {location = "float"})` overlay is
+        /// closed by a left-click outside every open float — the
+        /// dismiss-and-fall-through half of `render::
+        /// route_plugin_view_float_click`'s contract
+        /// (`App::handle_mouse_click_msg`'s plugin-view-float rung), shared
+        /// verbatim with GTK's `gtk::testing::modal_rung::
+        /// click_outside_an_open_plugin_view_float_closes_it`.
+        ///
+        /// Resolving a float's own anchor into a painted `ModalStack` entry
+        /// is `render::paint_plugin_view_floats`'s job; this test pushes the
+        /// entry directly at the bounds it would have painted at, so it can
+        /// drive the click-routing rung in isolation from that paint step.
+        #[test]
+        fn click_outside_an_open_plugin_view_float_closes_it_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.plugin_views.insert(
+                "hint".to_string(),
+                crate::core::plugin_ui::PluginView::default(),
+            );
+            engine.open_plugin_view_float(
+                "hint",
+                crate::core::plugin_ui::PluginViewFloatSpec::new(
+                    crate::core::plugin_ui::PluginViewFloatAnchor::Cell { row: 0, col: 0 },
+                ),
+            );
+            let mut h = harness_no_sidebar(engine);
+            h.driver.backend().modal_stack_handle().borrow_mut().push(
+                crate::render::plugin_view_float_widget_id("hint"),
+                quadraui::Rect::new(1.0, 1.0, 5.0, 2.0),
+            );
+
+            h.driver.click(30.0, 20.0); // far outside the float's pushed bounds
+
+            assert!(
+                h.engine.borrow().plugin_views_float.is_empty(),
+                "a click outside every open float must close all of them"
+            );
+        }
+
+        /// Escape closes the topmost open plugin-view float, mirroring
+        /// `quadraui`'s own `examples/common/float_app.rs::handle`
+        /// "Escape closes the topmost popup" convention
+        /// (`App::handle_key_press`'s plugin-view-float keyboard rung).
+        #[test]
+        fn escape_closes_the_topmost_open_plugin_view_float_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.plugin_views.insert(
+                "hint".to_string(),
+                crate::core::plugin_ui::PluginView::default(),
+            );
+            engine.open_plugin_view_float(
+                "hint",
+                crate::core::plugin_ui::PluginViewFloatSpec::new(
+                    crate::core::plugin_ui::PluginViewFloatAnchor::Cell { row: 0, col: 0 },
+                ),
+            );
+            let mut h = harness_no_sidebar(engine);
+            h.driver.backend().modal_stack_handle().borrow_mut().push(
+                crate::render::plugin_view_float_widget_id("hint"),
+                quadraui::Rect::new(1.0, 1.0, 5.0, 2.0),
+            );
+
+            h.driver.press_named(quadraui::NamedKey::Escape);
+
+            assert!(
+                h.engine.borrow().plugin_views_float.is_empty(),
+                "Escape must close the topmost open float"
             );
         }
 
