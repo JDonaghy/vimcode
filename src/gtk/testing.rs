@@ -2318,27 +2318,31 @@ mod tests {
 
         crate::icons::set_nerd_fonts(prev_nf);
 
-        assert!(
-            cs_px
-                .iter()
-                .copied()
-                .any(|p| pixel_near(p, crate::icons::ICON_BLUE)),
-            "a .cs tab must paint its blue C# badge inside its own slot; \
-             sampled: {:?}",
-            cs_px
-        );
-        assert!(
-            !generic_px
-                .iter()
-                .copied()
-                .any(|p| pixel_near(p, crate::icons::ICON_BLUE)),
-            "an unrecognised extension must not paint the C# blue badge; \
-             matches: {:?}",
-            generic_px
-                .iter()
+        // A badge is a glyph, not a pixel: the C# badge paints a dozen-plus
+        // exact-colour pixels in this window, while the generic file icon's
+        // antialiased corners can land a stray pixel or two inside
+        // `pixel_near`'s tolerance.
+        const MIN_BADGE_PIXELS: usize = 6;
+        let blue = |px: &[(u8, u8, u8)]| {
+            px.iter()
                 .copied()
                 .filter(|p| pixel_near(*p, crate::icons::ICON_BLUE))
                 .collect::<Vec<_>>()
+        };
+        let cs_blue = blue(&cs_px);
+        let generic_blue = blue(&generic_px);
+
+        assert!(
+            cs_blue.len() >= MIN_BADGE_PIXELS,
+            "a .cs tab must paint its blue C# badge inside its own slot; \
+             {} matching px (need {MIN_BADGE_PIXELS}), sampled: {:?}",
+            cs_blue.len(),
+            cs_px
+        );
+        assert!(
+            generic_blue.len() < MIN_BADGE_PIXELS,
+            "an unrecognised extension must not paint the C# blue badge; \
+             matches: {generic_blue:?}"
         );
     }
 
