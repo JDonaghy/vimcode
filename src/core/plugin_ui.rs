@@ -401,8 +401,9 @@ pub enum ViewBody {
         /// paints it as a rounded frame, via `quadraui::DataTable`'s own
         /// `bordered: bool` field (TUI: `crate::tui::draw_data_table`'s
         /// `╭─╮ │ ╰─╯` frame; GTK/macOS/Win: the content area is inset by
-        /// the reserved margin). Hit-testing accounts for the inset
-        /// automatically via `DataTableLayout::inset_x`/`inset_y`.
+        /// the reserved margin, but these backends don't paint a frame in
+        /// it yet). Hit-testing accounts for the inset automatically via
+        /// `DataTableLayout::inset_x`/`inset_y`.
         #[serde(default)]
         bordered: bool,
     },

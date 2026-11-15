@@ -1458,9 +1458,11 @@ margin on every edge of the table, so its own header/first column/last row
 never share a cell with chrome a host paints around the widget (most notably
 a focus ring). On TUI this margin paints as a rounded `╭─╮ │ ╰─╯` frame; on
 GTK/macOS/Windows it only shrinks the content area today — a frame there is
-future work. Clicks and column-divider drags still resolve correctly through
-the reserved margin on every backend. Omit it, or set it `false` (the
-default), for today's unbordered rendering.
+future work, and until each backend's rasteriser grows one to match, its own
+paint and the layout's margin can be off by a pixel there. The layout
+translates hit-testing through the margin on every backend, though, so clicks
+and column-divider drags still resolve correctly. Omit it, or set it `false`
+(the default), for today's unbordered rendering.
 
 ```lua
 vimcode.ui.register_view("my_list", {
