@@ -114,6 +114,89 @@ Vim-mode default takes effect with nothing set — see
 `ctrl_f_pages_down_the_viewport_in_default_vim_mode_via_shell_app` in
 `src/tui_main/shell_app.rs`.
 
+## Adding a New `vimcode.ui.open_view` Location
+
+`vimcode.ui.open_view(name, opts)` (`src/core/plugin.rs`) dispatches on
+`opts.location` — `"tab"`, `"split"`/`"vsplit"`, `"dock"`, `"modal"`, `"float"`
+today. Each location is a full vertical slice through the engine, the render
+layer, the shared `src/app/` input dispatch, and the test harness; adding a new
+one (or extending `"float"`'s still-partial coverage — see
+`PluginViewHost::Float`'s doc in `src/core/engine/plugins.rs` for what isn't
+wired yet) means touching all of the following. `"float"` is the newest
+worked example — grep its name in each file below for the concrete shape.
+
+1. **Engine state + open/close methods** — `src/core/engine/plugins.rs`.
+   A single reusable slot (`modal`/`dock`) is one `Option<String>`/enum field;
+   multiple simultaneously-open instances (`float`) are a `HashMap<String, Spec>`
+   keyed by view name (`Engine::plugin_views_float`). Add
+   `open_plugin_view_<location>`/`close_plugin_view_<location>`, and wire the
+   close into the generic `vimcode.ui.close_view` dispatch too.
+2. **`PluginViewHost` variant** — same file. Document exactly what per-host
+   state (selection/scroll/row-focus/`FormController`) this host does and does
+   not cache yet; every exhaustive `match` over the enum needs an arm, even a
+   `{}` no-op one, so the compiler finds every call site a new host must be
+   taught about.
+3. **Lua binding** — a new `location` match arm inside `open_view`'s
+   `lua.create_function` in `src/core/plugin.rs`. Parse any location-specific
+   `opts` keys *before* calling the `live_engine` closure (see
+   `lua_float_spec`/`lua_float_anchor` for a worked "required sub-table,
+   several variants" parse) — `live_engine` needs a live engine loan, so
+   `opts` must already be a plain Rust value by the time the closure runs.
+   Validation failures are a Lua error (`LuaError::RuntimeError`), never a
+   silent no-op — matches `register_view`'s "fail loudly at the Lua/Rust
+   boundary" convention.
+4. **Paint wiring** — a new `paint_plugin_view_<location>*` function in
+   `src/render/plugin_views_declared.rs`, called once per frame, unconditionally
+   (never gated behind "is one open"), from the shared `src/app/paint.rs` —
+   a just-closed instance still needs its stale `quadraui::ModalStack`/chrome
+   entry cleaned up this frame.
+5. **Click routing** — a `route_plugin_view_<location>_click` rung in
+   `src/render/` plus the matching dispatch in the shared `src/app/
+   mouse_tabs.rs`, placed above the generic click paths (an overlay paints on
+   top of whatever is beneath it).
+6. **Key routing** — a rung in the shared `src/app/input.rs` keyboard
+   dispatch, at the correct precedence relative to the other modal/picker
+   rungs — see the "Shared plugin-view float keyboard rung" comment there for
+   the worked example (`Escape` dismissal is checked *before* the
+   keyboard-focus-steal gate, so it can dismiss even a non-focusable overlay
+   that would otherwise never see a key at all).
+7. **Test fixtures + black-box driver scenarios** — `src/harness/
+   plugin_view.rs`: an `engine_with_plugin_view_<location>` builder (loads the
+   fixture plugin, runs a real `:Command` wrapping `vimcode.ui.open_view`,
+   asserts the engine state opened) plus `tui_<location>`/`gtk_<location>`
+   wrappers, mirroring the dock/modal functions already there. At minimum,
+   cover:
+   - open + initial paint, then `vimcode.ui.close_view` closing it, with the
+     boolean return read back through `screen_has` on a painted message (see
+     `close_view_closes_the_modal`/`float_paints_and_close_view_closes_it`).
+   - if more than one instance can be open at once (like `float`), a
+     two-instance ordering scenario. **Don't assert on pixel occlusion** — GTK's
+     test backend (`painted_text`) is an unfiltered draw log, not a rasterised
+     screen, so an "the top one hides the other's text" assertion only ever
+     proves the TUI side (TUI's cell buffer genuinely overwrites) and silently
+     passes on GTK regardless of ordering. Assert on a property every backend
+     agrees on instead — e.g. which instance a single `Escape`/dismiss closes
+     first (see `float_z_order_topmost_is_escaped_and_clicked_first`).
+   - if the host can take keyboard focus conditionally (a `focusable` flag),
+     one scenario per state — the focused one swallows keys that would
+     otherwise reach the editor, the non-focused one does not (see
+     `focusable_float_swallows_keys_until_escape_dismisses_it`/
+     `non_focusable_float_lets_keys_reach_the_editor`).
+   Run both `cargo test --no-default-features` (TUI) and `cargo test` (GTK) —
+   see this file's own Platform-Neutrality testing rule.
+8. **A Lua-facing test in `tests/extensions.rs`** driving the real
+   `vimcode.ui.open_view`/`close_view` binding end to end through
+   `engine_with_plugin` + `exec`. This is a separate integration-test crate, so
+   it cannot read a crate-private `Engine` field like `plugin_views_float`
+   directly — round-trip results through `vimcode.message` and assert on
+   `e.message` instead (see `plugin_open_view_float_opens_and_close_view_closes_it`).
+   Add an error-path test too: an invalid/missing required `opts` key must be
+   a Lua error a `pcall` catches (see
+   `plugin_open_view_float_without_an_anchor_errors`).
+9. **Update `open_view`'s own doc comment** (the one enumerating every
+   `location` value and what each does) and its `"unsupported location"` error
+   message's `(expected ...)` list, in `src/core/plugin.rs`.
+
 ## Hermetic Engine Construction in Tests
 
 **Any new hermetic/rendering/snapshot-style test that needs an `Engine` should call `Engine::new_for_test()`, not `Engine::new()`.** `new_for_test()` builds settings/session/history/`git_branch` from in-memory defaults instead of loading ambient disk/git state, so tests stay reproducible regardless of the machine, `$HOME`, or git branch they run on (#439, #615, #617). Don't call `Engine::new()` and overwrite fields afterward — some ambient state (e.g. `session.explorer_visible`) is consumed inside construction to drive `app_shell.hide_sidebar()` before a post-hoc field reset can run, so overwrite-after doesn't reliably undo it. See `src/tui_main/render_impl.rs`'s `test_engine()` for the reference pattern, including how to reset `extension_state`/`ext_registry` (still loaded from disk/cache unconditionally) and how to flip sidebar visibility through `app_shell`'s own API rather than reassigning `session` directly.

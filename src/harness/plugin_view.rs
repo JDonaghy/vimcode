@@ -1129,6 +1129,40 @@ vimcode.ui.register_view("{SECTION_VIEW}", {{
     end
   end,
 }})
+
+-- Real `:Command`s around `vimcode.ui.open_view` with `location = "float"`
+-- for {VIEW} and {CANCEL_VIEW}, anchored at the identical screen cell:
+-- `{CANCEL_VIEW}` ("{CANCEL_VIEW}") sorts after `{VIEW}` ("{VIEW}")
+-- alphabetically, so opening both exercises the deterministic paint/
+-- click z-order between two overlapping floats. `Zq2164OpenFocusableFloat`
+-- opens {VIEW} with `focusable = true` instead, for the keyboard-routing
+-- scenarios.
+vimcode.command("Zq2164OpenFloat", function()
+  vimcode.ui.open_view("{VIEW}", {{
+    location = "float",
+    anchor = {{ type = "cell", row = 2, col = 2 }},
+  }})
+end)
+
+vimcode.command("Zq2164OpenFocusableFloat", function()
+  vimcode.ui.open_view("{VIEW}", {{
+    location = "float",
+    anchor = {{ type = "cell", row = 2, col = 2 }},
+    focusable = true,
+  }})
+end)
+
+vimcode.command("Zq2164OpenFloat2", function()
+  vimcode.ui.open_view("{CANCEL_VIEW}", {{
+    location = "float",
+    anchor = {{ type = "cell", row = 2, col = 2 }},
+  }})
+end)
+
+vimcode.command("Zq2164CloseFloat", function()
+  local closed = vimcode.ui.close_view("{VIEW}")
+  vimcode.message("Zq2164closed:" .. tostring(closed))
+end)
 "#
     )
 }
@@ -1578,6 +1612,61 @@ pub fn engine_with_plugin_view_modal_over_focused_explorer(
         engine.plugin_view_modal.as_deref(),
         Some(view),
         "vimcode.ui.open_view(..., {{location = \"modal\"}}) must open the modal"
+    );
+    (engine, dir)
+}
+
+/// Float fixture: loads the fixture plugin and runs `command`, a real
+/// `:Command` around `vimcode.ui.open_view(view, {location = "float", ...})`.
+/// The sidebar shows the Settings panel, so nothing of `view` is painted
+/// except through the float.
+pub fn engine_with_plugin_view_float(view: &str, command: &str) -> (Engine, PathBuf) {
+    let dir = plugin_dir();
+    let mut engine = Engine::new_for_test();
+    load_fixture_plugin(&mut engine, &dir);
+
+    engine.app_shell.show_panel(&quadraui::WidgetId::new(
+        crate::core::engine::sidebar::PANEL_SETTINGS,
+    ));
+
+    assert!(
+        engine.plugin_run_command(command, ""),
+        "fixture plugin must register the {command} command"
+    );
+    assert!(
+        engine.plugin_views_float.contains_key(view),
+        "vimcode.ui.open_view(..., {{location = \"float\"}}) must open the float"
+    );
+    (engine, dir)
+}
+
+/// Two-float fixture for the z-order scenario: opens [`VIEW`] then
+/// [`CANCEL_VIEW`] as floats anchored at the identical screen cell, via
+/// the fixture's real `Zq2164OpenFloat`/`Zq2164OpenFloat2` `:Command`s.
+/// [`VIEW`]'s own name sorts before [`CANCEL_VIEW`]'s, so
+/// `render::paint_plugin_view_floats`'s deterministic alphabetical sort
+/// paints `CANCEL_VIEW` last — the topmost, occluding float.
+pub fn engine_with_two_overlapping_plugin_view_floats() -> (Engine, PathBuf) {
+    let dir = plugin_dir();
+    let mut engine = Engine::new_for_test();
+    load_fixture_plugin(&mut engine, &dir);
+
+    engine.app_shell.show_panel(&quadraui::WidgetId::new(
+        crate::core::engine::sidebar::PANEL_SETTINGS,
+    ));
+
+    assert!(
+        engine.plugin_run_command("Zq2164OpenFloat", ""),
+        "fixture plugin must register the Zq2164OpenFloat command"
+    );
+    assert!(
+        engine.plugin_run_command("Zq2164OpenFloat2", ""),
+        "fixture plugin must register the Zq2164OpenFloat2 command"
+    );
+    assert_eq!(
+        engine.plugin_views_float.len(),
+        2,
+        "both floats must be open at once"
     );
     (engine, dir)
 }
@@ -4249,6 +4338,176 @@ pub fn close_view_closes_the_modal<
     );
 }
 
+// ── `location = "float"` scenarios ──────────────────────────────────────
+
+/// Scenario — `location = "float"` paints the view, and
+/// `vimcode.ui.close_view(name)` closes it, reporting its boolean return
+/// the same way [`close_view_closes_the_modal`] does for a modal.
+pub fn float_paints_and_close_view_closes_it<
+    D: ConformanceDriver + crate::harness::rest_client::DrivesIdle,
+>(
+    h: &mut crate::harness::ConformanceHarness<D>,
+) {
+    assert_paints(
+        &h.driver,
+        &[ROW_HEADER],
+        "a view opened with location = \"float\"",
+    );
+    assert!(h
+        .engine
+        .borrow_mut()
+        .plugin_run_command("Zq2164CloseFloat", ""));
+    h.driver.repaint();
+    assert!(
+        !h.driver.screen_has(ROW_HEADER),
+        "close_view must close the float; painted runs were {:?}",
+        painted(&h.driver)
+    );
+    assert!(
+        h.driver.screen_has("Zq2164closed:true"),
+        "close_view must report true for the open float; painted runs were {:?}",
+        painted(&h.driver)
+    );
+    assert!(h
+        .engine
+        .borrow_mut()
+        .plugin_run_command("Zq2164CloseFloat", ""));
+    h.driver.repaint();
+    assert!(
+        h.driver.screen_has("Zq2164closed:false"),
+        "a second close_view must report false once the float is gone; \
+         painted runs were {:?}",
+        painted(&h.driver)
+    );
+}
+
+/// Scenario — two floats open at overlapping bounds: a click landing
+/// where both overlap hits the topmost one rather than falling through
+/// to dismiss anything, and `Escape` closes only that topmost float —
+/// the alphabetically later name ([`CANCEL_VIEW`], pushed last onto the
+/// shared `quadraui::ModalStack` by `render::paint_plugin_view_floats`'s
+/// deterministic sort, the same ordering `ModalStack::iter_top_down`
+/// walks for both the click and the `Escape` rung in `App::
+/// handle_key_pressed`) — leaving the other ([`VIEW`]) open until a
+/// second `Escape` closes it too. Unlike [`ROW_HEADER`]'s painted
+/// presence, which a backend may keep recording in its paint inventory
+/// even once genuinely occluded (GTK's `painted_text` is an unfiltered
+/// draw log, not a rasterised screen), whether a float is open at all —
+/// and therefore painted even once — is a property every backend agrees
+/// on, which is why this scenario reads that instead of pixel occlusion.
+pub fn float_z_order_topmost_is_escaped_and_clicked_first(driver: &mut impl ConformanceDriver) {
+    assert!(
+        driver.screen_has(CANCEL_HEADER),
+        "the topmost float (CANCEL_VIEW) must be painted; painted runs \
+         were {:?}",
+        painted(driver)
+    );
+
+    // A click landing where both floats' bounds overlap must hit the
+    // topmost float, not fall through and dismiss either one.
+    driver.click_text(CANCEL_HEADER);
+    assert!(
+        driver.screen_has(CANCEL_HEADER),
+        "a click landing inside the overlap must hit the topmost float, \
+         not dismiss it; painted runs were {:?}",
+        painted(driver)
+    );
+
+    driver.press_named(quadraui::NamedKey::Escape);
+    assert!(
+        !driver.screen_has(CANCEL_HEADER),
+        "Escape must close the topmost float (CANCEL_VIEW) first; \
+         painted runs were {:?}",
+        painted(driver)
+    );
+    assert!(
+        driver.screen_has(ROW_HEADER),
+        "closing the topmost float must leave the one beneath it (VIEW) \
+         open; painted runs were {:?}",
+        painted(driver)
+    );
+
+    driver.press_named(quadraui::NamedKey::Escape);
+    assert!(
+        !driver.screen_has(ROW_HEADER),
+        "a second Escape must close the remaining float; painted runs \
+         were {:?}",
+        painted(driver)
+    );
+}
+
+/// Scenario — a `focusable = true` float takes the keyboard: typed keys
+/// are swallowed rather than reaching the editor beneath it, but `Escape`
+/// still dismisses the topmost float regardless of its own `focusable`
+/// bit (the same rung `Escape` already uses to dismiss a non-focusable
+/// float in [`non_focusable_float_lets_keys_reach_the_editor`]). Once
+/// dismissed, keys reach the editor's command line again.
+pub fn focusable_float_swallows_keys_until_escape_dismisses_it(
+    driver: &mut impl ConformanceDriver,
+) {
+    assert_paints(
+        driver,
+        &[ROW_HEADER],
+        "a view opened with location = \"float\", focusable = true",
+    );
+    driver.type_text(":echo \"Zq2164Ok\"");
+    driver.press_named(quadraui::NamedKey::Enter);
+    assert!(
+        !driver.screen_has("Zq2164Ok"),
+        "a focusable float must swallow keys rather than letting them \
+         reach the editor's command line; painted runs were {:?}",
+        painted(driver)
+    );
+    assert!(
+        driver.screen_has(ROW_HEADER),
+        "keys swallowed by a focusable float must not close it; painted \
+         runs were {:?}",
+        painted(driver)
+    );
+    driver.press_named(quadraui::NamedKey::Escape);
+    assert!(
+        !driver.screen_has(ROW_HEADER),
+        "Escape must dismiss the topmost float even though it holds \
+         focus; painted runs were {:?}",
+        painted(driver)
+    );
+    driver.type_text(":echo \"Zq2164Ok\"");
+    driver.press_named(quadraui::NamedKey::Enter);
+    assert!(
+        driver.screen_has("Zq2164Ok"),
+        "once the focusable float is dismissed, keys must reach the \
+         editor's command line again; painted runs were {:?}",
+        painted(driver)
+    );
+}
+
+/// Scenario — a `focusable = false` float (the default) never takes the
+/// keyboard: typed keys reach the editor beneath it exactly as if no
+/// float were open at all, and the float stays painted throughout since
+/// nothing closed it. The mirror case of
+/// [`focusable_float_swallows_keys_until_escape_dismisses_it`].
+pub fn non_focusable_float_lets_keys_reach_the_editor(driver: &mut impl ConformanceDriver) {
+    assert_paints(
+        driver,
+        &[ROW_HEADER],
+        "a view opened with location = \"float\"",
+    );
+    driver.type_text(":echo \"Zq2164Ok\"");
+    driver.press_named(quadraui::NamedKey::Enter);
+    assert!(
+        driver.screen_has("Zq2164Ok"),
+        "a non-focusable float must not swallow keys; they must reach \
+         the editor's command line; painted runs were {:?}",
+        painted(driver)
+    );
+    assert!(
+        driver.screen_has(ROW_HEADER),
+        "keys that pass through a non-focusable float must not close it; \
+         painted runs were {:?}",
+        painted(driver)
+    );
+}
+
 /// Scenario 12b — `vimcode.ui.close_view(name)` closes a docked view,
 /// removing it from the painted bottom panel, and reports `false` the next
 /// time it's called since nothing is open under that name any more.
@@ -4652,6 +4911,49 @@ mod tests {
     fn plugin_view_modal_own_cancel_button_closes_it_on_tui() {
         let (mut h, _dir) = tui_modal(CANCEL_VIEW, "Zq2141CancelOpenModal");
         clicking_its_own_cancel_button_closes_the_view(&mut h.driver);
+    }
+
+    /// Plugin-view float fixture (TUI arm) — see
+    /// [`engine_with_plugin_view_float`].
+    fn tui_float(
+        view: &str,
+        command: &str,
+    ) -> (
+        crate::harness::ConformanceHarness<
+            quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+        >,
+        PathBuf,
+    ) {
+        let (engine, dir) = engine_with_plugin_view_float(view, command);
+        let mut h = crate::tui_main::testing::conformance_harness(engine, TUI_W, TUI_H);
+        h.driver.render();
+        (h, dir)
+    }
+
+    #[test]
+    fn plugin_view_float_paints_and_close_view_closes_it_on_tui() {
+        let (mut h, _dir) = tui_float(VIEW, "Zq2164OpenFloat");
+        float_paints_and_close_view_closes_it(&mut h);
+    }
+
+    #[test]
+    fn plugin_view_float_z_order_topmost_is_escaped_and_clicked_first_on_tui() {
+        let (engine, _dir) = engine_with_two_overlapping_plugin_view_floats();
+        let mut h = crate::tui_main::testing::conformance_harness(engine, TUI_W, TUI_H);
+        h.driver.render();
+        float_z_order_topmost_is_escaped_and_clicked_first(&mut h.driver);
+    }
+
+    #[test]
+    fn plugin_view_focusable_float_swallows_keys_until_escape_dismisses_it_on_tui() {
+        let (mut h, _dir) = tui_float(VIEW, "Zq2164OpenFocusableFloat");
+        focusable_float_swallows_keys_until_escape_dismisses_it(&mut h.driver);
+    }
+
+    #[test]
+    fn plugin_view_non_focusable_float_lets_keys_reach_the_editor_on_tui() {
+        let (mut h, _dir) = tui_float(VIEW, "Zq2164OpenFloat");
+        non_focusable_float_lets_keys_reach_the_editor(&mut h.driver);
     }
 
     #[test]
@@ -5275,6 +5577,54 @@ mod tests {
     fn plugin_view_modal_own_cancel_button_closes_it_on_gtk() {
         let (mut h, _dir) = gtk_modal(CANCEL_VIEW, "Zq2141CancelOpenModal");
         clicking_its_own_cancel_button_closes_the_view(&mut h.driver);
+    }
+
+    /// Plugin-view float fixture (GTK arm) — see
+    /// [`engine_with_plugin_view_float`].
+    #[cfg(feature = "gui")]
+    fn gtk_float(
+        view: &str,
+        command: &str,
+    ) -> (
+        crate::harness::ConformanceHarness<
+            quadraui::gtk::testing::GtkDriver<impl quadraui::AppLogic>,
+        >,
+        PathBuf,
+    ) {
+        let (engine, dir) = engine_with_plugin_view_float(view, command);
+        let mut h = crate::gtk::testing::conformance_harness(engine, W, H);
+        h.driver.render();
+        (h, dir)
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_float_paints_and_close_view_closes_it_on_gtk() {
+        let (mut h, _dir) = gtk_float(VIEW, "Zq2164OpenFloat");
+        float_paints_and_close_view_closes_it(&mut h);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_float_z_order_topmost_is_escaped_and_clicked_first_on_gtk() {
+        let (engine, _dir) = engine_with_two_overlapping_plugin_view_floats();
+        let mut h = crate::gtk::testing::conformance_harness(engine, W, H);
+        h.driver.render();
+        float_z_order_topmost_is_escaped_and_clicked_first(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_focusable_float_swallows_keys_until_escape_dismisses_it_on_gtk() {
+        let (mut h, _dir) = gtk_float(VIEW, "Zq2164OpenFocusableFloat");
+        focusable_float_swallows_keys_until_escape_dismisses_it(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_non_focusable_float_lets_keys_reach_the_editor_on_gtk() {
+        let (mut h, _dir) = gtk_float(VIEW, "Zq2164OpenFloat");
+        non_focusable_float_lets_keys_reach_the_editor(&mut h.driver);
     }
 
     #[cfg(feature = "gui")]
