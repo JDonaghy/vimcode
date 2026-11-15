@@ -17917,6 +17917,82 @@ mod tests {
             );
         }
 
+        /// `vimcode.ui.open_view(name, { location = "float", anchor = {...}
+        /// })` must paint as an overlay — the original window's own buffer
+        /// text stays on screen alongside the float's own content, unlike
+        /// `tab`/`split`, which replace or share the window. Closing it via
+        /// `vimcode.ui.close_view` must make the painted content disappear
+        /// again on the very next frame.
+        #[test]
+        fn open_view_float_paints_as_an_overlay_and_disappears_on_close_via_shell_app() {
+            let mut engine = engine_with_plugin(
+                "open_view_float_2162",
+                r#"
+                vimcode.ui.register_view("float_demo_2162", {
+                    title = "Float Demo",
+                    render = function()
+                        return {
+                            fields = {
+                                { type = "label", id = "lbl", label = "ZQ_FLOAT_VIEW_LABEL" },
+                            },
+                        }
+                    end,
+                })
+                vimcode.command("ZqOpenFloatView", function(_)
+                    vimcode.ui.open_view("float_demo_2162", {
+                        location = "float",
+                        anchor = { type = "cell", row = 10, col = 0 },
+                    })
+                end)
+                vimcode.command("ZqCloseFloatView", function(_)
+                    vimcode.ui.close_view("float_demo_2162")
+                end)
+                "#,
+            );
+            engine.buffer_mut().insert(0, "ZQ_ORIGINAL_FILE_TEXT\n");
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            let before = driver.screen();
+            assert!(
+                !before.contains("ZQ_FLOAT_VIEW_LABEL"),
+                "precondition: the float isn't open yet; screen:\n{before}"
+            );
+
+            driver.type_char(':');
+            for c in "ZqOpenFloatView".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.render();
+
+            let opened = driver.screen();
+            assert!(
+                opened.contains("ZQ_FLOAT_VIEW_LABEL"),
+                "opening the float must paint its declared-widget content; \
+                 screen:\n{opened}"
+            );
+            assert!(
+                opened.contains("ZQ_ORIGINAL_FILE_TEXT"),
+                "a float must overlay the window, not replace its content \
+                 (unlike a tab/split); screen:\n{opened}"
+            );
+
+            driver.type_char(':');
+            for c in "ZqCloseFloatView".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.render();
+
+            let closed = driver.screen();
+            assert!(
+                !closed.contains("ZQ_FLOAT_VIEW_LABEL"),
+                "closing the float must stop painting its content on the \
+                 very next frame; screen:\n{closed}"
+            );
+        }
+
         /// `vimcode.ui.open_view(name, { location = "split" })` must place
         /// the view as a horizontal (stacked) sibling split of the active
         /// window rather than a vertical (side-by-side) one or a new tab.

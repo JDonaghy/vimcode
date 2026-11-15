@@ -1303,6 +1303,27 @@ impl App {
         );
         self.editor_hover_popup_rect.set(editor_hover_popup_rect);
         self.editor_hover_scrollbar.set(editor_hover_scrollbar);
+
+        // `vimcode.ui.open_view(name, {location = "float"})` overlays —
+        // unconditional (not gated behind "is any float open"), same
+        // reason `render::paint_plugin_view_floats`'s own doc gives: a
+        // float that closed this frame still needs its stale `ModalStack`
+        // entry popped. Shares this rung's own `win_origin`/`cw`/`lh` and
+        // the cursor point already resolved for the completion popup
+        // above, rather than re-deriving them.
+        let engine = self.engine.borrow();
+        render::paint_plugin_view_floats(
+            &engine,
+            backend,
+            main,
+            &render::PluginViewFloatGeometry {
+                win_origin,
+                win_rect: win_viewport,
+                cursor_point: anchor_points.completion,
+                cw: cw as f32,
+                lh: lh as f32,
+            },
+        );
     }
 
     /// Per-frame state pushes that must happen before anything is composed.
