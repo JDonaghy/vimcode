@@ -630,6 +630,47 @@ impl App {
             render::ModalKeyRoute::None => {}
         }
 
+        // ── Shared plugin-view float keyboard rung ──────────────────────────
+        //
+        // `vimcode.ui.open_view(name, {location = "float"})` overlays sit on
+        // the same `quadraui::ModalStack` as every other modal surface, but
+        // — unlike a dialog — a float only owns the keyboard while
+        // `focusable: true` was declared for it: `ModalStack::top_focusable`
+        // already skips a non-focusable float (a which-key-style hint
+        // popup) stacked above a focusable one, or above the base layer, so
+        // it never steals a keystroke meant for whatever's underneath.
+        //
+        // Escape closes the *topmost open* float regardless of its own
+        // `focusable` bit — mirrors `quadraui`'s own `examples/common/
+        // float_app.rs::handle` "Escape closes the topmost popup" contract
+        // — checked above the focus check below so Escape can dismiss even
+        // a non-focusable hint that would otherwise never see a key at all.
+        if key_name == "Escape" {
+            let topmost_float = backend
+                .modal_stack_handle()
+                .borrow()
+                .iter_top_down()
+                .find_map(|e| render::plugin_view_float_name_from_widget_id(&e.id));
+            if let Some(name) = topmost_float {
+                self.engine.borrow_mut().close_plugin_view_float(name);
+                self.draw_needed.set(true);
+                return;
+            }
+        }
+        let focusable_float_open = backend
+            .modal_stack_handle()
+            .borrow()
+            .top_focusable()
+            .is_some_and(|e| render::plugin_view_float_name_from_widget_id(&e.id).is_some());
+        if focusable_float_open {
+            // No per-field key routing exists for this host yet
+            // (`PluginViewHost::Float`'s doc) — swallow every other key so
+            // it can't leak through to the editor/base layer while a
+            // focusable float holds focus.
+            self.draw_needed.set(true);
+            return;
+        }
+
         // ── Shared folder-picker rung ───────────────────────────────────
         // Above every other tier: once `open_folder_dialog` (below) has
         // populated `folder_picker`, every key belongs to the picker.

@@ -805,6 +805,75 @@ impl App {
             return;
         }
 
+        // ── Plugin-view float click rung ───────────────────────────────────
+        //
+        // `vimcode.ui.open_view(name, {location = "float"})` overlays are
+        // registered on the same `quadraui::ModalStack` every other modal
+        // surface shares, keyed by name rather than a single engine-state
+        // flag since any number may be open at once
+        // (`Engine::plugin_views_float`). Arbitrated once in
+        // `render::route_plugin_view_float_click`, which walks the stack
+        // itself; checked here, above the scroll-surface dispatch, for the
+        // same "paints on top of the editor" reason the two hover-popup
+        // rungs above are.
+        {
+            let stack_rc = backend.modal_stack_handle();
+            let route = {
+                let stack = stack_rc.borrow();
+                render::route_plugin_view_float_click(&stack, x as f32, y as f32)
+            };
+            match route {
+                render::PluginViewFloatRoute::Hit { name, bounds } => {
+                    let mut engine = self.engine.borrow_mut();
+                    let event = quadraui::UiEvent::MouseDown {
+                        widget: None,
+                        button: quadraui::MouseButton::Left,
+                        position: quadraui::Point::new(x as f32, y as f32),
+                        modifiers: quadraui::Modifiers::default(),
+                    };
+                    let backend_rc = self.backend.clone();
+                    let mut b = backend_rc.borrow_mut();
+                    // `None` means `name` is the field-stack `Form` default
+                    // rather than a body-kind view — no per-field click
+                    // routing exists for this host yet (`PluginViewHost::
+                    // Float`'s doc), so the click is simply swallowed below.
+                    render::route_plugin_view_body_event(
+                        &mut engine,
+                        &name,
+                        PluginViewHost::Float,
+                        &event,
+                        bounds,
+                        &mut **b,
+                    );
+                    drop(b);
+                    drop(engine);
+                    self.draw_needed.set(true);
+                    return;
+                }
+                render::PluginViewFloatRoute::DismissAndFallThrough => {
+                    let mut engine = self.engine.borrow_mut();
+                    let names: Vec<String> = engine.plugin_views_float.keys().cloned().collect();
+                    for name in &names {
+                        engine.close_plugin_view_float(name);
+                    }
+                    drop(engine);
+                    // Pop each closed float's own `ModalStack` entry here
+                    // rather than leaving it for the next paint to notice
+                    // it's gone stale — a redraw always follows this click,
+                    // but nothing should rely on that ordering for
+                    // correctness (e.g. a second click arriving before a
+                    // frame renders).
+                    let mut stack = stack_rc.borrow_mut();
+                    for name in &names {
+                        stack.pop(&render::plugin_view_float_widget_id(name));
+                    }
+                    drop(stack);
+                    self.draw_needed.set(true);
+                }
+                render::PluginViewFloatRoute::None => {}
+            }
+        }
+
         // ── Scroll-surface click dispatch (scrollbar thumb-drag + track-page). ──
         {
             let surfaces = self.engine.borrow().scroll_surfaces.borrow().clone();

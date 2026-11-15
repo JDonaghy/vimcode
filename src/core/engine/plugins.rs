@@ -178,13 +178,14 @@ pub(crate) enum PluginViewHost {
     /// window edge (`Engine::open_plugin_view_float`). Unlike every other
     /// host, any number of named floats can be open at once — see
     /// `Engine::plugin_views_float`'s doc — so this variant carries no
-    /// per-host selection/scroll/focus state of its own yet: nothing in
-    /// this crate dispatches a key or click with this host today (the
-    /// `focusable` flag on `crate::core::plugin_ui::PluginViewFloatSpec` is
-    /// stored for a later rung to read), so every exhaustive match over
-    /// `PluginViewHost` below treats it the same way the dock treats a key
-    /// it can never actually receive: present only to keep the match
-    /// exhaustive.
+    /// per-host selection/scroll/focus state of its own yet. A click or key
+    /// *is* routed to the float that owns it (`render::
+    /// route_plugin_view_float_click`, `quadraui::ModalStack::top_focusable`
+    /// gating keyboard focus on the `crate::core::plugin_ui::
+    /// PluginViewFloatSpec::focusable` flag), but every exhaustive match
+    /// over `PluginViewHost` below still treats it the same way the dock
+    /// treats a key it can never actually receive, since none of them have
+    /// a cached layout/selection/scroll slot for this host yet.
     Float,
 }
 

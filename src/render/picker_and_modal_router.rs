@@ -1068,6 +1068,82 @@ pub fn apply_picker_row_click(engine: &mut Engine, idx: usize) {
     }
 }
 
+// ─── Plugin-view float click rung ───────────────────────────────────────────
+//
+// `vimcode.ui.open_view(name, {location = "float"})` overlays are, unlike
+// every other rung in this file, keyed by name rather than a single
+// engine-state flag: any number of distinctly named floats may be open at
+// once (`Engine::plugin_views_float`), each registered as its own
+// `quadraui::ModalStack` entry. Arbitration below walks the stack itself
+// instead of comparing against one painted rect.
+
+/// Widget-id prefix a plugin-view float's `quadraui::ModalStack` entry is
+/// registered under, keyed by its `vimcode.ui.register_view` name.
+pub(crate) const PLUGIN_VIEW_FLOAT_ID_PREFIX: &str = "plugin_view_float:";
+
+/// Recover the view name a plugin-view float's widget id was built from, or
+/// `None` when `id` isn't one (a dialog, palette, the editor-hover popup, or
+/// any other kind of `ModalStack` entry).
+pub(crate) fn plugin_view_float_name_from_widget_id(
+    id: &quadraui::WidgetId,
+) -> Option<&'static str> {
+    id.as_str().strip_prefix(PLUGIN_VIEW_FLOAT_ID_PREFIX)
+}
+
+/// Build `name`'s `quadraui::ModalStack` widget id — the inverse of
+/// [`plugin_view_float_name_from_widget_id`].
+pub(crate) fn plugin_view_float_widget_id(name: &str) -> quadraui::WidgetId {
+    quadraui::WidgetId::new(format!("{PLUGIN_VIEW_FLOAT_ID_PREFIX}{name}"))
+}
+
+/// What a left-press means for every currently open plugin-view float.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PluginViewFloatRoute {
+    /// The press landed inside this open float — forward it to the view's
+    /// own click handler, against the bounds it was actually painted at.
+    Hit {
+        name: String,
+        bounds: quadraui::Rect,
+    },
+    /// The press landed inside no open float: close every one of them, but
+    /// — mirroring [`EditorHoverPopupRoute::DismissAndFallThrough`] — let
+    /// the press fall through to whatever is painted underneath rather than
+    /// costing the user a second click.
+    DismissAndFallThrough,
+    /// No float is open — nothing to arbitrate.
+    None,
+}
+
+/// Arbitrate a left-press against every open plugin-view float, by walking
+/// `stack`'s entries topmost-first and testing the bounds each was actually
+/// pushed with — never a fresh recomputation, the same "trust what was
+/// painted" contract every other rung in this file follows.
+pub(crate) fn route_plugin_view_float_click(
+    stack: &quadraui::ModalStack,
+    x: f32,
+    y: f32,
+) -> PluginViewFloatRoute {
+    let point = quadraui::Point { x, y };
+    let mut any_open = false;
+    for entry in stack.iter_top_down() {
+        let Some(name) = plugin_view_float_name_from_widget_id(&entry.id) else {
+            continue;
+        };
+        any_open = true;
+        if entry.bounds.contains(point) {
+            return PluginViewFloatRoute::Hit {
+                name: name.to_string(),
+                bounds: entry.bounds,
+            };
+        }
+    }
+    if any_open {
+        PluginViewFloatRoute::DismissAndFallThrough
+    } else {
+        PluginViewFloatRoute::None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1917,5 +1993,93 @@ mod tests {
                 "glyph and fallback must differ so backend selection is observable"
             );
         }
+    }
+
+    // ─── Plugin-view float click rung ──────────────────────────────────
+
+    #[test]
+    fn plugin_view_float_name_from_widget_id_strips_the_prefix() {
+        let id = plugin_view_float_widget_id("hint");
+        assert_eq!(plugin_view_float_name_from_widget_id(&id), Some("hint"));
+        // A non-float entry (a dialog, a picker, ...) never matches.
+        assert_eq!(
+            plugin_view_float_name_from_widget_id(&quadraui::WidgetId::new("dialog")),
+            None
+        );
+    }
+
+    #[test]
+    fn route_plugin_view_float_click_reports_none_when_no_float_is_open() {
+        let stack = quadraui::ModalStack::new();
+        assert_eq!(
+            route_plugin_view_float_click(&stack, 5.0, 5.0),
+            PluginViewFloatRoute::None
+        );
+    }
+
+    #[test]
+    fn route_plugin_view_float_click_hits_the_float_whose_bounds_contain_the_point() {
+        let mut stack = quadraui::ModalStack::new();
+        stack.push(
+            plugin_view_float_widget_id("hint"),
+            quadraui::Rect::new(0.0, 0.0, 10.0, 10.0),
+        );
+        assert_eq!(
+            route_plugin_view_float_click(&stack, 5.0, 5.0),
+            PluginViewFloatRoute::Hit {
+                name: "hint".to_string(),
+                bounds: quadraui::Rect::new(0.0, 0.0, 10.0, 10.0),
+            }
+        );
+    }
+
+    #[test]
+    fn route_plugin_view_float_click_prefers_the_topmost_float_when_they_overlap() {
+        let mut stack = quadraui::ModalStack::new();
+        stack.push(
+            plugin_view_float_widget_id("menu"),
+            quadraui::Rect::new(0.0, 0.0, 10.0, 10.0),
+        );
+        stack.push(
+            plugin_view_float_widget_id("hint"),
+            quadraui::Rect::new(0.0, 0.0, 10.0, 10.0),
+        );
+        assert_eq!(
+            route_plugin_view_float_click(&stack, 1.0, 1.0),
+            PluginViewFloatRoute::Hit {
+                name: "hint".to_string(),
+                bounds: quadraui::Rect::new(0.0, 0.0, 10.0, 10.0),
+            }
+        );
+    }
+
+    #[test]
+    fn route_plugin_view_float_click_dismisses_and_falls_through_on_an_outside_click() {
+        let mut stack = quadraui::ModalStack::new();
+        stack.push(
+            plugin_view_float_widget_id("hint"),
+            quadraui::Rect::new(0.0, 0.0, 10.0, 10.0),
+        );
+        assert_eq!(
+            route_plugin_view_float_click(&stack, 50.0, 50.0),
+            PluginViewFloatRoute::DismissAndFallThrough
+        );
+    }
+
+    #[test]
+    fn route_plugin_view_float_click_ignores_non_float_modal_stack_entries() {
+        // A dialog/picker/etc. pushed onto the same stack must never be
+        // mistaken for a float, in either direction: it can't be hit, and
+        // its mere presence doesn't count as "a float is open" for the
+        // outside-click dismiss-all case.
+        let mut stack = quadraui::ModalStack::new();
+        stack.push(
+            quadraui::WidgetId::new("dialog"),
+            quadraui::Rect::new(0.0, 0.0, 10.0, 10.0),
+        );
+        assert_eq!(
+            route_plugin_view_float_click(&stack, 5.0, 5.0),
+            PluginViewFloatRoute::None
+        );
     }
 }
