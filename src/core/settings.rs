@@ -1728,6 +1728,17 @@ fn default_ui_font_size() -> u8 {
     10
 }
 
+/// VS Code's cross-platform UI-chrome convention, in the units `ui_font_size`
+/// is exposed to users in — a macOS-style "1pt == 1px" point, not whatever a
+/// given backend's native font API happens to take.
+/// [`Settings::effective_ui_font_size`] scales an *explicit* `ui_font_size`
+/// against this baseline so `13` always means "the VS Code convention" on
+/// every backend, matching what the *uncustomized* branch already gets for
+/// free by reading `Backend::default_fonts().ui_size_pt` directly: on GTK
+/// and Win-GUI that value is `9.75`, the native Pango/DirectWrite point
+/// that renders at 13px given their 96/72 DPI scaling, not `13.0` itself.
+const VS_CODE_UI_CHROME_PT: f32 = 13.0;
+
 /// `0.0` is [`Settings::effective_line_height_multiplier`]'s "auto"
 /// sentinel — the same "never customized" convention
 /// [`default_ui_font_size`]'s doc describes for `ui_font_size`.
@@ -3740,6 +3751,14 @@ impl Settings {
     /// backend literal today, but clamping here too means a future caller
     /// that skips `app_support::sync_ui_font_size`'s own `.max(6)` can
     /// never see an out-of-range value from this method.
+    ///
+    /// An *explicit* `ui_font_size` is scaled against [`VS_CODE_UI_CHROME_PT`]
+    /// before being handed back, the same `default_size_pt`-native units the
+    /// uncustomized branch already returns — see that constant's doc. Without
+    /// this, an explicit `13` (the value users would naturally pick to match
+    /// the default) rendered at a different, larger size than leaving the
+    /// setting untouched on any backend whose native convention isn't
+    /// `VS_CODE_UI_CHROME_PT` itself (GTK, Win-GUI).
     pub fn effective_ui_font_size(&self, default_size_pt: f32) -> u8 {
         if default_size_pt <= 0.0 {
             return self.ui_font_size;
@@ -3747,7 +3766,9 @@ impl Settings {
         if self.ui_font_size == default_ui_font_size() {
             default_size_pt.round().clamp(6.0, 32.0) as u8
         } else {
-            self.ui_font_size
+            (self.ui_font_size as f32 * default_size_pt / VS_CODE_UI_CHROME_PT)
+                .round()
+                .clamp(6.0, 32.0) as u8
         }
     }
 
