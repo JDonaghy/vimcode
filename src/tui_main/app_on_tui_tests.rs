@@ -5442,7 +5442,7 @@ mod tests {
             engine.open_plugin_view_float(
                 "hint",
                 crate::core::plugin_ui::PluginViewFloatSpec::new(
-                    crate::core::plugin_ui::PluginViewFloatAnchor::Cell { row: 0, col: 0 },
+                    crate::core::plugin_ui::PluginViewFloatAnchor::Cell { row: 15, col: 40 },
                 ),
             );
             let mut h = harness_no_sidebar(engine);
@@ -5452,7 +5452,7 @@ mod tests {
                 .borrow_mut()
                 .push_with_focusable(
                     crate::render::plugin_view_float_widget_id("hint"),
-                    quadraui::Rect::new(1.0, 1.0, 5.0, 2.0),
+                    quadraui::Rect::new(40.0, 15.0, 5.0, 2.0),
                     quadraui::Focusable::No,
                 );
 
