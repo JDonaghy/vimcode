@@ -9300,3 +9300,90 @@ fn fs_read_round_trips_write_and_errors_on_missing_file_2040() {
         e.message
     );
 }
+
+// ── vimcode.ui.open_view(name, {location = "float"}) ───────────────────────
+
+/// `vimcode.ui.open_view(name, {location = "float", anchor = {...}})`
+/// opens a named floating overlay, and `vimcode.ui.close_view(name)`
+/// closes it and reports `true`; calling `close_view` again once nothing
+/// is open under that name reports `false`. Both booleans round-trip
+/// through `vimcode.message` since `Engine::plugin_views_float` itself
+/// is a crate-private field this integration test can't read directly —
+/// the same boundary `src/harness/plugin_view.rs`'s own float fixtures
+/// work around by reading painted output instead.
+#[test]
+fn plugin_open_view_float_opens_and_close_view_closes_it() {
+    let mut e = engine_with_plugin(
+        "",
+        "open_view_float",
+        r#"
+        vimcode.ui.register_view("floatview", {
+            render = function()
+                return { fields = { { type = "label", id = "hdr", label = "hi" } } }
+            end,
+        })
+        vimcode.command("OpenFloat", function()
+            vimcode.ui.open_view("floatview", {
+                location = "float",
+                anchor = { type = "cell", row = 0, col = 0 },
+            })
+        end)
+        vimcode.command("CloseFloat", function()
+            local closed = vimcode.ui.close_view("floatview")
+            vimcode.message("closed:" .. tostring(closed))
+        end)
+        "#,
+    );
+
+    exec(&mut e, "OpenFloat");
+    exec(&mut e, "CloseFloat");
+    assert_eq!(
+        e.message, "closed:true",
+        "close_view must report true for a view that open_view just opened \
+         as a float, got {:?}",
+        e.message
+    );
+
+    exec(&mut e, "CloseFloat");
+    assert_eq!(
+        e.message, "closed:false",
+        "a second close_view must report false once the float is already \
+         closed, got {:?}",
+        e.message
+    );
+}
+
+/// `vimcode.ui.open_view(name, {location = "float"})` with no `anchor`
+/// key is a Lua error rather than a silent no-op, matching every other
+/// `open_view` validation failure's "fail loudly at the Lua/Rust
+/// boundary" convention (`register_view`'s own doc names it).
+#[test]
+fn plugin_open_view_float_without_an_anchor_errors() {
+    let mut e = engine_with_plugin(
+        "",
+        "open_view_float_no_anchor",
+        r#"
+        vimcode.ui.register_view("floatview", {
+            render = function()
+                return { fields = { { type = "label", id = "hdr", label = "hi" } } }
+            end,
+        })
+        vimcode.command("OpenFloatNoAnchor", function()
+            local ok, err = pcall(vimcode.ui.open_view, "floatview", { location = "float" })
+            vimcode.message(tostring(ok) .. "|" .. tostring(err))
+        end)
+        "#,
+    );
+
+    exec(&mut e, "OpenFloatNoAnchor");
+    assert!(
+        e.message.starts_with("false|"),
+        "location = \"float\" with no anchor must error (pcall ok=false), got {:?}",
+        e.message
+    );
+    assert!(
+        e.message.contains("anchor"),
+        "the error must name the missing `anchor` key, got {:?}",
+        e.message
+    );
+}
