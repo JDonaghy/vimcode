@@ -1,5 +1,6 @@
 use super::*;
 use crate::core::engine::PluginViewHost;
+use crate::core::plugin_ui::{PluginViewFloatAnchor, PluginViewFloatEdge};
 
 // ─── Plugin-declared UI views ───────────────────────────────────────────────
 
@@ -1033,6 +1034,284 @@ pub fn paint_plugin_view_modal(
             Some(_) => {}
         }
     });
+}
+
+// ─── Floating views (`location = "float"`) ──────────────────────────────────
+//
+// `Engine::plugin_views_float` only records *that* a view is a declared
+// float and *where* it's anchored (`PluginViewFloatSpec`) — turning that
+// into an on-screen box each frame is quadraui's `Float`/`Anchor`/
+// `FloatMeasure` primitives plus `crate::ModalStack`, wired up here. Unlike
+// the dock/modal's single reusable slot, any number of distinctly-named
+// floats may be open at once, so every function below is driven by a
+// `name`, not a single `Engine` field.
+
+/// The `quadraui::ModalStack`/`Backend::draw_float` id for the float named
+/// `name` — distinct per view name (unlike the dock/modal's one shared id)
+/// so two simultaneously-open floats get independently poppable stack
+/// entries. [`plugin_view_float_name_from_widget_id`] is the inverse.
+fn plugin_view_float_widget_id(name: &str) -> quadraui::WidgetId {
+    quadraui::WidgetId::new(format!("plugin_view_float:{name}"))
+}
+
+/// Recover the view name a [`plugin_view_float_widget_id`] id was built
+/// from, or `None` when `id` wasn't one (e.g. a dialog or palette's own
+/// id) — tells a stale float's `ModalStack` entry apart from every other
+/// kind of entry the stack might be holding.
+fn plugin_view_float_name_from_widget_id(id: &quadraui::WidgetId) -> Option<&'static str> {
+    id.as_str().strip_prefix("plugin_view_float:")
+}
+
+/// Resolve a declared float's [`PluginViewFloatAnchor`] into a quadraui
+/// [`quadraui::Anchor`], against the active window's live screen geometry.
+///
+/// `win_origin`/`cw`/`lh` are the same inputs
+/// `render::editor_popup_anchors` takes: the active window's own top-left
+/// in the caller's native units, and the caller's char-width/line-height.
+/// `cursor_point` is the active window's own cursor cell — the same point
+/// `editor_popup_anchors` resolves for the completion popup — `None` when
+/// there is no active window/cursor, in which case a `Cursor`-anchored
+/// float falls back to `win_origin` (or the origin, absent even that)
+/// rather than vanishing. `win_rect` is the active window's whole content
+/// rect, needed only for `WindowEdge`.
+///
+/// `WindowEdge` resolves to a zero-thickness line laid *on* that edge, with
+/// the opposite [`Side`](quadraui::Side) as its preference, so the box
+/// extends inward from the edge into the window — a sticky-header-style
+/// placement — rather than outward past it (which `Anchor::resolve`'s own
+/// flip-on-overflow would immediately correct anyway, since the window's
+/// edge coincides with the viewport's edge far more often than not).
+fn resolve_plugin_view_float_anchor(
+    anchor: &PluginViewFloatAnchor,
+    win_origin: Option<(f32, f32)>,
+    win_rect: Option<quadraui::Rect>,
+    cursor_point: Option<(f32, f32)>,
+    cw: f32,
+    lh: f32,
+) -> quadraui::Anchor {
+    match *anchor {
+        PluginViewFloatAnchor::Cursor { dx, dy } => {
+            let (x, y) = cursor_point.or(win_origin).unwrap_or((0.0, 0.0));
+            quadraui::Anchor::at_point(quadraui::Point::new(x + dx as f32 * cw, y + dy as f32 * lh))
+        }
+        PluginViewFloatAnchor::Cell { row, col } => {
+            let (wx, wy) = win_origin.unwrap_or((0.0, 0.0));
+            quadraui::Anchor::at_point(quadraui::Point::new(
+                wx + col as f32 * cw,
+                wy + row as f32 * lh,
+            ))
+        }
+        PluginViewFloatAnchor::WindowEdge { edge } => {
+            let rect = win_rect.unwrap_or_default();
+            let (edge_rect, side) = match edge {
+                PluginViewFloatEdge::Top => (
+                    quadraui::Rect::new(rect.x, rect.y, rect.width, 0.0),
+                    quadraui::Side::Bottom,
+                ),
+                PluginViewFloatEdge::Bottom => (
+                    quadraui::Rect::new(rect.x, rect.y + rect.height, rect.width, 0.0),
+                    quadraui::Side::Top,
+                ),
+                PluginViewFloatEdge::Left => (
+                    quadraui::Rect::new(rect.x, rect.y, 0.0, rect.height),
+                    quadraui::Side::Right,
+                ),
+                PluginViewFloatEdge::Right => (
+                    quadraui::Rect::new(rect.x + rect.width, rect.y, 0.0, rect.height),
+                    quadraui::Side::Left,
+                ),
+            };
+            quadraui::Anchor::new(edge_rect, side)
+        }
+    }
+}
+
+/// `name`'s float box size: a fixed 30-column width and a height sized to
+/// its field count when it's the field-stack `Form` default (clamped to
+/// `[1, 10]` rows), or a flat 6-row default for every single-widget body
+/// kind — none of which have a declared size hint in the Lua API yet, the
+/// same "accepted, not yet wired" precedent `paint_plugin_view_modal`
+/// follows for the body kinds it doesn't paint at all. `+2` budgets the
+/// border rows [`quadraui::Float::layout`] insets for, matching
+/// `examples/common/float_app.rs`'s own `N content lines + 2 border rows`
+/// convention.
+fn plugin_view_float_measure(
+    engine: &Engine,
+    name: &str,
+    cw: f32,
+    lh: f32,
+) -> quadraui::FloatMeasure {
+    let rows = engine
+        .plugin_views
+        .get(name)
+        .map(|v| match v.body.as_ref() {
+            None => v.fields.len().max(1),
+            Some(_) => 6,
+        })
+        .unwrap_or(1)
+        .clamp(1, 10);
+    let width = (30.0 * cw).round();
+    let height = ((rows as f32) + 2.0) * lh;
+    quadraui::FloatMeasure::new(width, height)
+}
+
+/// Populate `Engine::plugin_view_float_form_controller` from the named
+/// plugin view — the float twin of
+/// [`populate_plugin_view_modal_form_controller`]. A float never holds
+/// keyboard focus today (`PluginViewHost::Float`'s doc), so `has_focus` is
+/// always `false`.
+///
+/// Returns `false` when `name` isn't a registered view.
+fn populate_plugin_view_float_form_controller(engine: &Engine, name: &str) -> bool {
+    let Some(view) = engine.plugin_views.get(name) else {
+        return false;
+    };
+    let form = plugin_view_to_form_with_row_focus(
+        name,
+        view,
+        engine.plugin_view_selected(PluginViewHost::Float),
+        engine.plugin_view_scroll_top(PluginViewHost::Float),
+        false,
+        engine.plugin_view_text_edit.as_ref(),
+        engine.plugin_view_combo_edit.as_ref(),
+        engine.plugin_view_row_focus(PluginViewHost::Float),
+        engine.plugin_view_number_edit.as_ref(),
+    );
+    let mut fc = engine.plugin_view_float_form_controller.borrow_mut();
+    fc.set_form(form);
+    fc.set_scroll_offset(0);
+    fc.set_has_focus(false);
+    true
+}
+
+/// Paint `name`'s own content into `content_bounds` —
+/// [`quadraui::FloatLayout::content_bounds`], after the caller has already
+/// painted the float's chrome via `Backend::draw_float`. Only the
+/// field-stack `Form` default and the `TextView` body kind paint anything;
+/// every other body kind has no float-hosted layout cache yet, the same
+/// "accepted, not yet wired" precedent `paint_plugin_view_modal` follows
+/// for the modal host.
+fn paint_plugin_view_float_content(
+    engine: &Engine,
+    name: &str,
+    content_bounds: quadraui::Rect,
+    backend: &mut dyn quadraui::Backend,
+) {
+    let kind = engine
+        .plugin_views
+        .get(name)
+        .and_then(|v| v.body.as_ref())
+        .map(|b| b.kind_name());
+    match kind {
+        None => {
+            if populate_plugin_view_float_form_controller(engine, name) {
+                engine
+                    .plugin_view_float_form_controller
+                    .borrow_mut()
+                    .render_and_cache(backend, content_bounds);
+            }
+        }
+        Some("text_view") => {
+            paint_plugin_view_text(
+                engine,
+                name,
+                PluginViewHost::Float,
+                false,
+                content_bounds,
+                backend,
+            );
+        }
+        Some(_) => {}
+    }
+}
+
+/// The active window's live screen geometry, in the caller's native units
+/// — everything [`resolve_plugin_view_float_anchor`] needs, bundled so
+/// [`paint_plugin_view_floats`] takes one argument for it instead of five.
+/// Mirrors `render::PopupAnchor`'s own "bundle the caller's resolved
+/// geometry, don't make the callee re-derive it" shape.
+pub struct PluginViewFloatGeometry {
+    /// The active window's own top-left, in the caller's unit scale —
+    /// `None` when there's no active window.
+    pub win_origin: Option<(f32, f32)>,
+    /// The active window's whole content rect — `None` alongside
+    /// `win_origin`.
+    pub win_rect: Option<quadraui::Rect>,
+    /// The active window's cursor cell — the same point
+    /// `render::editor_popup_anchors` resolves for the completion popup.
+    pub cursor_point: Option<(f32, f32)>,
+    pub cw: f32,
+    pub lh: f32,
+}
+
+/// Reconcile every open `location = "float"` view's `quadraui::ModalStack`
+/// entry and paint it, for one frame.
+///
+/// Called unconditionally, once per frame, from the shared `src/app/`
+/// layer — never gated behind "is any float open", so a float that closed
+/// this frame still gets popped. `geometry` is the active window's live
+/// geometry (see [`resolve_plugin_view_float_anchor`]'s doc); `viewport`
+/// is the whole screen box [`quadraui::Float::layout`] clamps into,
+/// matching `examples/common/float_app.rs`'s own floats.
+///
+/// A float's `ModalStack` entry is popped the frame it disappears from
+/// `Engine::plugin_views_float` (an open/close transition), by diffing the
+/// stack's own [`plugin_view_float_widget_id`]-prefixed entries against
+/// the map rather than caching an "already open" name set separately on
+/// `App`. Every *currently* open float is (re-)pushed every frame — safe
+/// because `ModalStack::push_float` dedupes on id, the same "push every
+/// frame it's open is safe" convention `App::reconcile_editor_hover_modal`
+/// already relies on — so a moving cursor-anchored float's registered
+/// bounds never drift from what this call paints.
+pub fn paint_plugin_view_floats(
+    engine: &Engine,
+    backend: &mut dyn quadraui::Backend,
+    viewport: quadraui::Rect,
+    geometry: &PluginViewFloatGeometry,
+) {
+    let stack_rc = backend.modal_stack_handle();
+    {
+        let mut stack = stack_rc.borrow_mut();
+        let stale: Vec<quadraui::WidgetId> = stack
+            .iter_top_down()
+            .map(|e| e.id)
+            .filter(|id| {
+                plugin_view_float_name_from_widget_id(id)
+                    .map(|name| !engine.plugin_views_float.contains_key(name))
+                    .unwrap_or(false)
+            })
+            .collect();
+        for id in stale {
+            stack.pop(&id);
+        }
+    }
+
+    // Deterministic paint/z-order across runs: `HashMap` iteration order
+    // is not stable, and two floats could legitimately overlap.
+    let mut names: Vec<&String> = engine.plugin_views_float.keys().collect();
+    names.sort();
+
+    for name in names {
+        let Some(spec) = engine.plugin_views_float.get(name.as_str()) else {
+            continue;
+        };
+        let anchor = resolve_plugin_view_float_anchor(
+            &spec.anchor,
+            geometry.win_origin,
+            geometry.win_rect,
+            geometry.cursor_point,
+            geometry.cw,
+            geometry.lh,
+        );
+        let mut float = quadraui::Float::new(plugin_view_float_widget_id(name), anchor);
+        float.focusable = spec.focusable;
+        float.border = spec.border;
+        let measure = plugin_view_float_measure(engine, name, geometry.cw, geometry.lh);
+        let layout = float.layout(viewport, measure);
+        stack_rc.borrow_mut().push_float(&float, layout.bounds);
+        backend.draw_float(&float, &layout);
+        paint_plugin_view_float_content(engine, name, layout.content_bounds, backend);
+    }
 }
 
 /// Route a left press at `position` while the plugin-view modal is open.

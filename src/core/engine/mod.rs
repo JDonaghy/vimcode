@@ -5177,6 +5177,18 @@ pub struct Engine {
     /// `Engine::close_plugin_view_float` and by `Engine::close_plugin_view`
     /// when its `name` argument matches.
     pub(crate) plugin_views_float: HashMap<String, crate::core::plugin_ui::PluginViewFloatSpec>,
+    /// The `quadraui::FormController` a `location = "float"` view's
+    /// field-stack `Form` default is painted through — the float twin of
+    /// `plugin_view_modal_form_controller`. Any number of floats may be
+    /// open at once (`Self::plugin_views_float`'s doc), but they paint
+    /// sequentially within one frame, so one shared, repeatedly-repopulated
+    /// controller is enough: the same "one long-lived object reused by
+    /// whichever view is current" precedent `plugin_view_tab_form_controller`
+    /// already relies on for simultaneously-visible tab windows. A float
+    /// never holds keyboard focus today (`PluginViewHost::Float`'s doc), so
+    /// nothing reads this controller's cached click-routing geometry back —
+    /// only its paint output is observed.
+    pub plugin_view_float_form_controller: std::cell::RefCell<quadraui::FormController>,
     /// Per-panel section expanded state.
     pub ext_panel_sections_expanded: HashMap<String, Vec<bool>>,
     /// Per-panel tree item expand state: (panel_name, item_id) → expanded.
@@ -6065,6 +6077,9 @@ impl Engine {
             plugin_view_modal_row_focus: 0,
             plugin_view_modal_prev_focus: None,
             plugin_views_float: HashMap::new(),
+            plugin_view_float_form_controller: std::cell::RefCell::new(
+                quadraui::FormController::new("plugin-view-float".to_string()),
+            ),
             ext_panel_sections_expanded: HashMap::new(),
             ext_panel_tree_expanded: HashMap::new(),
             ext_panel_input_text: HashMap::new(),
