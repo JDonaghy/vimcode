@@ -431,3 +431,53 @@ fn test_swap_no_recovery_when_content_matches_disk() {
     let _ = fs::remove_file(&swap_path);
     let _ = fs::remove_file(&path);
 }
+
+/// A UTF-8 BOM'd file that was never touched must not be offered for
+/// recovery, even though the stale swap's content (captured from the
+/// in-memory buffer, which never carries a BOM — `read_file_to_string`
+/// strips it on load) is byte-for-byte different from the *raw* file on
+/// disk, which still has its BOM.
+///
+/// **Verified RED against unfixed `develop`:** with the comparison in
+/// `Engine::swap_check_on_open` reverted to a plain `std::fs::read_to_string`
+/// of the file (no BOM stripping), this test's `dialog.is_none()` assertion
+/// fails — a BOM'd file is reported as "modified" by every single
+/// crash-restart, forever, even with zero real edits. That false "swap
+/// found" noise (indistinguishable in the dialog from a file that really
+/// does have unsaved work) is what led to losing real work: a user facing
+/// several of these spurious prompts in a row clicks "Delete swap" through
+/// all of them, including the one genuine recovery in the batch.
+#[test]
+fn test_swap_no_recovery_for_unchanged_bom_file() {
+    let mut bytes = vec![0xEF, 0xBB, 0xBF]; // UTF-8 BOM
+    bytes.extend_from_slice(b"fn main() {}\n");
+    let path = std::env::temp_dir().join("vimcode_swap_test_bom.rs");
+    fs::write(&path, &bytes).unwrap();
+    let canonical_path = canonical(&path);
+    let swap_path = swap::swap_path_for(&canonical_path);
+
+    // The swap's content matches what the buffer actually holds after
+    // loading this file — BOM already stripped, same as the real engine
+    // would have written before a crash.
+    fs::create_dir_all(swap_path.parent().unwrap()).unwrap();
+    {
+        let mut f = fs::File::create(&swap_path).unwrap();
+        writeln!(f, "VIMCODE_SWAP_V1").unwrap();
+        writeln!(f, "path: {}", canonical_path.display()).unwrap();
+        writeln!(f, "pid: 999999999").unwrap(); // dead PID
+        writeln!(f, "modified: 2026-01-01T00:00:00Z").unwrap();
+        writeln!(f, "---").unwrap();
+        write!(f, "fn main() {{}}\n").unwrap();
+    }
+
+    let mut e = engine_with("");
+    e.open_file_in_tab(&path);
+
+    assert!(
+        e.dialog.is_none(),
+        "an untouched BOM'd file must not be offered for recovery"
+    );
+
+    let _ = fs::remove_file(&swap_path);
+    let _ = fs::remove_file(&path);
+}
