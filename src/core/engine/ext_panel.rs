@@ -4636,8 +4636,17 @@ impl Engine {
         }
         // PID is dead — but does the swap actually differ from the file on disk?
         // If the content is identical the buffer was never modified before the
-        // crash, so silently discard the stale swap instead of bothering the user.
-        let disk_content = std::fs::read_to_string(&file_path).unwrap_or_default();
+        // crash, so silently discard the stale swap instead of bothering the
+        // user. Must decode `file_path` the same way the buffer itself was
+        // loaded (`crate::core::buffer::read_file_to_string`, which strips a
+        // UTF-8/16 BOM and transcodes UTF-16) rather than a raw
+        // `fs::read_to_string` — the in-memory buffer (and therefore
+        // `content`, captured from it) never has a BOM, so a plain
+        // `fs::read_to_string` of a BOM'd or UTF-16 file always disagreed
+        // with `content` even when the file was never touched, offering
+        // recovery for every single untouched BOM'd/UTF-16 file on every
+        // crash-restart forever.
+        let disk_content = crate::core::buffer::read_file_to_string(&file_path).unwrap_or_default();
         if content == disk_content {
             crate::core::swap::delete_swap(&swap_path);
             self.swap_create_for_buffer(buf_id);
