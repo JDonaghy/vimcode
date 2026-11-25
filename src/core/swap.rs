@@ -369,6 +369,84 @@ fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
     (y, m, d)
 }
 
+/// GitHub repo crash reports are filed against.
+const CRASH_REPORT_REPO: &str = "JDonaghy/vimcode";
+
+/// Consume the crash log left by a previous run, if any: read its content,
+/// delete the file so a clean run never re-shows the report-crash dialog,
+/// and return the content.
+///
+/// Always returns `None` under `cfg(test)` — `crash_log_path()` is a fixed
+/// path under the OS temp dir shared with real, non-test runs on the same
+/// machine, so a developer's genuine crash log sitting there must never be
+/// silently deleted by (or leak a dialog into) a test run.
+pub fn take_crash_report() -> Option<String> {
+    if cfg!(test) {
+        return None;
+    }
+    let path = crash_log_path();
+    let content = fs::read_to_string(&path).ok()?;
+    if content.trim().is_empty() {
+        return None;
+    }
+    let _ = fs::remove_file(&path);
+    Some(content)
+}
+
+/// First `PANIC:` line of a crash report, trimmed and capped at 80 chars,
+/// for use as a GitHub issue title. Falls back to a generic summary if the
+/// report doesn't contain one (defensive only — every report written by
+/// `write_crash_log` has one).
+fn crash_report_summary(report: &str) -> String {
+    let line = report
+        .lines()
+        .find_map(|l| l.strip_prefix("PANIC:"))
+        .map(str::trim)
+        .unwrap_or("unknown panic");
+    line.chars().take(80).collect()
+}
+
+/// Percent-encode `s` for use in a URL query parameter (RFC 3986 unreserved
+/// characters pass through unescaped; everything else becomes `%XX`).
+fn percent_encode_query(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Build a `github.com/.../issues/new` URL prefilled with `report`'s
+/// content, for the crash-report dialog's "Report on GitHub" button.
+///
+/// The body is capped well under GitHub's practical URL-length limit —
+/// `report` can carry a full resolved backtrace, which for a deep call
+/// stack is easily tens of KB and would make the browser or GitHub itself
+/// silently truncate (or reject) the URL. Keeping the head, where the
+/// panic message and its originating location live, matters more than the
+/// backtrace tail, so truncation cuts there and says so.
+pub fn crash_report_issue_url(report: &str) -> String {
+    const MAX_BODY_CHARS: usize = 3000;
+    let body_text: String = if report.chars().count() > MAX_BODY_CHARS {
+        let head: String = report.chars().take(MAX_BODY_CHARS).collect();
+        format!("{head}\n…(truncated)")
+    } else {
+        report.to_string()
+    };
+    let title = format!("Crash: {}", crash_report_summary(report));
+    let body = format!("VimCode crashed on the previous run.\n\n```\n{body_text}\n```\n");
+    format!(
+        "https://github.com/{CRASH_REPORT_REPO}/issues/new?title={}&body={}",
+        percent_encode_query(&title),
+        percent_encode_query(&body)
+    )
+}
+
 /// Scan the swap directory for swap files with dead PIDs.
 pub fn find_stale_swaps() -> Vec<(SwapHeader, PathBuf)> {
     let dir = swap_dir();
@@ -394,11 +472,70 @@ pub fn find_stale_swaps() -> Vec<(SwapHeader, PathBuf)> {
 mod tests {
     use super::*;
 
+    /// `crash_log_path()` is one fixed path under the OS temp dir, shared
+    /// by every test (and every real run) on the machine — serializes the
+    /// tests below that write/remove it directly so they can't interleave
+    /// and read back each other's content.
+    static CRASH_LOG_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn test_swap_path_deterministic() {
         let p1 = swap_path_for(Path::new("/home/user/file.rs"));
         let p2 = swap_path_for(Path::new("/home/user/file.rs"));
         assert_eq!(p1, p2);
+    }
+
+    #[test]
+    fn take_crash_report_is_a_noop_under_test() {
+        let _guard = CRASH_LOG_TEST_LOCK.lock().unwrap();
+        // Guards against a dev machine's real, non-test crash log leaking
+        // a dialog into — or being deleted by — a test run.
+        let path = crash_log_path();
+        let _ = fs::write(&path, "PANIC: should never be read by a test\n");
+        assert!(take_crash_report().is_none());
+        assert!(
+            path.exists(),
+            "a test run must never delete a real crash log"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn crash_report_summary_extracts_panic_line() {
+        let report = "PANIC: index out of bounds\n  at src/foo.rs:10:1\nbacktrace:\n...\n";
+        assert_eq!(crash_report_summary(report), "index out of bounds");
+    }
+
+    #[test]
+    fn crash_report_summary_falls_back_without_a_panic_line() {
+        assert_eq!(crash_report_summary("no panic line here"), "unknown panic");
+    }
+
+    #[test]
+    fn percent_encode_query_escapes_reserved_characters() {
+        assert_eq!(percent_encode_query("a b/c=d"), "a%20b%2Fc%3Dd");
+        assert_eq!(percent_encode_query("abc-123._~"), "abc-123._~");
+    }
+
+    #[test]
+    fn crash_report_issue_url_embeds_title_and_body() {
+        let report = "PANIC: boom\n  at src/foo.rs:1:1\nbacktrace:\nframe0\n";
+        let url = crash_report_issue_url(report);
+        assert!(url.starts_with("https://github.com/JDonaghy/vimcode/issues/new?title="));
+        assert!(url.contains("Crash%3A%20boom"));
+        assert!(url.contains("frame0"));
+    }
+
+    #[test]
+    fn crash_report_issue_url_truncates_long_reports() {
+        let huge = "PANIC: boom\n".to_string() + &"x".repeat(10_000);
+        let url = crash_report_issue_url(&huge);
+        // 8KB is the rough practical ceiling browsers/GitHub tolerate for
+        // a GET URL; this report alone is well past that unencoded, so the
+        // encoded URL must stay far under it rather than growing with the
+        // backtrace.
+        assert!(url.len() < 8_000, "url was {} bytes", url.len());
+        assert!(url.contains("truncated"));
     }
 
     #[test]
@@ -421,6 +558,7 @@ mod tests {
     /// `contains("FIRST")` assertion fails.
     #[test]
     fn append_to_crash_log_appends_rather_than_truncates() {
+        let _guard = CRASH_LOG_TEST_LOCK.lock().unwrap();
         let path = crash_log_path();
         let _ = fs::remove_file(&path);
 

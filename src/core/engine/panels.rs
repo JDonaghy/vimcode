@@ -594,6 +594,16 @@ impl Engine {
                 self.handle_file_watcher_action(action);
                 EngineAction::None
             }
+            "crash_report" => {
+                if action == "report" {
+                    if let Some(report) = self.pending_crash_report.take() {
+                        self.open_url(&crate::core::swap::crash_report_issue_url(&report));
+                    }
+                } else {
+                    self.pending_crash_report = None;
+                }
+                EngineAction::None
+            }
             "acp_permission" => {
                 // The one function that turns a dialog
                 // dismissal into the ACP reply. `dialog_click_button`/
@@ -813,6 +823,44 @@ impl Engine {
         // Also scan the swap directory for orphaned swaps (files that
         // aren't in the restored session).
         self.swap_scan_stale();
+    }
+
+    /// If the previous run left a crash log, show a dialog offering to file
+    /// it as a GitHub issue. Called once from `Engine::startup_inner` — see
+    /// that function's `offer_crash_report_if_pending` call for why it's
+    /// gated on `load_ambient_state` the same way `plugin_init`/
+    /// `ext_refresh_quiet` are.
+    ///
+    /// `swap_check_all_buffers`/`swap_scan_stale` (run earlier in the same
+    /// startup, via `restore_session_files`) already recovered any unsaved
+    /// buffer content into swap files, so this dialog is purely about
+    /// reporting the crash itself — it does not touch swap recovery state.
+    pub fn offer_crash_report_if_pending(&mut self) {
+        let Some(report) = crate::core::swap::take_crash_report() else {
+            return;
+        };
+        self.pending_crash_report = Some(report);
+        self.show_dialog(
+            "crash_report",
+            "VimCode Crashed Last Time",
+            vec![
+                "VimCode didn't exit cleanly on its last run.".to_string(),
+                "Any unsaved changes were recovered from swap files.".to_string(),
+                "Report this crash on GitHub?".to_string(),
+            ],
+            vec![
+                DialogButton {
+                    label: "Report on GitHub".to_string(),
+                    hotkey: 'r',
+                    action: "report".to_string(),
+                },
+                DialogButton {
+                    label: "Dismiss".to_string(),
+                    hotkey: 'd',
+                    action: "dismiss".to_string(),
+                },
+            ],
+        );
     }
 
     /// Re-check open buffers for stale swaps after a recovery dialog is dismissed.
