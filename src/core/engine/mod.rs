@@ -4827,6 +4827,10 @@ pub struct Engine {
     swap_last_write: std::time::Instant,
     /// Pending swap recovery data (used by the dialog system).
     pub pending_swap_recovery: Option<SwapRecovery>,
+    /// Full text of the previous run's crash log, held between
+    /// `Engine::offer_crash_report_if_pending` showing the `"crash_report"`
+    /// dialog and `process_dialog_result` acting on the user's choice.
+    pub pending_crash_report: Option<String>,
     /// Modal dialog displayed over the editor.
     pub dialog: Option<Dialog>,
 
@@ -6018,6 +6022,7 @@ impl Engine {
             swap_write_needed: HashSet::new(),
             swap_last_write: std::time::Instant::now(),
             pending_swap_recovery: None,
+            pending_crash_report: None,
             dialog: None,
             spell_checker: None,
             spell_suggestions: None,
@@ -6411,6 +6416,9 @@ impl Engine {
             }
         } else if restore_session {
             self.restore_session_files();
+        }
+        if load_ambient_state {
+            self.offer_crash_report_if_pending();
         }
     }
 

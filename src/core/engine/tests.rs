@@ -20703,6 +20703,71 @@ fn test_reveal_in_file_manager_queues_platform_action() {
     );
 }
 
+/// Clicking "Report on GitHub" on the `"crash_report"` dialog must queue the
+/// crash's GitHub issue URL as a platform action rather than opening nothing
+/// — the actual disk-backed trigger for this dialog
+/// (`Engine::offer_crash_report_if_pending`, reading a real crash log) is
+/// covered end-to-end by `tests/crash_report.rs`; this exercises the button
+/// handler in isolation, with no filesystem involved, the same way the
+/// `open_url`/`reveal_in_file_manager` tests above do.
+#[test]
+fn crash_report_dialog_report_button_queues_github_issue_url() {
+    let mut e = engine_with_text("hello\n");
+    let report = "PANIC: kaboom\n  at src/foo.rs:1:1\nbacktrace:\nframe0\n";
+    e.pending_crash_report = Some(report.to_string());
+    e.show_dialog(
+        "crash_report",
+        "VimCode Crashed Last Time",
+        vec!["Report this crash on GitHub?".to_string()],
+        vec![
+            DialogButton {
+                label: "Report on GitHub".to_string(),
+                hotkey: 'r',
+                action: "report".to_string(),
+            },
+            DialogButton {
+                label: "Dismiss".to_string(),
+                hotkey: 'd',
+                action: "dismiss".to_string(),
+            },
+        ],
+    );
+
+    e.dialog_click_button(0);
+
+    assert!(e.dialog.is_none());
+    assert!(e.pending_crash_report.is_none());
+    assert_eq!(
+        e.pending_platform_actions,
+        vec![PendingPlatformAction::OpenUrl(
+            crate::core::swap::crash_report_issue_url(report)
+        )]
+    );
+}
+
+/// Dismissing the dialog must clear the pending report without queuing
+/// anything to open.
+#[test]
+fn crash_report_dialog_dismiss_queues_nothing() {
+    let mut e = engine_with_text("hello\n");
+    e.pending_crash_report = Some("PANIC: kaboom\n".to_string());
+    e.show_dialog(
+        "crash_report",
+        "VimCode Crashed Last Time",
+        vec!["Report this crash on GitHub?".to_string()],
+        vec![DialogButton {
+            label: "Dismiss".to_string(),
+            hotkey: 'd',
+            action: "dismiss".to_string(),
+        }],
+    );
+
+    e.dialog_click_button(0);
+
+    assert!(e.pending_crash_report.is_none());
+    assert!(e.pending_platform_actions.is_empty());
+}
+
 /// Exercises the editor-action-menu "reveal" item's real `context_menu_confirm`
 /// call site in `windows.rs` (`reveal_in_file_manager`'s 3rd of 3 in-tree
 /// callers) end-to-end, not just the method in isolation above.
