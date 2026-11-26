@@ -288,6 +288,7 @@ pub fn quadraui_tooltip(id: quadraui::WidgetId, text: impl Into<String>) -> quad
         placement: quadraui::TooltipPlacement::default(),
         bg: None,
         fg: None,
+        chrome: Default::default(),
     }
 }
 
@@ -521,6 +522,7 @@ pub fn editor_hover_to_quadraui_rich_text(
         padding: 0.0,
         fg: Some(theme.hover_fg),
         bg: Some(theme.hover_bg),
+        font_role: Default::default(),
     }
 }
 
@@ -602,7 +604,7 @@ pub fn editor_hover_popup_paint(
         ),
     };
 
-    backend.draw_rich_text_popup(&popup, &layout);
+    let _ = crate::render::draw_widget_plain(backend, layout.bounds, &popup);
 
     let link_rects: Vec<(quadraui::Rect, String)> = layout
         .link_hit_regions
@@ -824,7 +826,7 @@ pub fn paint_editor_popups(
             max_popup_height,
             |_| quadraui::CompletionItemMeasure::new(unit_h),
         );
-        backend.draw_completions(&completions, &layout);
+        let _ = crate::render::draw_widget_plain(backend, layout.bounds, &completions);
         *completion_layout_out = Some(layout);
     }
 
@@ -838,7 +840,7 @@ pub fn paint_editor_popups(
             unit_w,
             unit_h,
         );
-        backend.draw_tooltip(&tooltip, &layout);
+        let _ = crate::render::draw_widget_plain(backend, layout.bounds, &tooltip);
     }
 
     // ── Editor hover popup (rich markdown, triggered by gh or mouse dwell) ─
@@ -869,7 +871,7 @@ pub fn paint_editor_popups(
             unit_w,
             unit_h,
         );
-        backend.draw_tooltip(&tooltip, &layout);
+        let _ = crate::render::draw_widget_plain(backend, layout.bounds, &tooltip);
     }
 
     // ── Signature-help popup (shown in insert mode when cursor is inside a call) ─
@@ -883,7 +885,7 @@ pub fn paint_editor_popups(
             unit_w,
             unit_h,
         );
-        backend.draw_tooltip(&tooltip, &layout);
+        let _ = crate::render::draw_widget_plain(backend, layout.bounds, &tooltip);
     }
 }
 

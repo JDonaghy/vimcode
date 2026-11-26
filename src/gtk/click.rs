@@ -604,10 +604,9 @@ mod frame_hit_map_tests {
         for (next_surface_idx, target) in (window_editors.len()..).zip(
             render_mod::tab_bar_draw_targets(engine, &screen, tab_row_h, tab_bar_h),
         ) {
-            hit_frame.push(Surface::TabBar {
+            hit_frame.push(Surface::Widget {
                 rect: target.rect,
-                bar: target.bar.clone(),
-                hovered_close: None,
+                widget: Box::new(target.bar.clone()),
             });
             tab_bar_zones.insert(next_surface_idx, (target.group_id, target.rect));
         }

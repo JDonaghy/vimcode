@@ -710,6 +710,28 @@ pub fn populate_plugin_view_modal_form_controller(engine: &Engine, name: &str) -
     true
 }
 
+/// The filtered options of an open `combo` as the `Completions` list its
+/// dropdown paints as, highlight included.
+fn combo_dropdown_completions(combo: &quadraui::ComboBox) -> quadraui::Completions {
+    quadraui::Completions {
+        id: combo.dropdown_id(),
+        items: combo
+            .filtered_indices()
+            .into_iter()
+            .map(|i| quadraui::CompletionItem {
+                label: quadraui::StyledText::plain(combo.options[i].clone()),
+                detail: None,
+                documentation: None,
+                kind: quadraui::CompletionKind::Text,
+                icon: None,
+            })
+            .collect(),
+        selected_idx: combo.highlighted.unwrap_or(0),
+        scroll_offset: 0,
+        has_focus: combo.focused,
+    }
+}
+
 /// Paint the open `combo_box` field's filtered dropdown as an overlay on
 /// top of whichever host just painted its compact row via
 /// `FormController::render_and_cache` — see EXTENSIONS.md's `combo_box`
@@ -802,26 +824,27 @@ pub(crate) fn paint_plugin_view_combo_box_dropdown(
     // the actual popup height to the filtered item count itself, same as
     // `paint_editor_popups`'s completion-menu sizing.
     let max_popup_height = (lh * (filtered_count as f32 + 0.5)).min(rect.height.max(lh));
-    let layout = combo.layout(
-        field_bounds,
+    let completions = combo_dropdown_completions(&combo);
+    let dropdown = completions.layout(
+        field_bounds.x,
+        field_bounds.y,
+        field_bounds.height,
         rect,
         field_bounds.width,
         max_popup_height,
         |_| quadraui::CompletionItemMeasure::new(lh),
     );
-    // `draw_combo_box` paints the field row itself before the dropdown
-    // (`tui::combo_box::draw_combo_box` /
-    // `primitives::combo_box::native_surface_paint::paint`, both gated on
-    // `field.width > 0.0 && field.height > 0.0`), but the field row was
-    // already painted by `FormController::render_and_cache` just before this
-    // call — repainting it here would overwrite that row's label with the
-    // field-only rendering. Hand the rasteriser a zero-sized `field_bounds`
-    // so it skips the field and paints only the dropdown, while caching the
-    // real `layout` (with the real `field_bounds`) for anchoring and for
-    // `route_plugin_view_combo_box_dropdown_click`'s hit-testing.
-    let mut paint_layout = layout.clone();
-    paint_layout.field_bounds = quadraui::Rect::new(field_bounds.x, field_bounds.y, 0.0, 0.0);
-    backend.draw_combo_box(&combo, &paint_layout);
+    // The field row itself was already painted by
+    // `FormController::render_and_cache` just before this call, so only
+    // the dropdown paints here.
+    // TODO(#2175): paint through the ComboBox widget's own popup; its
+    // dropdown content widget is private to quadraui, so the filtered
+    // options paint as a `Completions` list in the meantime.
+    let _ = crate::render::draw_widget_plain(backend, dropdown.bounds, &completions);
+    let layout = crate::core::plugin_ui::ComboDropdownLayout {
+        field_bounds,
+        dropdown,
+    };
     engine.plugin_view_combo_dropdown_layout.replace(Some((
         view_name.to_string(),
         field.id.clone(),
@@ -882,7 +905,7 @@ pub(crate) fn route_plugin_view_combo_box_dropdown_click(
         return false;
     };
     match layout.hit_test(position) {
-        quadraui::ComboBoxHit::DropdownItem(idx) => {
+        crate::core::plugin_ui::ComboDropdownHit::DropdownItem(idx) => {
             let edit = engine
                 .plugin_view_combo_edit
                 .clone()
@@ -898,15 +921,13 @@ pub(crate) fn route_plugin_view_combo_box_dropdown_click(
                 return false;
             };
             // Resolve the filtered-list `idx` back to a committed value
-            // through the real primitive's own `click` rather than
+            // through the real primitive's own `pick` rather than
             // re-deriving `filtered_indices` by hand here — the same
             // "call into the primitive" contract
             // `paint_plugin_view_combo_box_dropdown` follows for `layout`.
             let mut combo = quadraui::ComboBox::new(quadraui::WidgetId::new(""), options.clone());
             combo.text = edit.text.clone();
-            let Some(quadraui::ComboBoxEvent::Committed { value, .. }) =
-                combo.click(quadraui::ComboBoxHit::DropdownItem(idx))
-            else {
+            let Some(quadraui::ComboBoxEvent::Committed { value, .. }) = combo.pick(idx) else {
                 return false;
             };
             engine.plugin_view_combo_edit = None;
@@ -918,8 +939,8 @@ pub(crate) fn route_plugin_view_combo_box_dropdown_click(
             });
             true
         }
-        quadraui::ComboBoxHit::Field => false,
-        quadraui::ComboBoxHit::Outside => {
+        crate::core::plugin_ui::ComboDropdownHit::Field => false,
+        crate::core::plugin_ui::ComboDropdownHit::Outside => {
             engine.plugin_view_combo_edit = None;
             engine.plugin_view_combo_dropdown_layout.replace(None);
             true
@@ -1571,7 +1592,7 @@ pub fn paint_plugin_view_floats(
         let measure = plugin_view_float_measure(engine, name, geometry.cw, geometry.lh);
         let layout = float.layout(viewport, measure);
         stack_rc.borrow_mut().push_float(&float, layout.bounds);
-        backend.draw_float(&float, &layout);
+        let _ = crate::render::draw_widget_plain(backend, layout.bounds, &float);
         paint_plugin_view_float_content(engine, name, layout.content_bounds, backend);
     }
 }
@@ -2789,7 +2810,12 @@ mod button_style_translation_tests {
 
         let width = 40u16;
         let mut buf = Buffer::empty(Rect::new(0, 0, width, 2));
-        quadraui::tui::draw_form(&mut buf, Rect::new(0, 0, width, 2), &form, &theme);
+        quadraui::primitives::form::cell_paint::draw_form(
+            &mut buf,
+            Rect::new(0, 0, width, 2),
+            &form,
+            &theme,
+        );
 
         let danger_row = row_string(&buf, 0, width);
         let danger_bracket = danger_row
@@ -2848,7 +2874,12 @@ mod button_style_translation_tests {
         let width = 40u16;
         let mut buf = Buffer::empty(Rect::new(0, 0, width, 1));
         let theme = quadraui::Theme::default();
-        quadraui::tui::draw_form(&mut buf, Rect::new(0, 0, width, 1), &form, &theme);
+        quadraui::primitives::form::cell_paint::draw_form(
+            &mut buf,
+            Rect::new(0, 0, width, 1),
+            &form,
+            &theme,
+        );
         let row = row_string(&buf, 0, width);
         assert!(
             row.contains("< Go >"),
@@ -2885,7 +2916,12 @@ mod button_style_translation_tests {
         let width = 40u16;
         let mut buf = Buffer::empty(Rect::new(0, 0, width, 1));
         let theme = quadraui::Theme::default();
-        quadraui::tui::draw_form(&mut buf, Rect::new(0, 0, width, 1), &form, &theme);
+        quadraui::primitives::form::cell_paint::draw_form(
+            &mut buf,
+            Rect::new(0, 0, width, 1),
+            &form,
+            &theme,
+        );
         let row = row_string(&buf, 0, width);
         assert!(
             row.contains("< Go >"),
@@ -2936,7 +2972,12 @@ mod layout_knob_translation_tests {
         let form = plugin_view_to_form("myview", view, 0, 0, false, None);
         let area = Rect::new(0, 0, width, height);
         let mut buf = Buffer::empty(area);
-        quadraui::tui::draw_form(&mut buf, area, &form, &quadraui::Theme::default());
+        quadraui::primitives::form::cell_paint::draw_form(
+            &mut buf,
+            area,
+            &form,
+            &quadraui::Theme::default(),
+        );
         buf
     }
 
@@ -3571,7 +3612,12 @@ mod layout_container_painted_tests {
         let form = plugin_view_to_form("myview", view, 0, 0, false, None);
         let area = Rect::new(0, 0, width, height);
         let mut buf = Buffer::empty(area);
-        quadraui::tui::draw_form(&mut buf, area, &form, &quadraui::Theme::default());
+        quadraui::primitives::form::cell_paint::draw_form(
+            &mut buf,
+            area,
+            &form,
+            &quadraui::Theme::default(),
+        );
         buf
     }
 

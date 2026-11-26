@@ -77,6 +77,7 @@ pub fn command_line_click_char_idx(
         text: text.to_string(),
         cursor_offset: None,
         right_align: false,
+        selection: None,
     };
     let layout = cmd.layout(rect, quadraui::CommandLineMeasure::new(char_width));
     Some(command_line_byte_to_char_idx(

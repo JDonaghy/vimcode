@@ -393,7 +393,7 @@ pub fn paint_wildmenu_rung(
     rect: quadraui::Rect,
 ) {
     let bar = wildmenu_to_status_bar(wm, theme);
-    let _ = b.draw_status_bar_interactive(rect, &bar, &quadraui::InteractionState::new());
+    let _ = crate::render::draw_status_bar(b, rect, &bar, &quadraui::InteractionState::new());
 }
 
 /// The [`FrameOp::StatusBar`] (global status line) rung's whole body on both
@@ -408,8 +408,8 @@ pub fn paint_global_status_bar_rung(
     rect: quadraui::Rect,
 ) -> quadraui::StatusBarLayout {
     engine.global_status_rect.set(rect);
-    let _ = b.draw_status_bar_interactive(rect, bar, &quadraui::InteractionState::new());
-    b.status_bar_layout(rect, bar)
+    let _ = crate::render::draw_status_bar(b, rect, bar, &quadraui::InteractionState::new());
+    crate::render::status_bar_layout(b, rect, bar)
 }
 
 /// The [`FrameOp::FindReplace`] rung's whole body on both backends.
@@ -436,7 +436,7 @@ pub fn paint_command_center_rung(
     rect: quadraui::Rect,
     cc: &quadraui::CommandCenter,
 ) {
-    let layout = b.draw_command_center(rect, cc);
+    let layout = crate::render::draw_widget_plain(b, rect, cc);
     engine.command_center_layout.replace(Some(layout));
 }
 
@@ -528,7 +528,7 @@ pub fn paint_picker_rung(
     let geo = PickerGeometry::compute(viewport, picker.items.len(), has_preview, sizing);
     let palette = picker_panel_to_palette(picker, theme);
     let rect = quadraui::Rect::new(geo.popup_x, geo.popup_y, geo.popup_w, geo.popup_h);
-    b.draw_palette(rect, &palette);
+    let _ = crate::render::draw_widget_plain(b, rect, &palette);
     rect
 }
 
@@ -644,14 +644,16 @@ pub fn paint_context_menu_rung(
     line_height: f64,
     border_chrome_inset: f64,
 ) -> quadraui::ContextMenuLayout {
+    let row_heights = crate::render::context_menu_row_heights(b);
     let (menu, layout) = context_menu_generic_layout(
         panel,
         viewport,
         char_width,
         line_height,
         border_chrome_inset,
+        row_heights,
     );
-    let _ = b.draw_context_menu(&menu, &layout);
+    crate::render::draw_context_menu(b, &menu, &layout);
     layout
 }
 
@@ -666,9 +668,8 @@ pub fn paint_dialog_rung(
     char_width: f64,
     line_height: f64,
 ) -> quadraui::DialogLayout {
-    let (dialog, layout) = dialog_generic_layout(panel, viewport, char_width, line_height);
-    let _ = b.draw_dialog(&dialog, &layout);
-    layout
+    let (dialog, _) = dialog_generic_layout(panel, viewport, char_width, line_height);
+    crate::render::draw_dialog(b, viewport, &dialog)
 }
 
 /// The [`FrameOp::ToastStack`] rung's whole body on both backends.
@@ -678,7 +679,7 @@ pub fn paint_toast_stack_rung(
     stack: &quadraui::ToastOverlay,
     viewport: quadraui::Rect,
 ) {
-    let layout = b.draw_toast_overlay(viewport, stack);
+    let layout = crate::render::draw_widget_plain(b, viewport, stack).layout;
     engine.toast_layout.replace(Some(layout));
 }
 
@@ -840,7 +841,8 @@ pub fn paint_change_review_rung(
         viewport.width,
         footer_h,
     );
-    let _ = b.draw_status_bar_interactive(footer_rect, &status, &quadraui::InteractionState::new());
+    let _ =
+        crate::render::draw_status_bar(b, footer_rect, &status, &quadraui::InteractionState::new());
 }
 
 /// Build the "you are editing a real branch checkout, not your own" status
@@ -946,7 +948,7 @@ pub fn measure_title_bar_bands(
     menu_bar: &quadraui::MenuBar,
     controls_bar: Option<&quadraui::StatusBar>,
 ) -> TitleBarBands {
-    let mb_layout = backend.menu_bar_layout(items, menu_bar);
+    let mb_layout = quadraui::DrawsPrimitives::layout_primitive(&*backend, items, menu_bar).layout;
     // An item-less bar still starts *after* the app-icon slot, so the
     // Command Center / window controls must not be handed the icon's real
     // estate back — hence `items.x`, not `band.x`, as the fallback.
@@ -965,8 +967,7 @@ pub fn measure_title_bar_bands(
     // buttons paint at.
     let controls_start = controls_bar
         .map(|cb| {
-            backend
-                .status_bar_layout(full, cb)
+            crate::render::status_bar_layout(backend, full, cb)
                 .visible_segments
                 .iter()
                 .map(|vs| vs.bounds.x)
@@ -1052,6 +1053,7 @@ pub fn command_line_view(command: &CommandLineData) -> quadraui::CommandLine {
             None
         },
         right_align: command.right_align,
+        selection: None,
     }
 }
 

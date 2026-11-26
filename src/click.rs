@@ -309,7 +309,7 @@ pub(crate) fn frame_zone_to_screen_zone(
     y: f64,
 ) -> ScreenZone {
     match hit_map.hit_test(x as f32, y as f32) {
-        quadraui::FrameZone::TabBar { idx } => {
+        quadraui::FrameZone::Widget { idx, .. } => {
             if let Some((group_id, rect)) = tab_bar_zones.get(&idx) {
                 return ScreenZone::TabBar {
                     group_id: *group_id,

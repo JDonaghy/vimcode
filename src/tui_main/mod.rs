@@ -73,7 +73,9 @@ pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
     let config = app.shell_config();
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        quadraui::tui::shell_runner::run_with_shell(app, config);
+        crate::app_support::exit_on_run_error(quadraui::tui::shell_runner::run_with_shell(
+            app, config,
+        ));
     }));
 
     if let Err(e) = result {

@@ -149,7 +149,7 @@ pub fn draw_debug_toolbar(b: &mut dyn quadraui::Backend, engine: &Engine, rect: 
         .debug_button_pressed
         .and_then(Engine::debug_button_id);
     let interaction = quadraui::InteractionState::from_parts(hovered, pressed);
-    let layout = b.draw_toolbar_interactive(rect, &bar, &interaction);
+    let layout = crate::render::draw_toolbar(b, rect, &bar, &interaction);
     engine.debug_toolbar_layout.replace(Some(layout));
 }
 
@@ -671,7 +671,7 @@ mod tests {
         let engine = engine_with_dap(true, Some(1u64));
         let bar = debug_toolbar(&engine);
         let area = ratatui::layout::Rect::new(0, 0, 80, 1);
-        let layout = quadraui::tui::tui_toolbar_layout(&bar, area);
+        let layout = quadraui::primitives::toolbar::cell_layout::tui_toolbar_layout(&bar, area);
 
         // Hit-test each visible_item that is clickable and assert that it
         // resolves back to its expected DEBUG_BUTTON_IDS entry.
@@ -692,6 +692,7 @@ mod tests {
                         item.bounds
                     );
                 }
+                other => panic!("clickable item hit_test returned {other:?}"),
             }
         }
     }
@@ -704,7 +705,7 @@ mod tests {
         let engine = engine_with_dap(false, None);
         let bar = debug_toolbar(&engine);
         let area = ratatui::layout::Rect::new(0, 0, 80, 1);
-        let layout = quadraui::tui::tui_toolbar_layout(&bar, area);
+        let layout = quadraui::primitives::toolbar::cell_layout::tui_toolbar_layout(&bar, area);
 
         // Every visible_item must be not clickable and hit_test must return Empty.
         for item in &layout.visible_items {

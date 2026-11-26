@@ -1149,9 +1149,9 @@ impl Engine {
     /// area, or outside the panel.
     pub fn sc_button_hit(&self, x: f32, y: f32) -> Option<usize> {
         let layout = self.sc_panel_layout.borrow();
-        match layout.as_ref()?.toolbar_layout.as_ref()?.hit_test(x, y) {
-            quadraui::ToolbarHit::Button(id) => Self::sc_button_index(&id),
-            quadraui::ToolbarHit::Empty => None,
+        match layout.as_ref()?.hit_test(x, y) {
+            quadraui::SidebarPanelHit::ToolbarButton(id) => Self::sc_button_index(&id),
+            _ => None,
         }
     }
 

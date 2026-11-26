@@ -436,3 +436,30 @@ pub(crate) static ICON_FONT_BYTES: &[u8] = include_bytes!("../data/fonts/vimcode
 )]
 pub(crate) static APP_ICON_PNG: &[u8] =
     include_bytes!("../data/icons/io.github.jdonaghy.VimCode.png");
+
+/// Map a shell runner's outcome onto the process exit status: success, the
+/// runner's own exit code, or a printed error and a failure status.
+#[cfg(any(all(feature = "macos", target_os = "macos"), feature = "win"))]
+pub(crate) fn run_outcome_exit_code(
+    outcome: Result<(), quadraui::RunError>,
+) -> std::process::ExitCode {
+    match outcome {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => std::process::Termination::report(e),
+    }
+}
+
+/// For an entry point with no exit status of its own: end the process with
+/// the runner's failure status when it reports one, after printing it.
+pub(crate) fn exit_on_run_error(outcome: Result<(), quadraui::RunError>) {
+    if let Err(e) = outcome {
+        let code = match e {
+            quadraui::RunError::Code(code) => i32::from(code),
+            other => {
+                eprintln!("error: {other}");
+                1
+            }
+        };
+        std::process::exit(code);
+    }
+}

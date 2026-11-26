@@ -1728,6 +1728,41 @@ pub struct PluginViewComboBoxEditState {
     pub highlighted: Option<usize>,
 }
 
+/// Where an open plugin-view `combo_box` dropdown painted: the field row it
+/// hangs from and the dropdown rows below (or above) it, in the host's
+/// absolute space.
+// TODO(#2175): replace with the ComboBox widget's own popup once the
+// combo field is routed through quadraui's `Interactive::popups`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComboDropdownLayout {
+    pub field_bounds: quadraui::Rect,
+    pub dropdown: quadraui::CompletionsLayout,
+}
+
+/// What a press over a [`ComboDropdownLayout`] landed on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComboDropdownHit {
+    /// The field row the dropdown hangs from.
+    Field,
+    /// A dropdown row, by index into the *filtered* option list.
+    DropdownItem(usize),
+    /// Neither.
+    Outside,
+}
+
+impl ComboDropdownLayout {
+    pub fn hit_test(&self, p: quadraui::Point) -> ComboDropdownHit {
+        if let quadraui::CompletionsHit::Item(idx) = self.dropdown.hit_test(p.x, p.y) {
+            return ComboDropdownHit::DropdownItem(idx);
+        }
+        if self.field_bounds.contains(p) {
+            ComboDropdownHit::Field
+        } else {
+            ComboDropdownHit::Outside
+        }
+    }
+}
+
 /// vimcode-owned interaction state for whichever `number_input` field
 /// currently has keyboard focus, in either the sidebar or an editor-area
 /// tab — the `number_input` twin of [`PluginViewComboBoxEditState`], same

@@ -543,7 +543,8 @@ impl App {
             // regardless of `sb_rect`'s own origin, which is exactly the
             // window-relative `local_x` `window_zone_hit_test` hit-tests with.
             // This is the layout the paint resolved, not a second re-measure.
-            let sb_layout = backend.draw_status_bar_interactive(
+            let sb_layout = crate::render::draw_status_bar(
+                backend,
                 sb_rect,
                 &win_bar,
                 &quadraui::InteractionState::new(),
@@ -714,14 +715,15 @@ impl App {
                         );
                         self.cached_sc_bands.set(Some(bands));
                         let header_bar = render::sc_header_status_bar(sc, theme);
-                        let _ = backend.draw_status_bar_interactive(
+                        let _ = crate::render::draw_status_bar(
+                            backend,
                             bands.header,
                             &header_bar,
                             &quadraui::InteractionState::new(),
                         );
 
                         let ti = render::sc_commit_message_to_text_input(sc);
-                        backend.draw_text_input(bands.commit_input, &ti);
+                        let _ = render::draw_widget_plain(backend, bands.commit_input, &ti);
 
                         // Render the toolbar-slab + section list below the
                         // header + commit input.
@@ -733,7 +735,8 @@ impl App {
                         // has focus) so it can't show unreserved space.
                         if let Some(hint_rect) = bands.hint {
                             let hint_bar = render::sc_hint_status_bar(theme);
-                            let _ = backend.draw_status_bar_interactive(
+                            let _ = crate::render::draw_status_bar(
+                                backend,
                                 hint_rect,
                                 &hint_bar,
                                 &quadraui::InteractionState::new(),
@@ -780,7 +783,8 @@ impl App {
                             };
                             let popup_x = q_sb.x + (q_sb.width - popup_w) / 2.0;
                             let popup_y = q_sb.y + 2.0 * lh as f32;
-                            backend.draw_palette(
+                            let _ = render::draw_widget_plain(
+                                backend,
                                 quadraui::Rect::new(popup_x, popup_y, popup_w, popup_h),
                                 &palette,
                             );
@@ -788,9 +792,9 @@ impl App {
 
                         if sc.help_open {
                             let viewport = q_sb;
-                            let (dialog, dlayout) =
+                            let (dialog, _) =
                                 render::sc_help_dialog_layout(viewport, cw as f32, lh as f32);
-                            backend.draw_dialog(&dialog, &dlayout);
+                            let _ = render::draw_dialog(backend, viewport, &dialog);
                         }
                     } else {
                         // Git panel is the active tab but there's no repo open
@@ -854,7 +858,8 @@ impl App {
                         if let Some(ref status) = board.status {
                             let bar = render::board_status_bar(status, theme);
                             let rect = quadraui::Rect::new(q_sb.x, q_sb.y, q_sb.width, lh as f32);
-                            let _ = backend.draw_status_bar_interactive(
+                            let _ = crate::render::draw_status_bar(
+                                backend,
                                 rect,
                                 &bar,
                                 &quadraui::InteractionState::new(),
@@ -1074,14 +1079,15 @@ impl App {
                     // `render::ext_panel_help_tooltip_layout`'s own doc for why this is the
                     // real implementation and not a stand-in.
                     if panel.help_open {
-                        let (tooltip, tlayout, chrome) = render::ext_panel_help_tooltip_layout(
+                        let (mut tooltip, tlayout, chrome) = render::ext_panel_help_tooltip_layout(
                             &panel.name,
                             &panel.help_bindings,
                             q_sb,
                             cw as f32,
                             lh as f32,
                         );
-                        backend.draw_tooltip_with_chrome(&tooltip, &tlayout, &chrome);
+                        tooltip.chrome = chrome;
+                        let _ = render::draw_widget_plain(backend, tlayout.bounds, &tooltip);
                     }
                 } else {
                     engine.ext_panel_tree_layout.replace(None);
@@ -1531,10 +1537,9 @@ impl App {
         let mut tab_bar_zones: HashMap<usize, (core::window::GroupId, quadraui::Rect)> =
             HashMap::new();
         for (surface_idx, (group_id, rect, bar)) in (window_editors.len()..).zip(hit_bars) {
-            hit_frame.push(Surface::TabBar {
+            hit_frame.push(Surface::Widget {
                 rect,
-                bar: bar.clone(),
-                hovered_close: None,
+                widget: Box::new(bar.clone()),
             });
             tab_bar_zones.insert(surface_idx, (group_id, rect));
         }
@@ -1599,7 +1604,8 @@ impl App {
                     open_item: None,
                     focused_item: None,
                 };
-                let _ = backend.draw_menu_bar(
+                let _ = render::draw_widget_plain(
+                    backend,
                     quadraui::Rect::new(
                         menu_row_rect.x,
                         menu_row_rect.y,
@@ -1635,7 +1641,8 @@ impl App {
                 .unwrap_or(false);
             let controls_bar = render::window_controls_status_bar(theme, maximized);
             let interaction = self.title_bar_interaction.borrow();
-            let hits = backend.draw_status_bar_interactive(
+            let hits = crate::render::draw_status_bar(
+                backend,
                 controls_rect,
                 &controls_bar,
                 &quadraui::InteractionState::from_parts(

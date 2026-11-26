@@ -686,8 +686,8 @@ pub fn paint_separated_status_rung(
     rect: quadraui::Rect,
 ) -> quadraui::StatusBarLayout {
     let bar = window_status_line_to_status_bar(status, quadraui::WidgetId::new("status:separated"));
-    let _ = b.draw_status_bar_interactive(rect, &bar, &quadraui::InteractionState::new());
-    b.status_bar_layout(rect, &bar)
+    let _ = crate::render::draw_status_bar(b, rect, &bar, &quadraui::InteractionState::new());
+    crate::render::status_bar_layout(b, rect, &bar)
 }
 
 /// Paint a plain, content-free fill behind the "real" status bar at
@@ -724,7 +724,7 @@ pub fn paint_status_backdrop(
         }],
         right_segments: Vec::new(),
     };
-    let _ = b.draw_status_bar_interactive(rect, &backdrop, &quadraui::InteractionState::new());
+    let _ = crate::render::draw_status_bar(b, rect, &backdrop, &quadraui::InteractionState::new());
 }
 
 /// The unit system `render_content` composes [`paint_bottom_panel_rung`] in,
@@ -794,7 +794,8 @@ pub fn paint_bottom_panel_rung(
         engine.terminal_open,
         !screen.bottom_tabs.output_lines.is_empty(),
     );
-    let layout = b.draw_tab_bar_layout(
+    let layout = crate::render::draw_tab_bar(
+        b,
         quadraui::Rect::new(rect.x, rect.y, rect.width, lh),
         &tab_bar,
         None,
@@ -817,7 +818,8 @@ pub fn paint_bottom_panel_rung(
             let toolbar_rect = quadraui::Rect::new(rect.x, rect.y + lh, rect.width, lh);
             let toolbar_hits = match build_terminal_toolbar(term, theme) {
                 TerminalToolbar::FindBar(bar) => {
-                    let _ = b.draw_status_bar_interactive(
+                    let _ = crate::render::draw_status_bar(
+                        b,
                         toolbar_rect,
                         &bar,
                         &quadraui::InteractionState::new(),
@@ -835,7 +837,7 @@ pub fn paint_bottom_panel_rung(
                 }
                 TerminalToolbar::TabStrip(bar) => {
                     crate::core::engine::TerminalToolbarHits::TabStrip {
-                        layout: b.draw_tab_bar_layout(toolbar_rect, &bar, None),
+                        layout: crate::render::draw_tab_bar(b, toolbar_rect, &bar, None),
                         origin_x: toolbar_rect.x as f64,
                     }
                 }
@@ -864,7 +866,8 @@ pub fn paint_bottom_panel_rung(
                 for i in 0..visible_rows {
                     let row =
                         quadraui::Rect::new(rect.x, content_y + i as f32 * lh, rect.width, lh);
-                    let _ = b.draw_status_bar_interactive(
+                    let _ = crate::render::draw_status_bar(
+                        b,
                         row,
                         &bg_bar,
                         &quadraui::InteractionState::new(),
@@ -885,20 +888,19 @@ pub fn paint_bottom_panel_rung(
                 // Both backends now support painting a split divider.
                 let left = td.left.as_ref().unwrap();
                 let right = td.right.as_ref().unwrap();
-                b.draw_terminal(split.left, left);
-                b.draw_terminal(split.right, right);
+                let _ = crate::render::draw_widget_plain(b, split.left, left);
+                let _ = crate::render::draw_widget_plain(b, split.right, right);
                 // Width stays a literal `1.0` in *both* unit systems, as both
                 // call sites had it: one hairline pixel on GTK, one cell on
                 // TUI. Scaling it by `cw` would fatten GTK's divider to a full
                 // character width.
-                b.draw_terminal_divider(quadraui::Rect::new(
-                    split.divider_x,
-                    content_y,
-                    1.0,
-                    content_h,
-                ));
+                let _ = crate::render::draw_widget_plain(
+                    b,
+                    quadraui::Rect::new(split.divider_x, content_y, 1.0, content_h),
+                    &quadraui::TerminalDivider::new(quadraui::WidgetId::new("terminal_divider")),
+                );
             } else if let Some(ref single) = td.single {
-                b.draw_terminal(body, single);
+                let _ = crate::render::draw_widget_plain(b, body, single);
             }
 
             let scrollbar = units.terminal_scrollbar.and_then(|gutter| {
@@ -958,7 +960,7 @@ pub fn paint_bottom_panel_rung(
             let body =
                 quadraui::Rect::new(rect.x, rect.y + lh, rect.width, (rect.height - lh).max(0.0));
             let td = bottom_panel_placeholder_to_text_display(widget_id, message);
-            b.draw_text_display(body, &td);
+            let _ = crate::render::draw_widget_plain(b, body, &td);
         }
         BottomPanelKind::DebugOutput => {
             if content_h <= 0.0 {
@@ -978,8 +980,7 @@ pub fn paint_bottom_panel_rung(
                 engine.debug_output_scroll,
                 engine.debug_output_auto_scroll,
             );
-            let layout = b.text_display_layout(body, &td);
-            b.draw_text_display(body, &td);
+            let layout = crate::render::draw_widget_plain(b, body, &td).layout;
             let scrollbar =
                 layout
                     .scrollbar_bounds
@@ -1135,8 +1136,13 @@ pub fn paint_tab_bars<'a>(
             // byte-identical to `draw_tab_bar_layout` (quadraui's
             // `draw_tab_bar_layout` literally forwards to it with `&[]`), so
             // the Nerd-Fonts-off path keeps today's geometry exactly.
-            let layout =
-                backend.draw_tab_bar_icons_layout(target.rect, target.bar, target.icons, hover);
+            let layout = if target.icons.is_empty() {
+                crate::render::draw_tab_bar(backend, target.rect, target.bar, hover)
+            } else {
+                let mut bar = target.bar.clone();
+                bar.icons = target.icons.to_vec();
+                crate::render::draw_tab_bar(backend, target.rect, &bar, hover)
+            };
             PaintedTabBar {
                 group_id: target.group_id,
                 rect: target.rect,
@@ -1159,8 +1165,12 @@ pub fn paint_breadcrumb_bars(
     terminal_maximized: bool,
 ) {
     for t in breadcrumb_draw_targets(screen, terminal_maximized) {
-        let layout =
-            backend.draw_status_bar_interactive(t.rect, t.bar, &quadraui::InteractionState::new());
+        let layout = crate::render::draw_status_bar(
+            backend,
+            t.rect,
+            t.bar,
+            &quadraui::InteractionState::new(),
+        );
         *t.draw_layout.borrow_mut() = Some(layout);
     }
 }
@@ -1232,7 +1242,12 @@ pub fn paint_tab_drop_overlay(
     ghost_offset: f32,
 ) -> Option<quadraui::DropOverlay> {
     let overlay = tab_drop_overlay(ctx, cursor.0, cursor.1, bar_thickness, ghost_offset)?;
-    backend.draw_drop_overlay(&overlay);
+    let bounds = overlay.bounds();
+    let _ = crate::render::draw_widget_plain(backend, bounds, &overlay);
+    backend.register_zone(
+        quadraui::WidgetId::new(quadraui::DROP_OVERLAY_ZONE_ID),
+        bounds,
+    );
     Some(overlay)
 }
 
@@ -1769,7 +1784,7 @@ pub(crate) mod tests {
         let sc = empty_sc_data();
         let bar = sc_button_toolbar(&sc);
         let area = ratatui::layout::Rect::new(0, 5, 60, 1);
-        let layout = quadraui::tui::tui_toolbar_layout(&bar, area);
+        let layout = quadraui::primitives::toolbar::cell_layout::tui_toolbar_layout(&bar, area);
 
         // Push is button index 1 and is enabled (icon-only).
         let push = &layout.visible_items[1];
@@ -1788,7 +1803,7 @@ pub(crate) mod tests {
         let sc = empty_sc_data();
         let bar = sc_button_toolbar(&sc);
         let area = ratatui::layout::Rect::new(0, 0, 60, 1);
-        let layout = quadraui::tui::tui_toolbar_layout(&bar, area);
+        let layout = quadraui::primitives::toolbar::cell_layout::tui_toolbar_layout(&bar, area);
         let commit = &layout.visible_items[0];
         assert!(!commit.clickable, "disabled Commit must not be clickable");
         assert_eq!(

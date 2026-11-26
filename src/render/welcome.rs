@@ -80,7 +80,7 @@ pub(crate) fn paint_welcome_panel(
         title: None,
         show_scrollbar: false,
     };
-    backend.draw_text_display(heading_rect, &heading);
+    let _ = crate::render::draw_widget_plain(backend, heading_rect, &heading);
 
     let button_width = (rect.width - pad * 2.0).clamp(0.0, unit_h * 16.0);
     let button_rect = quadraui::Rect::new(
@@ -95,8 +95,7 @@ pub(crate) fn paint_welcome_panel(
     // Code uses — the recent-folders rows below get the link color instead.
     let mut button = Button::new(WidgetId::new("welcome.open_folder"), "Open Folder");
     button.focused = engine.welcome_focus == crate::core::engine::WelcomeFocus::OpenFolderButton;
-    backend.draw_button(button_rect, &button);
-    let button_layout = backend.button_layout(button_rect, &button);
+    let button_layout = crate::render::draw_widget_plain(backend, button_rect, &button);
     engine
         .welcome_button_layout
         .replace(Some((button_rect, button_layout)));

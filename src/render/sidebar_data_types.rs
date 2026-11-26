@@ -361,6 +361,7 @@ pub fn panel_hover_to_quadraui_rich_text(
         padding: 0.0,
         fg: Some(theme.hover_fg),
         bg: Some(theme.hover_bg),
+        font_role: Default::default(),
     }
 }
 
@@ -571,7 +572,7 @@ pub fn panel_hover_popup_paint(
         },
     );
 
-    backend.draw_rich_text_popup(&popup, &layout);
+    let _ = crate::render::draw_widget_plain(backend, layout.bounds, &popup);
 
     let link_rects: Vec<(quadraui::Rect, String, bool)> = layout
         .link_hit_regions

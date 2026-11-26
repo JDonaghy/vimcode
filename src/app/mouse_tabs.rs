@@ -378,11 +378,16 @@ impl App {
             .as_ref()
             .and_then(|s| s.find_replace.as_ref())
             .map(|panel| {
-                render::FindReplaceHitGeometry::from_panel(
-                    panel,
-                    (self.painted_char_width() as f32, lh),
-                    &(self.units.find_replace_anchor),
-                )
+                let cell = (self.painted_char_width() as f32, lh);
+                if self.units.find_replace_anchor.snap_to_cells {
+                    render::FindReplaceHitGeometry::from_panel(
+                        panel,
+                        cell,
+                        &(self.units.find_replace_anchor),
+                    )
+                } else {
+                    render::FindReplaceHitGeometry::from_pixel_metrics(panel, cell)
+                }
             });
 
         render::route_modal_overlay_click(

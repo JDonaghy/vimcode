@@ -236,7 +236,9 @@ impl App {
             quadraui::Handled::Event(quadraui::PathPickerAction::Cancelled) => {
                 *self.folder_picker.borrow_mut() = None;
             }
-            quadraui::Handled::Consumed | quadraui::Handled::Ignored => {}
+            quadraui::Handled::Event(_)
+            | quadraui::Handled::Consumed
+            | quadraui::Handled::Ignored => {}
         }
     }
 

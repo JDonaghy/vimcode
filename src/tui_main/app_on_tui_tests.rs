@@ -3309,7 +3309,7 @@ mod tests {
                 let layout = engine.sc_panel_layout.borrow();
                 let toolbar = layout
                     .as_ref()
-                    .and_then(|l| l.toolbar_layout.as_ref())
+                    .and_then(crate::render::sidebar_panel_toolbar_layout)
                     .expect("the SC panel toolbar must have painted a layout");
                 let item = toolbar
                     .visible_items
@@ -5427,7 +5427,7 @@ mod tests {
             );
         }
 
-        /// A non-focusable float (`Focusable::No`, a which-key-style hint
+        /// A non-focusable float (`focusable: false`, a which-key-style hint
         /// popup) never steals a keystroke meant for whatever's underneath
         /// — `ModalStack::top_focusable` skips it, so the `focusable_float_
         /// open` keyboard-sink rung in `App::handle_key_press` never fires
@@ -5453,7 +5453,7 @@ mod tests {
                 .push_with_focusable(
                     crate::render::plugin_view_float_widget_id("hint"),
                     quadraui::Rect::new(40.0, 15.0, 5.0, 2.0),
-                    quadraui::Focusable::No,
+                    false,
                 );
 
             h.driver.type_char('i'); // Normal -> Insert
@@ -5469,8 +5469,8 @@ mod tests {
             );
         }
 
-        /// The converse of the test above: a focusable float (`Focusable::
-        /// Yes`, the default `ModalStack::push`) is a total keyboard sink
+        /// The converse of the test above: a focusable float (`focusable:
+        /// true`, the default `ModalStack::push`) is a total keyboard sink
         /// while it is topmost — every key but Escape is swallowed by the
         /// `focusable_float_open` rung, so none of this typed text ever
         /// reaches the editor.

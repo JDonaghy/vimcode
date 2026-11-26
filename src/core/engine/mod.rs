@@ -4927,7 +4927,7 @@ pub struct Engine {
     /// `render::paint_plugin_view_combo_box_dropdown`; read by
     /// `render::route_plugin_view_combo_box_dropdown_click`.
     pub plugin_view_combo_dropdown_layout:
-        std::cell::RefCell<Option<(String, String, quadraui::ComboBoxLayout)>>,
+        std::cell::RefCell<Option<(String, String, crate::core::plugin_ui::ComboDropdownLayout)>>,
     /// Local interaction state for whichever plugin-view `number_input`
     /// field currently has keyboard focus — the `number_input` twin of
     /// `plugin_view_combo_edit`, same "quadraui's `FormController` keeps no

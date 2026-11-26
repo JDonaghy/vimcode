@@ -125,7 +125,38 @@ impl App {
                 self.menu_items_rect.get(),
                 backend.viewport().width,
             );
-            let menu_event = menu_system.borrow_mut().handle(&event, backend, bar_rect);
+            // An open dropdown resolves a plain printable key as type-ahead
+            // and consumes it; this host closes the dropdown on such a key
+            // and lets it reach the editor instead (the `Ignored` arm below).
+            // TODO(#2176): drop this bypass once quadraui's menu system lets
+            // a host opt out of dropdown type-ahead.
+            let plain_char_in_open_menu = menu_open
+                && matches!(
+                    event,
+                    UiEvent::KeyPressed { key: quadraui::Key::Char(_), modifiers, .. }
+                        if !modifiers.alt && !modifiers.ctrl && !modifiers.cmd
+                );
+            // With no dropdown open, the menu system claims every pointer
+            // event over `bar_rect`, the empty stretch past the last label
+            // included, where the Command Center and the window controls
+            // sit. Only a pointer over a label belongs to it here.
+            // TODO(#2176): drop this once the title bar routes through a
+            // `FrameTree` that hit-tests those widgets first.
+            let pointer_off_menu_labels = !menu_open
+                && render::pointer_position(&event).is_some_and(|p| {
+                    let bar = menu_system.borrow().menu_bar();
+                    !matches!(
+                        quadraui::DrawsPrimitives::layout_primitive(&*backend, bar_rect, &bar)
+                            .layout
+                            .hit_test(p.x, p.y),
+                        quadraui::MenuBarHit::Item(_)
+                    )
+                });
+            let menu_event = if plain_char_in_open_menu || pointer_off_menu_labels {
+                quadraui::MenuEvent::Ignored
+            } else {
+                menu_system.borrow_mut().handle(&event, backend, bar_rect)
+            };
             match menu_event {
                 quadraui::MenuEvent::Activated(id) => {
                     self.handle_menu_action(id.as_str().to_string());
@@ -168,6 +199,7 @@ impl App {
                         self.draw_needed.set(true);
                     }
                 }
+                _ => {}
             }
         }
 
@@ -706,7 +738,7 @@ impl App {
                         ("Shift_backslash".to_string(), Some('\\'))
                     }
                     Key::Char(c) => (c.to_string(), Some(c)),
-                    Key::Named(_) => {
+                    _ => {
                         // `Escape`/`Enter`->`Return`/`Backspace`->
                         // `BackSpace`/`Delete`/`Tab`/`Home`/`End`/the arrows/
                         // F-keys are byte-identical to TUI's spelling, so

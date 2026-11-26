@@ -636,7 +636,9 @@ impl quadraui::ShellApp for App {
                         self.engine.borrow().cmd_sel.get().map(|sel| {
                             render::command_line_selection_bytes(&screen.command.text, sel)
                         });
-                    backend.draw_command_line_selection(cmd_rect, &cmd, sel_bytes);
+                    let mut cmd = cmd;
+                    cmd.selection = sel_bytes;
+                    let _ = render::draw_widget_plain(backend, cmd_rect, &cmd);
                     composed.push(render::FrameOp::CommandLine);
                 }
 

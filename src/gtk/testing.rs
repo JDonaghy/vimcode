@@ -5467,7 +5467,7 @@ mod sidebar_panel_clicks {
             let layout = engine.sc_panel_layout.borrow();
             layout
                 .as_ref()
-                .and_then(|l| l.toolbar_layout.as_ref())
+                .and_then(crate::render::sidebar_panel_toolbar_layout)
                 .and_then(|t| t.visible_items.iter().find(|i| i.clickable).cloned())
         };
         let Some(button) = button else {
@@ -5521,7 +5521,7 @@ mod sidebar_panel_clicks {
             let layout = engine.sc_panel_layout.borrow();
             layout
                 .as_ref()
-                .and_then(|l| l.toolbar_layout.as_ref())
+                .and_then(crate::render::sidebar_panel_toolbar_layout)
                 .and_then(|t| t.visible_items.iter().find(|i| i.clickable).cloned())
         };
         let Some(button) = button else {
@@ -5579,7 +5579,7 @@ mod sidebar_panel_clicks {
     /// `true` after switching to an unrelated plugin panel.
     ///
     /// Drives a **real activity-bar click** through `GtkDriver`: the click
-    /// targets the exact row `quadraui::gtk::ACTIVITY_ROW_PX` puts the
+    /// targets the exact row `quadraui::primitives::activity_bar::PIXEL_ROW_HEIGHT` puts the
     /// newly-registered ext panel at.
     #[test]
     fn switching_to_a_plugin_panel_clears_stale_marketplace_focus() {
@@ -5610,7 +5610,7 @@ mod sidebar_panel_clicks {
 
         // Click the plugin panel's activity-bar icon (index 7 — see doc
         // comment above).
-        let y = ab_top + (7.0 + 0.5) * quadraui::gtk::ACTIVITY_ROW_PX as f32;
+        let y = ab_top + (7.0 + 0.5) * quadraui::primitives::activity_bar::PIXEL_ROW_HEIGHT as f32;
         h.driver.click(20.0, y);
 
         assert_eq!(
@@ -9665,10 +9665,20 @@ mod editor_popups {
                  vs {second_rect:?}"
             );
 
-            let line_bounds = h
+            // Each styled span paints as its own text run, so the line is
+            // the horizontal union of the two URLs' runs.
+            let first_run = h
                 .driver
                 .find_bounds(first_url)
                 .expect("the popup line containing both URLs must paint");
+            let second_run = h
+                .driver
+                .find_bounds(second_url)
+                .expect("the popup line containing both URLs must paint");
+            let left = first_run.x.min(second_run.x);
+            let right = (first_run.x + first_run.width).max(second_run.x + second_run.width);
+            let line_bounds =
+                quadraui::Rect::new(left, first_run.y, right - left, first_run.height);
             let theme = crate::render::Theme::from_name(&h.engine.borrow().settings.colorscheme);
             let md_link = (theme.md_link.r, theme.md_link.g, theme.md_link.b);
             let spans = link_colored_x_spans(&mut h, line_bounds, md_link);
@@ -11773,8 +11783,11 @@ mod command_center {
             .position(|i| i.label.replace('&', "") == "File")
             .expect("the menu bar must carry a File item");
         let mb_layout = {
-            use quadraui::Backend as _;
-            h.driver.backend().menu_bar_layout(items_rect, &menu_bar)
+            use quadraui::DrawsPrimitives as _;
+            h.driver
+                .backend()
+                .layout_primitive(items_rect, &menu_bar)
+                .layout
         };
         let file = mb_layout
             .visible_items
@@ -11818,12 +11831,8 @@ mod command_center {
         );
         let theme = crate::render::Theme::from_name(&h.engine.borrow().settings.colorscheme);
         let controls_bar = crate::render::window_controls_status_bar(&theme, false);
-        let status_layout = {
-            use quadraui::Backend as _;
-            h.driver
-                .backend()
-                .status_bar_layout(controls_rect, &controls_bar)
-        };
+        let status_layout =
+            crate::render::status_bar_layout(h.driver.backend(), controls_rect, &controls_bar);
         let button_rect = |action: &str| -> quadraui::Rect {
             status_layout
                 .hit_regions
@@ -20060,8 +20069,9 @@ mod engine_key_from_ui_gtk_tests {
 
         let mut h = harness(engine, 1400, 900);
         h.driver.render();
+        // A GUI backend marks the active section with the codicon chevron.
         assert!(
-            h.driver.screen_contains("▶ STAGED CHANGES"),
+            h.driver.screen_contains("\u{eab6} STAGED CHANGES"),
             "precondition: Staged must be the initially active section; \
              painted: {:?}",
             h.driver.painted_texts()
@@ -20070,7 +20080,8 @@ mod engine_key_from_ui_gtk_tests {
         press(&mut h, Key::Named(NamedKey::Tab), Modifiers::default());
         h.driver.render();
         assert!(
-            h.driver.screen_contains("▶ CHANGES") && !h.driver.screen_contains("▶ STAGED CHANGES"),
+            h.driver.screen_contains("\u{eab6} CHANGES")
+                && !h.driver.screen_contains("\u{eab6} STAGED CHANGES"),
             "Tab must cycle the SC sidebar's active section forward, from \
              Staged to Changes; painted: {:?}",
             h.driver.painted_texts()
@@ -20079,7 +20090,7 @@ mod engine_key_from_ui_gtk_tests {
         press(&mut h, Key::Named(NamedKey::BackTab), Modifiers::default());
         h.driver.render();
         assert!(
-            h.driver.screen_contains("▶ STAGED CHANGES"),
+            h.driver.screen_contains("\u{eab6} STAGED CHANGES"),
             "plain BackTab (Shift+Tab, no ctrl) decoded via the shared \
              `engine_key_from_ui` (\"ISO_Left_Tab\") must cycle the active \
              section back to Staged through `map_gtk_key_with_unicode`'s \

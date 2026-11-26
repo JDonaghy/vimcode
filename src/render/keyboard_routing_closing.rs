@@ -1294,8 +1294,8 @@ mod slice7_router_tests {
     /// native path moved to `show_context_menu_now`, called at
     /// event-handler time instead of from this render rung. This is the
     /// RED-able regression pin for that split: it proves the rung this
-    /// file owns still calls `draw_context_menu` and returns the painted
-    /// layout.
+    /// file owns still paints the context-menu widget and returns the
+    /// painted layout.
     #[test]
     fn paint_context_menu_rung_paints_in_window() {
         let panel = ContextMenuPanel {
@@ -1314,10 +1314,13 @@ mod slice7_router_tests {
 
         let mut backend = quadraui::testing::RecordingBackend::new();
         let _layout = paint_context_menu_rung(&mut backend, &panel, viewport, 8.0, 16.0, 0.0);
+        let painted = quadraui::primitive::with_painted_widgets(|p| {
+            p.painted_layout(&quadraui::WidgetId::new("context_menu"))
+                .is_some()
+        });
         assert!(
-            backend.calls.contains(&"draw_context_menu"),
-            "paint_context_menu_rung must call draw_context_menu; calls were {:?}",
-            backend.calls
+            painted,
+            "paint_context_menu_rung must paint the context menu widget"
         );
     }
 

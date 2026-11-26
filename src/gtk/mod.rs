@@ -95,7 +95,10 @@ pub fn run(file_path: Option<PathBuf>) {
         crate::render::UnitProfile::px(),
     );
     let config = build_shell_config(&vimcode_app);
-    quadraui::gtk::shell_runner::run_with_shell(vimcode_app, config);
+    crate::app_support::exit_on_run_error(quadraui::gtk::shell_runner::run_with_shell(
+        vimcode_app,
+        config,
+    ));
 }
 
 /// Derive the runner's [`quadraui::ShellConfig`] from an [`App`]'s engine state.
@@ -428,12 +431,12 @@ mod chrome_paint_tests {
             // The bar's painted height comes from `rect.height` and `set_current_line_height`
             // is set to match, so the backend's per-frame line height agrees with
             // the rect.
-            use quadraui::Backend as _;
             let mut backend = super::backend::GtkBackend::new();
             backend.set_current_theme(render::to_quadraui_theme(theme));
             backend.set_current_line_height(LINE_H);
             backend.enter_frame_scope(&cr, &pango_layout, |b| {
-                b.draw_status_bar_interactive(
+                crate::render::draw_status_bar(
+                    b,
                     quadraui::Rect::new(0.0, 0.0, W as f32, LINE_H as f32),
                     &bar,
                     &quadraui::InteractionState::new(),

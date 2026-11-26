@@ -61,6 +61,7 @@ mod test_support;
 mod tests_behavioral;
 mod theme;
 mod welcome;
+mod widget_paint;
 mod window_and_popups;
 mod window_builder;
 
@@ -95,6 +96,7 @@ pub use theme::*;
 // `plugin_view_body`/`window_builder` below).
 #[allow(unused_imports)]
 pub use welcome::*;
+pub(crate) use widget_paint::*;
 pub use window_and_popups::*;
 // `plugin_view_body` and `window_builder` currently expose only
 // `pub(crate)` items (same as before the split, when they were reachable

@@ -163,6 +163,7 @@ pub fn build_activity_bar(
         // `app/input.rs`, backed by `Engine::activity_bar_move_up/down/
         // activate/focus_out`) stays the sole, working navigation path.
         is_keyboard_focused: false,
+        style: Default::default(),
     }
 }
 

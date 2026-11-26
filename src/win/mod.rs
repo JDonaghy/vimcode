@@ -91,7 +91,9 @@ pub fn run(file_path: Option<PathBuf>) -> ExitCode {
         crate::render::UnitProfile::px(),
     );
     let config = build_shell_config(&app);
-    quadraui::win::shell_runner::run_with_shell(app, config)
+    crate::app_support::run_outcome_exit_code(quadraui::win::shell_runner::run_with_shell(
+        app, config,
+    ))
 }
 
 /// Derive the runner's [`quadraui::ShellConfig`] from an [`App`]'s engine

@@ -129,6 +129,9 @@ pub fn build_tab_bar_primitive(
         active_accent,
         show_tab_close: true,
         compact: false,
+        chrome: Default::default(),
+        icons: Vec::new(),
+        glyphs: Default::default(),
     }
 }
 
@@ -197,6 +200,9 @@ pub fn build_bottom_panel_tab_bar(
         active_accent: None,
         show_tab_close: false,
         compact: true,
+        chrome: Default::default(),
+        icons: Vec::new(),
+        glyphs: Default::default(),
     }
 }
 
@@ -307,6 +313,9 @@ pub fn build_terminal_toolbar(panel: &TerminalPanel, theme: &Theme) -> TerminalT
             active_accent: None,
             show_tab_close: false,
             compact: true,
+            chrome: Default::default(),
+            icons: Vec::new(),
+            glyphs: Default::default(),
         })
     }
 }
@@ -982,8 +991,21 @@ pub fn tab_hover_tooltip_paint(
         }],
         right_segments: vec![],
     };
-    let rect = quadraui::Rect::new(x, y, w_chars * uw, unit_h);
-    let _ = backend.draw_status_bar_interactive(rect, &bar, &quadraui::InteractionState::new());
+    // A pixel status bar insets its segments from both edges and pads each
+    // one, so the strip is widened by that chrome to keep the text whole.
+    let width = if backend.cell_grid() {
+        w_chars * uw
+    } else {
+        let chrome = 2.0
+            * (quadraui::primitives::status_bar::PIXEL_EDGE_INSET
+                + quadraui::primitives::status_bar::PIXEL_SEGMENT_PADDING);
+        let measured = backend
+            .measure_text(&bar.left_segments[0].text, quadraui::FontRole::Chrome)
+            .0;
+        (measured + chrome).max(w_chars * uw).min(max_width)
+    };
+    let rect = quadraui::Rect::new(x, y, width, unit_h);
+    let _ = crate::render::draw_status_bar(backend, rect, &bar, &quadraui::InteractionState::new());
 }
 
 pub fn build_command_line(engine: &Engine) -> CommandLineData {

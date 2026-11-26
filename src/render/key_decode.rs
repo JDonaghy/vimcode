@@ -152,6 +152,7 @@ pub fn engine_key_from_ui(
             NamedKey::Insert => Some(("Insert".to_string(), None, false)),
             NamedKey::CapsLock | NamedKey::NumLock | NamedKey::ScrollLock | NamedKey::Menu => None,
         },
+        _ => None,
     }
 }
 

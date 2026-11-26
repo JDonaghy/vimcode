@@ -185,7 +185,7 @@ pub fn draw_sc_sidebar_panel(
     let hovered = sc.button_hovered.and_then(Engine::sc_button_id);
     let pressed = sc.button_focused.and_then(Engine::sc_button_id);
     let interaction = quadraui::InteractionState::from_parts(hovered, pressed);
-    let layout = b.draw_sidebar_panel_interactive(rect, &panel, &interaction);
+    let layout = crate::render::draw_sidebar_panel(b, rect, &panel, &interaction);
     engine.sc_panel_layout.replace(Some(layout));
 }
 
@@ -787,14 +787,12 @@ mod tests {
 
     #[test]
     fn test_sc_sidebar_panel_toolbar_slot_reserved_at_top() {
-        use quadraui::{primitives::toolbar::ToolbarItemMeasure, SidebarPanelMeasure};
-
         let sc = empty_sc_data();
         let panel = sc_sidebar_panel(&sc);
         // TUI default: toolbar_height = 1 cell, item_width = 8 cells.
         let area = quadraui::Rect::new(0.0, 5.0, 60.0, 20.0);
-        let measure = SidebarPanelMeasure::new(1.0, 8.0);
-        let layout = panel.layout(area, measure, |_| ToolbarItemMeasure::new(8.0));
+        let layout =
+            quadraui::Primitive::layout(&panel, &quadraui::LayoutCtx::new(1.0, 1.0, false), area);
 
         // Toolbar slot is reserved at the top.
         let tb = layout.toolbar_bounds.expect("toolbar slot reserved");
@@ -814,16 +812,14 @@ mod tests {
     #[test]
     fn test_sc_sidebar_panel_hit_test_resolves_toolbar_button_and_content() {
         use crate::core::engine::Engine;
-        use quadraui::{
-            primitives::toolbar::ToolbarItemMeasure, SidebarPanelHit, SidebarPanelMeasure,
-        };
+        use quadraui::SidebarPanelHit;
 
         let mut sc = empty_sc_data();
         sc.commit_message = "feat: fix".into(); // non-empty → Commit enabled
         let panel = sc_sidebar_panel(&sc);
         let area = quadraui::Rect::new(0.0, 0.0, 60.0, 10.0);
-        let measure = SidebarPanelMeasure::new(1.0, 8.0);
-        let layout = panel.layout(area, measure, |_| ToolbarItemMeasure::new(8.0));
+        let layout =
+            quadraui::Primitive::layout(&panel, &quadraui::LayoutCtx::new(1.0, 1.0, false), area);
 
         // A hit in the toolbar slot (y=0, which is the toolbar row) on a button.
         let hit = layout.hit_test(0.5, 0.0);
@@ -851,14 +847,12 @@ mod tests {
 
     #[test]
     fn test_sc_sidebar_panel_content_bounds_height() {
-        use quadraui::{primitives::toolbar::ToolbarItemMeasure, SidebarPanelMeasure};
-
         let sc = empty_sc_data();
         let panel = sc_sidebar_panel(&sc);
         // Simulate a 15-row panel starting at y=3 (e.g. after 3 header/commit rows).
         let area = quadraui::Rect::new(0.0, 3.0, 40.0, 15.0);
-        let measure = SidebarPanelMeasure::new(1.0, 8.0);
-        let layout = panel.layout(area, measure, |_| ToolbarItemMeasure::new(8.0));
+        let layout =
+            quadraui::Primitive::layout(&panel, &quadraui::LayoutCtx::new(1.0, 1.0, false), area);
 
         assert_eq!(
             layout.content_bounds.height, 14.0,

@@ -82,7 +82,9 @@ pub fn run(file_path: Option<PathBuf>) -> ExitCode {
 
     let app = App::new_portable(file_path, backend, crate::render::UnitProfile::px());
     let config = build_shell_config(&app);
-    quadraui::macos::shell_runner::run_with_shell(app, config)
+    crate::app_support::run_outcome_exit_code(quadraui::macos::shell_runner::run_with_shell(
+        app, config,
+    ))
 }
 
 /// Derive the runner's [`quadraui::ShellConfig`] from an [`App`]'s engine

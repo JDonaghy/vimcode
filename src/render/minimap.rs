@@ -1211,6 +1211,7 @@ pub fn context_menu_panel_to_quadraui_context_menu(
         selected_idx,
         bg: None,
         placement,
+        glyphs: Default::default(),
     }
 }
 
@@ -1236,12 +1237,15 @@ pub(crate) fn context_menu_anchor_point(
 /// `char_width` units) to account for a border the rasteriser draws
 /// *outside* `layout.bounds` rather than inside it — TUI passes `1.0`,
 /// GTK passes `0.0`.
+/// `row_heights` is the `(item, separator)` row pitch the painted widget
+/// uses — see [`crate::render::context_menu_row_heights`].
 pub fn context_menu_generic_layout(
     panel: &ContextMenuPanel,
     viewport: quadraui::Rect,
     char_width: f64,
     line_height: f64,
     border_chrome_inset: f64,
+    row_heights: (f32, f32),
 ) -> (quadraui::ContextMenu, quadraui::ContextMenuLayout) {
     let menu = context_menu_panel_to_quadraui_context_menu(panel);
 
@@ -1258,7 +1262,11 @@ pub fn context_menu_generic_layout(
 
     let anchor = context_menu_anchor_point(panel, char_width, line_height);
     let trigger_height_px = panel.trigger_height as f64 * line_height;
-    let item_height = |_i: usize| quadraui::ContextMenuItemMeasure::new(line_height as f32);
+    let (item_h, separator_h) = row_heights;
+    let item_height = |i: usize| {
+        let separator = menu.items.get(i).is_some_and(|item| item.is_separator());
+        quadraui::ContextMenuItemMeasure::new(if separator { separator_h } else { item_h })
+    };
 
     let layout = menu.layout_at(
         quadraui::Rect::new(anchor.x, anchor.y, 0.0, trigger_height_px as f32),

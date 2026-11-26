@@ -586,6 +586,25 @@ impl<'a> FindReplaceHitGeometry<'a> {
             hit_regions: &panel.hit_regions,
         }
     }
+
+    /// The geometry a pixel backend paints `panel` at: rows at the resolved
+    /// control height and the content corner inset by the style's padding,
+    /// through the same [`quadraui::FindReplaceMetrics`] the painter uses.
+    pub fn from_pixel_metrics(panel: &'a quadraui::FindReplacePanel, cell: (f32, f32)) -> Self {
+        let cw = cell.0.max(1.0);
+        let metrics = quadraui::FindReplaceMetrics::resolve(
+            panel,
+            &quadraui::Style::default(),
+            cw,
+            cell.1.max(1.0),
+        );
+        FindReplaceHitGeometry {
+            bounds: metrics.popup_rect,
+            content_origin: metrics.content_origin,
+            cell: (cw, metrics.row_height),
+            hit_regions: &panel.hit_regions,
+        }
+    }
 }
 
 /// How a backend's palette rasteriser lays result rows out inside the popup.

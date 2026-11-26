@@ -966,7 +966,7 @@ pub fn paint_ai_command_completions(
         max_popup_height,
         |_| quadraui::CompletionItemMeasure::new(unit_h),
     );
-    backend.draw_completions(&completions, &layout);
+    let _ = crate::render::draw_widget_plain(backend, layout.bounds, &completions);
 }
 
 /// Build the cell grid for a single terminal session.

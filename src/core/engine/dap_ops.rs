@@ -1532,6 +1532,7 @@ impl Engine {
         match layout.as_ref()?.hit_test(x, y) {
             quadraui::ToolbarHit::Button(id) => Self::debug_button_index(&id),
             quadraui::ToolbarHit::Empty => None,
+            _ => None,
         }
     }
 }

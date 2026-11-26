@@ -1358,7 +1358,7 @@ pub(crate) fn paint_plugin_view_text(
     };
     let scroll_top = engine.plugin_view_scroll_top(host);
     let display = plugin_view_to_text_display(name, text, scroll_top, has_focus);
-    backend.draw_text_display(rect, &display);
+    let _ = crate::render::draw_widget_plain(backend, rect, &display);
     true
 }
 
