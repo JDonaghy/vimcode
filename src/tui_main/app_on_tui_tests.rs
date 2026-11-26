@@ -21040,4 +21040,225 @@ mod tests {
             },
         );
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Dialog button clicks and keyboard confirms must reach the same outcome.
+    // Every `Engine::show_dialog` dialog accepts Enter (the default button),
+    // a per-button hotkey and a mouse click on the painted button; each test
+    // pair below drives one dialog through two of those input modes and
+    // asserts the same post-condition, so a regression that breaks button
+    // clicks while leaving the keyboard path working (or vice versa) fails
+    // here.
+    // ─────────────────────────────────────────────────────────────────────────
+    mod dialog_click_keyboard_parity {
+        use super::*;
+
+        /// A scratch project directory holding `foo.txt` and an empty `sub/`
+        /// directory, unique to this test and thread.
+        fn scratch_project(tag: &str) -> std::path::PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "vimcode_test_dialog_parity_{tag}_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("sub")).unwrap();
+            std::fs::write(dir.join("foo.txt"), "hello").unwrap();
+            dir
+        }
+
+        /// An engine showing the delete-confirmation dialog for `target`.
+        fn engine_confirming_delete(
+            dir: &std::path::Path,
+            target: &std::path::Path,
+        ) -> crate::core::Engine {
+            let mut engine = plain_engine();
+            engine.cwd = dir.to_path_buf();
+            engine.confirm_delete_file(target);
+            engine
+        }
+
+        /// An engine showing the move-file dialog for `dir/foo.txt`, its
+        /// destination input already holding `sub`.
+        fn engine_moving_into_sub(dir: &std::path::Path) -> crate::core::Engine {
+            let mut engine = plain_engine();
+            engine.cwd = dir.to_path_buf();
+            engine.start_move_file_dialog(&dir.join("foo.txt"), dir);
+            engine
+                .dialog
+                .as_mut()
+                .and_then(|d| d.input.as_mut())
+                .expect("the move dialog carries a destination input")
+                .value = "sub".to_string();
+            engine
+        }
+
+        /// Cell centre of the button labelled `label` in the painted dialog:
+        /// located on the row that also paints `row_marker` (another button
+        /// on the same row), so a body or title line repeating the label
+        /// never matches.
+        fn button_cell(screen: &str, row_marker: &str, label: &str) -> Option<(f32, f32)> {
+            let needle: Vec<char> = label.chars().collect();
+            screen.lines().enumerate().find_map(|(y, line)| {
+                if !line.contains(row_marker) {
+                    return None;
+                }
+                let cells: Vec<char> = line.chars().collect();
+                let x = cells
+                    .windows(needle.len())
+                    .position(|w| w == needle.as_slice())?;
+                Some((x as f32 + needle.len() as f32 / 2.0, y as f32))
+            })
+        }
+
+        #[test]
+        fn delete_dialog_click_on_delete_deletes_like_enter() {
+            let dir = scratch_project("click_delete");
+            let target = dir.join("foo.txt");
+            let mut h = harness(engine_confirming_delete(&dir, &target));
+            let driver = &mut h.driver;
+            driver.render();
+            assert!(
+                driver.screen_has("Confirm Delete"),
+                "precondition: the delete-confirmation dialog must paint; screen:\n{}",
+                driver.screen()
+            );
+
+            // The button paints its hotkey bracketed, as `[D]elete`.
+            let screen = driver.screen();
+            let (x, y) = button_cell(&screen, "Cancel", "[D]elete").unwrap_or_else(|| {
+                panic!("the dialog must paint a Delete button beside Cancel; screen:\n{screen}")
+            });
+            driver.click(x, y);
+            driver.render();
+
+            assert!(
+                !driver.screen_has("Confirm Delete"),
+                "clicking Delete must close the dialog; screen:\n{}",
+                driver.screen()
+            );
+            assert!(
+                !target.exists(),
+                "clicking Delete must delete the target, exactly as Enter does"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn delete_dialog_enter_deletes() {
+            let dir = scratch_project("enter_delete");
+            let target = dir.join("foo.txt");
+            let mut h = harness(engine_confirming_delete(&dir, &target));
+            let driver = &mut h.driver;
+            driver.render();
+
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.render();
+
+            assert!(
+                !driver.screen_has("Confirm Delete"),
+                "Enter must close the dialog; screen:\n{}",
+                driver.screen()
+            );
+            assert!(!target.exists(), "Enter must delete the target");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn delete_dialog_hotkey_deletes_like_a_click() {
+            let dir = scratch_project("hotkey_delete");
+            let target = dir.join("foo.txt");
+            let mut h = harness(engine_confirming_delete(&dir, &target));
+            let driver = &mut h.driver;
+            driver.render();
+
+            // The Delete button's hotkey.
+            driver.type_char('d');
+            driver.render();
+
+            assert!(
+                !driver.screen_has("Confirm Delete"),
+                "the Delete hotkey must close the dialog; screen:\n{}",
+                driver.screen()
+            );
+            assert!(!target.exists(), "the Delete hotkey must delete the target");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn delete_dialog_click_on_cancel_keeps_target_like_escape() {
+            for via_click in [true, false] {
+                let dir = scratch_project(if via_click {
+                    "click_cancel"
+                } else {
+                    "esc_cancel"
+                });
+                let target = dir.join("foo.txt");
+                let mut h = harness(engine_confirming_delete(&dir, &target));
+                let driver = &mut h.driver;
+                driver.render();
+
+                if via_click {
+                    let (x, y) = driver
+                        .find("Cancel")
+                        .expect("the dialog must paint a Cancel button");
+                    driver.click(x, y);
+                } else {
+                    driver.press_named(quadraui::NamedKey::Escape);
+                }
+                driver.render();
+
+                assert!(
+                    !driver.screen_has("Confirm Delete"),
+                    "cancelling (click: {via_click}) must close the dialog; screen:\n{}",
+                    driver.screen()
+                );
+                assert!(
+                    target.exists(),
+                    "cancelling (click: {via_click}) must leave the target in place"
+                );
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+
+        #[test]
+        fn move_dialog_click_on_move_moves_like_enter() {
+            for via_click in [true, false] {
+                let dir = scratch_project(if via_click {
+                    "click_move"
+                } else {
+                    "enter_move"
+                });
+                let mut h = harness(engine_moving_into_sub(&dir));
+                let driver = &mut h.driver;
+                driver.render();
+                assert!(
+                    driver.screen_has("Move 'foo.txt'"),
+                    "precondition: the move dialog must paint; screen:\n{}",
+                    driver.screen()
+                );
+
+                if via_click {
+                    let (x, y) = button_cell(&driver.screen(), "Cancel", "Move")
+                        .expect("the dialog must paint a Move button beside Cancel");
+                    driver.click(x, y);
+                } else {
+                    driver.press_named(quadraui::NamedKey::Enter);
+                }
+                driver.render();
+
+                assert!(
+                    !driver.screen_has("Move 'foo.txt'"),
+                    "confirming the move (click: {via_click}) must close the \
+                     dialog; screen:\n{}",
+                    driver.screen()
+                );
+                assert!(
+                    dir.join("sub").join("foo.txt").exists() && !dir.join("foo.txt").exists(),
+                    "confirming the move (click: {via_click}) must move foo.txt into sub/"
+                );
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+    }
 }

@@ -23571,3 +23571,123 @@ mod issue_2146_plugin_ui_row_sub_focus_gtk {
         );
     }
 }
+
+#[cfg(test)]
+mod dialog_click_keyboard_parity {
+    //! A dialog button click and the keyboard confirm must reach the same
+    //! outcome on GTK too. The move-file dialog carries a text input, so it
+    //! always paints in-canvas (never as a native alert) and its buttons are
+    //! real click targets on this backend.
+    use super::*;
+
+    /// A scratch project directory holding `foo.txt` and an empty `sub/`
+    /// directory, unique to this test and thread.
+    fn scratch_project(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_gtk_dialog_parity_{tag}_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("foo.txt"), "hello").unwrap();
+        dir
+    }
+
+    /// An engine showing the move-file dialog for `dir/foo.txt`, its
+    /// destination input already holding `sub`.
+    fn engine_moving_into_sub(dir: &std::path::Path) -> Engine {
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.cwd = dir.to_path_buf();
+        engine.start_move_file_dialog(&dir.join("foo.txt"), dir);
+        engine
+            .dialog
+            .as_mut()
+            .and_then(|d| d.input.as_mut())
+            .expect("the move dialog carries a destination input")
+            .value = "sub".to_string();
+        engine
+    }
+
+    /// Centre of dialog button `idx` where the frame actually painted it,
+    /// read from the painted-widget record.
+    fn painted_button_center(idx: u64) -> Option<(f32, f32)> {
+        quadraui::primitive::with_painted_widgets(|p| {
+            p.painted_sub_center(
+                &quadraui::WidgetId::new("dialog"),
+                quadraui::interactive::SubTarget(idx),
+            )
+        })
+    }
+
+    #[test]
+    fn move_dialog_click_on_move_moves_like_enter() {
+        for via_click in [true, false] {
+            let dir = scratch_project(if via_click {
+                "click_move"
+            } else {
+                "enter_move"
+            });
+            let mut h = harness(engine_moving_into_sub(&dir), 1400, 900);
+            h.driver.render();
+            assert!(
+                h.driver.screen_contains("Move 'foo.txt'"),
+                "precondition: the move dialog must paint in-canvas"
+            );
+
+            if via_click {
+                let (x, y) =
+                    painted_button_center(0).expect("the dialog must have painted its Move button");
+                h.driver.click(x, y);
+            } else {
+                h.driver.press_named(quadraui::NamedKey::Enter);
+            }
+            h.driver.render();
+
+            assert!(
+                !h.driver.screen_contains("Move 'foo.txt'"),
+                "confirming the move (click: {via_click}) must close the dialog"
+            );
+            assert!(
+                dir.join("sub").join("foo.txt").exists() && !dir.join("foo.txt").exists(),
+                "confirming the move (click: {via_click}) must move foo.txt into sub/"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn move_dialog_click_on_cancel_keeps_file_like_escape() {
+        for via_click in [true, false] {
+            let dir = scratch_project(if via_click {
+                "click_cancel"
+            } else {
+                "esc_cancel"
+            });
+            let mut h = harness(engine_moving_into_sub(&dir), 1400, 900);
+            h.driver.render();
+
+            if via_click {
+                let (x, y) = h
+                    .driver
+                    .find("Cancel")
+                    .expect("the dialog must paint a Cancel button");
+                h.driver.click(x, y);
+            } else {
+                h.driver.press_named(quadraui::NamedKey::Escape);
+            }
+            h.driver.render();
+
+            assert!(
+                !h.driver.screen_contains("Move 'foo.txt'"),
+                "cancelling (click: {via_click}) must close the dialog"
+            );
+            assert!(
+                dir.join("foo.txt").exists() && !dir.join("sub").join("foo.txt").exists(),
+                "cancelling (click: {via_click}) must leave foo.txt where it was"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+}
