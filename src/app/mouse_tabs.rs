@@ -366,7 +366,7 @@ impl App {
         let picker = self.picker_popup_rect.get().map(|rect| {
             render::PickerHitGeometry::new(
                 rect,
-                lh,
+                (self.units.picker)(lh).line_h,
                 engine_ref.picker_preview.is_some(),
                 &(self.units.picker_rows)(lh),
                 &engine_ref,
@@ -435,7 +435,7 @@ impl App {
             let engine = self.engine.borrow();
             render::PickerHitGeometry::new(
                 rect,
-                lh,
+                (self.units.picker)(lh).line_h,
                 engine.picker_preview.is_some(),
                 &(self.units.picker_rows)(lh),
                 &engine,

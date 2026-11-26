@@ -103,7 +103,7 @@ pub fn gtk_picker_sizing(line_height: f32) -> PickerSizing {
         width_clamp: (500.0, 2400.0),
         left_pane_ratio: 0.40,
         header_h: 2.0 * line_height + 6.0,
-        line_h: line_height,
+        line_h: palette_item_pitch(line_height),
         top_margin: line_height,
         // `viewport` is the editor pane (every tab group combined, not the
         // full window), so 0.9 of it tracks `compute`'s ~90 % width target;
@@ -112,6 +112,19 @@ pub fn gtk_picker_sizing(line_height: f32) -> PickerSizing {
         max_visible_cap: 60,
         min_popup_h: line_height * 4.0,
     }
+}
+
+/// The pitch a pixel backend's palette paints one result row at, for a
+/// chrome `line_height` — read from the `Palette` widget's own layout so
+/// popup sizing and row hit-testing use the same pitch the painter does.
+/// On a cell grid (`line_height <= 1.0`) this is one cell.
+pub fn palette_item_pitch(line_height: f32) -> f32 {
+    let probe = quadraui::Palette::default();
+    let ctx = quadraui::LayoutCtx::new(line_height, 1.0, false);
+    let area = quadraui::Rect::new(0.0, 0.0, 400.0, (line_height * 40.0).max(40.0));
+    quadraui::Primitive::layout(&probe, &ctx, area)
+        .row_height
+        .max(line_height)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -658,7 +671,8 @@ pub struct PickerHitGeometry {
     pub list_width: f32,
     /// Top edge of the first result row.
     pub rows_top: f32,
-    /// Height of one result row (`1.0` on TUI, the painted line height on GTK).
+    /// Height of one result row (`1.0` on TUI, the palette's painted row pitch on
+    /// pixel backends).
     pub row_height: f32,
     /// Width of the scrollbar gutter, measured back from the list pane's right
     /// edge.
