@@ -5085,6 +5085,48 @@ mod tests {
             );
         }
 
+        /// Clicking a completion row other than the selected one inserts
+        /// that row's candidate and closes the popup, the pointer twin of
+        /// navigating to it and pressing Enter. The click lands on the
+        /// popup row the driver finds on the painted screen, so the test
+        /// exercises the painted geometry and the click routing together.
+        #[test]
+        fn completion_popup_click_on_a_row_inserts_that_candidate_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.buffer_mut().insert(0, "ZQXWFOOBAR ZQXWFOOQUUX\n");
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            driver.type_char('G');
+            driver.type_char('o');
+            for c in "ZQXWFOO".chars() {
+                driver.type_char(c);
+            }
+
+            let screen = driver.screen();
+            let row = driver.find_bounds("│tx ZQXWFOOQUUX │").unwrap_or_else(|| {
+                panic!("the popup must list the \"ZQXWFOOQUUX\" candidate; screen:\n{screen}")
+            });
+            assert!(
+                driver.screen_has("│tx ZQXWFOOBAR "),
+                "precondition: the popup must list both candidates; screen:\n{screen}"
+            );
+
+            driver.click(row.x + 4.0, row.y + row.height / 2.0);
+
+            let screen = driver.screen();
+            assert!(
+                !screen.contains("│tx ZQXWFOO"),
+                "the click must close the completion popup; screen:\n{screen}"
+            );
+            assert_eq!(
+                screen.matches("ZQXWFOOQUUX").count(),
+                2,
+                "the clicked candidate must be inserted on the new line (so \
+                 it appears on both buffer lines); screen:\n{screen}"
+            );
+        }
+
         /// Mirrors `shell_app.rs`'s test of the same name: the
         /// LSP hover popup (`ScreenLayout::hover`) must anchor at the same
         /// tab-expanded display column as the completion popup above.
