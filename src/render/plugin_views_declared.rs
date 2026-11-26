@@ -710,28 +710,6 @@ pub fn populate_plugin_view_modal_form_controller(engine: &Engine, name: &str) -
     true
 }
 
-/// The filtered options of an open `combo` as the `Completions` list its
-/// dropdown paints as, highlight included.
-fn combo_dropdown_completions(combo: &quadraui::ComboBox) -> quadraui::Completions {
-    quadraui::Completions {
-        id: combo.dropdown_id(),
-        items: combo
-            .filtered_indices()
-            .into_iter()
-            .map(|i| quadraui::CompletionItem {
-                label: quadraui::StyledText::plain(combo.options[i].clone()),
-                detail: None,
-                documentation: None,
-                kind: quadraui::CompletionKind::Text,
-                icon: None,
-            })
-            .collect(),
-        selected_idx: combo.highlighted.unwrap_or(0),
-        scroll_offset: 0,
-        has_focus: combo.focused,
-    }
-}
-
 /// Paint the open `combo_box` field's filtered dropdown as an overlay on
 /// top of whichever host just painted its compact row via
 /// `FormController::render_and_cache` — see EXTENSIONS.md's `combo_box`
@@ -748,7 +726,14 @@ fn combo_dropdown_completions(combo: &quadraui::ComboBox) -> quadraui::Completio
 /// `render_and_cache` call just rendered through — same contract
 /// `field_rect`'s own doc states.
 ///
-/// Caches the resolved `quadraui::ComboBoxLayout` onto
+/// The dropdown is the popup `quadraui::ComboBox`'s own
+/// `Interactive::popups` describes, painted here, in the host's paint
+/// order, rather than queued for the runner's end-of-frame popup layer:
+/// that layer paints nothing while any `ModalStack` entry is open, and
+/// vimcode keeps entries there for overlays (editor hover, floats) that
+/// must not hide a sidebar form's dropdown.
+///
+/// Caches the resolved [`crate::core::plugin_ui::ComboDropdownLayout`] onto
 /// `Engine::plugin_view_combo_dropdown_layout`, keyed by `(view_name,
 /// field.id)`, so the click router
 /// (`route_plugin_view_combo_box_dropdown_click`) can hit-test it without a
@@ -768,6 +753,7 @@ pub(crate) fn paint_plugin_view_combo_box_dropdown(
     backend: &mut dyn quadraui::Backend,
 ) {
     use crate::core::plugin_ui::{namespaced_widget_id, ViewFieldKind};
+    use quadraui::DrawsPrimitives;
 
     let clear_layout = || {
         let mut cache = engine.plugin_view_combo_dropdown_layout.borrow_mut();
@@ -812,38 +798,37 @@ pub(crate) fn paint_plugin_view_combo_box_dropdown(
     combo.highlighted = edit.highlighted;
     combo.focused = true;
 
-    let filtered_count = combo.filtered_indices().len();
-    if filtered_count == 0 {
+    if combo.filtered_indices().is_empty() {
         clear_layout();
         return;
     }
 
-    let lh = backend.line_height();
-    // An upper bound comfortably above every filtered option's total
-    // height, clamped to the host's own rect — `ComboBox::layout` clamps
-    // the actual popup height to the filtered item count itself, same as
-    // `paint_editor_popups`'s completion-menu sizing.
-    let max_popup_height = (lh * (filtered_count as f32 + 0.5)).min(rect.height.max(lh));
-    let completions = combo_dropdown_completions(&combo);
-    let dropdown = completions.layout(
-        field_bounds.x,
-        field_bounds.y,
-        field_bounds.height,
-        rect,
-        field_bounds.width,
-        max_popup_height,
-        |_| quadraui::CompletionItemMeasure::new(lh),
-    );
     // The field row itself was already painted by
-    // `FormController::render_and_cache` just before this call, so only
-    // the dropdown paints here.
-    // TODO(#2175): paint through the ComboBox widget's own popup; its
-    // dropdown content widget is private to quadraui, so the filtered
-    // options paint as a `Completions` list in the meantime.
-    let _ = crate::render::draw_widget_plain(backend, dropdown.bounds, &completions);
+    // `FormController::render_and_cache` just before this call, so only the
+    // box's own dropdown popup paints here. It is anchored under the whole
+    // form row rather than the box's one-line field, and placed inside the
+    // host's rect rather than the whole viewport, so it never spills over
+    // neighbouring chrome whose clicks the form host does not receive.
+    // TODO(#2173): route presses through the box's `Interactive::handle`
+    // (`RoutedEvent::PopupEvent`) once plugin-view forms are `FrameTree`
+    // nodes, and queue the popup for the runner's popup layer once that
+    // layer paints popups while a `ModalStack` entry is open.
+    let combo_layout = backend.layout_primitive(field_bounds, &combo);
+    let state = quadraui::primitives::combo_box::ComboBoxState::default();
+    let Some(mut popup) = quadraui::Interactive::popups(&combo, &state, &combo_layout)
+        .into_iter()
+        .next()
+    else {
+        clear_layout();
+        return;
+    };
+    popup.anchor = quadraui::Rect::new(0.0, 0.0, field_bounds.width, field_bounds.height);
+    let popup_rect = popup.resolve(field_bounds, rect);
+    let _ = backend.draw_dyn(popup_rect, popup.content.as_ref(), &());
     let layout = crate::core::plugin_ui::ComboDropdownLayout {
         field_bounds,
-        dropdown,
+        popup_rect,
+        dropdown_id: combo.dropdown_id(),
     };
     engine.plugin_view_combo_dropdown_layout.replace(Some((
         view_name.to_string(),

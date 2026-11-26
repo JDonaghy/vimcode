@@ -1103,9 +1103,9 @@ pub enum ViewFieldKind {
     /// chevron; the open filtered-option overlay is an app-painted popup,
     /// `render::paint_plugin_view_combo_box_dropdown` — anchored to the
     /// field's own on-screen rect via `FormController::field_rect`, built
-    /// from vimcode's shadow `text`/`open`/`highlighted` state through
-    /// `quadraui::ComboBox::layout`/`Backend::draw_combo_box`, the same
-    /// primitive every backend already shares. A click on a filtered
+    /// from vimcode's shadow `text`/`open`/`highlighted` state, and painted
+    /// as the popup `quadraui::ComboBox`'s own `Interactive::popups`
+    /// describes, the same widget every backend shares. A click on a filtered
     /// option in that popup commits it
     /// (`render::route_plugin_view_combo_box_dropdown_click`), the same as
     /// `Enter`; a click elsewhere closes the dropdown with no event, like
@@ -1729,14 +1729,16 @@ pub struct PluginViewComboBoxEditState {
 }
 
 /// Where an open plugin-view `combo_box` dropdown painted: the field row it
-/// hangs from and the dropdown rows below (or above) it, in the host's
-/// absolute space.
-// TODO(#2175): replace with the ComboBox widget's own popup once the
-// combo field is routed through quadraui's `Interactive::popups`.
+/// hangs from, the rect the `quadraui::ComboBox`'s own dropdown popup
+/// resolved to, and that popup content's widget id, in the host's absolute
+/// space. The popup's rows are not stored here: they are read back from
+/// quadraui's painted-widget record for `dropdown_id`, so hit-testing
+/// always matches the rows the widget actually painted.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ComboDropdownLayout {
     pub field_bounds: quadraui::Rect,
-    pub dropdown: quadraui::CompletionsLayout,
+    pub popup_rect: quadraui::Rect,
+    pub dropdown_id: quadraui::WidgetId,
 }
 
 /// What a press over a [`ComboDropdownLayout`] landed on.
@@ -1751,9 +1753,26 @@ pub enum ComboDropdownHit {
 }
 
 impl ComboDropdownLayout {
+    /// Resolve `p` against this dropdown. A row hit names the filtered
+    /// index the dropdown widget tagged that row with; a point inside the
+    /// popup but on no row (its border) counts as [`ComboDropdownHit::Outside`].
     pub fn hit_test(&self, p: quadraui::Point) -> ComboDropdownHit {
-        if let quadraui::CompletionsHit::Item(idx) = self.dropdown.hit_test(p.x, p.y) {
-            return ComboDropdownHit::DropdownItem(idx);
+        if self.popup_rect.contains(p) {
+            let row = quadraui::primitive::with_painted_widgets(|painted| {
+                painted
+                    .iter()
+                    .filter(|w| w.id == self.dropdown_id)
+                    .last()
+                    .and_then(|w| {
+                        w.sub_regions
+                            .iter()
+                            .find(|(r, _)| r.contains(p))
+                            .map(|(_, sub)| sub.0 as usize)
+                    })
+            });
+            if let Some(idx) = row {
+                return ComboDropdownHit::DropdownItem(idx);
+            }
         }
         if self.field_bounds.contains(p) {
             ComboDropdownHit::Field
