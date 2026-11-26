@@ -52,9 +52,18 @@ pub fn run_emergency_flush() {
 }
 
 /// Return the path used for the always-on crash log.
-/// Uses the platform temp directory so it works on Linux, macOS, and Windows.
+///
+/// Lives under [`super::paths::vimcode_config_dir`] rather than the raw OS
+/// temp directory: that function honors each test's isolated `$HOME`
+/// override (`paths::set_test_home` in `--lib` tests, a spawned-process
+/// `HOME` env var in PTY integration tests), while `std::env::temp_dir()`
+/// does not. A crash log under the real temp dir is one single path shared
+/// by every `vcd` process on the machine — including concurrent/sequential
+/// test runs in the same CI job — so a crash anywhere in the job leaves a
+/// stale log that the next, unrelated process picks up on startup and
+/// blocks on via the crash-report dialog.
 pub fn crash_log_path() -> PathBuf {
-    std::env::temp_dir().join("vimcode-crash.log")
+    super::paths::vimcode_config_dir().join("vimcode-crash.log")
 }
 
 /// Append `msg` to the crash log file, creating it if necessary. Returns
@@ -76,6 +85,7 @@ pub fn crash_log_path() -> PathBuf {
 /// directly.
 fn append_to_crash_log(msg: &str) -> Option<PathBuf> {
     let path = crash_log_path();
+    fs::create_dir_all(path.parent()?).ok()?;
     fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -472,12 +482,6 @@ pub fn find_stale_swaps() -> Vec<(SwapHeader, PathBuf)> {
 mod tests {
     use super::*;
 
-    /// `crash_log_path()` is one fixed path under the OS temp dir, shared
-    /// by every test (and every real run) on the machine — serializes the
-    /// tests below that write/remove it directly so they can't interleave
-    /// and read back each other's content.
-    static CRASH_LOG_TEST_LOCK: Mutex<()> = Mutex::new(());
-
     #[test]
     fn test_swap_path_deterministic() {
         let p1 = swap_path_for(Path::new("/home/user/file.rs"));
@@ -487,17 +491,22 @@ mod tests {
 
     #[test]
     fn take_crash_report_is_a_noop_under_test() {
-        let _guard = CRASH_LOG_TEST_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "vimcode_crash_log_test_noop_{}",
+            std::process::id()
+        ));
+        let _guard = crate::core::paths::set_test_home(&home);
         // Guards against a dev machine's real, non-test crash log leaking
         // a dialog into — or being deleted by — a test run.
         let path = crash_log_path();
+        let _ = fs::create_dir_all(path.parent().unwrap());
         let _ = fs::write(&path, "PANIC: should never be read by a test\n");
         assert!(take_crash_report().is_none());
         assert!(
             path.exists(),
             "a test run must never delete a real crash log"
         );
-        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -558,9 +567,12 @@ mod tests {
     /// `contains("FIRST")` assertion fails.
     #[test]
     fn append_to_crash_log_appends_rather_than_truncates() {
-        let _guard = CRASH_LOG_TEST_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "vimcode_crash_log_test_append_{}",
+            std::process::id()
+        ));
+        let _guard = crate::core::paths::set_test_home(&home);
         let path = crash_log_path();
-        let _ = fs::remove_file(&path);
 
         append_to_crash_log("FIRST PANIC REPORT\n");
         append_to_crash_log("SECOND PANIC REPORT\n");
@@ -577,7 +589,7 @@ mod tests {
             "the second call's report must also be present; contents were: {contents:?}"
         );
 
-        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
