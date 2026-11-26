@@ -521,6 +521,15 @@ impl App {
 
         let consumed = match &owner {
             render::SidebarOwner::Explorer => {
+                // Every other panel arm below grants its own keyboard-focus
+                // flag on `is_press` — Explorer must too, or a click here
+                // right after the editor dropped every sidebar's focus
+                // (`clear_sidebar_focus`, `mouse_tabs.rs`) leaves
+                // `explorer_has_focus` stale-false and the next keystroke
+                // falls through to the editor instead of the tree.
+                if is_press {
+                    self.engine.borrow_mut().explorer_has_focus = true;
+                }
                 // The view-actions toolbar row sits above the tree
                 // (`paint_sidebar_panel_rung`'s `PANEL_EXPLORER` arm), so a
                 // press is checked against it first — mirrors
