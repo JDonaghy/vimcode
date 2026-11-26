@@ -5523,6 +5523,70 @@ mod sidebar_panel_clicks {
         );
     }
 
+    /// A Source Control toolbar button left pressed by keyboard navigation
+    /// keeps painting pressed while the mouse rests on a different button of
+    /// the same toolbar.
+    #[test]
+    fn keyboard_pressed_sc_toolbar_button_paints_while_another_is_hovered() {
+        let mut h = panel_harness(PANEL_GIT);
+        h.driver.render();
+        match h.painted_sidebar_bounds.get() {
+            Some(_) if h.engine.borrow().sc_panel_layout.borrow().is_some() => {}
+            _ => return,
+        };
+        let buttons: Vec<_> = {
+            let engine = h.engine.borrow();
+            let layout = engine.sc_panel_layout.borrow();
+            layout
+                .as_ref()
+                .and_then(crate::render::sidebar_panel_toolbar_layout)
+                .map(|t| {
+                    t.visible_items
+                        .iter()
+                        .filter(|i| i.clickable)
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let [pressed_button, hovered_button, ..] = buttons.as_slice() else {
+            return; // fewer than two clickable toolbar buttons in this repo state
+        };
+        let by = pressed_button.bounds.y + pressed_button.bounds.height / 2.0;
+        let sample = |h: &mut Harness<_>| -> Vec<(u8, u8, u8)> {
+            let x0 = (pressed_button.bounds.x + 3.0) as i32;
+            let x1 = (pressed_button.bounds.x + pressed_button.bounds.width - 3.0) as i32;
+            (x0..x1).map(|x| h.driver.pixel(x, by as i32)).collect()
+        };
+        let baseline = sample(&mut h);
+
+        h.engine.borrow_mut().sc_has_focus = true;
+        h.engine.borrow_mut().sc_button_focused = Some(pressed_button.item_idx);
+        h.driver.render();
+        let pressed = sample(&mut h);
+        assert_ne!(
+            baseline, pressed,
+            "precondition: a keyboard-pressed button paints a pressed highlight"
+        );
+
+        h.driver.mouse_move(
+            hovered_button.bounds.x + hovered_button.bounds.width / 2.0,
+            hovered_button.bounds.y + hovered_button.bounds.height / 2.0,
+        );
+        h.driver.render();
+        assert_eq!(
+            h.engine.borrow().sc_button_focused,
+            Some(pressed_button.item_idx),
+            "precondition: hovering another button leaves the keyboard press set"
+        );
+        assert_eq!(
+            sample(&mut h),
+            pressed,
+            "the keyboard-pressed button must keep its pressed paint while the \
+             mouse hovers a different toolbar button"
+        );
+    }
+
     /// `Engine::clear_sidebar_focus` must call `Engine::sc_set_focus(false)`,
     /// not set `sc_has_focus = false` directly. The method's other effects
     /// include clearing `sc_button_focused`, which drives `draw_sc_sidebar_panel`'s
