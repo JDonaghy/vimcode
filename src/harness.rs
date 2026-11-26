@@ -1461,6 +1461,38 @@ pub const SCENARIO_REGISTRY: &[ScenarioMeta] = &[
         issue: Some(2112),
         description: "activating a recent entry opens that workspace and dismisses the welcome panel",
     },
+    ScenarioMeta {
+        name: "move_dialog_click_on_move_moves_the_file",
+        area: FeatureArea::FileOps,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: Some(2195),
+        description: "clicking the move dialog's Move button moves the file, as Enter does",
+    },
+    ScenarioMeta {
+        name: "move_dialog_enter_moves_the_file",
+        area: FeatureArea::FileOps,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: Some(2195),
+        description: "Enter in the move dialog moves the file, as clicking Move does",
+    },
+    ScenarioMeta {
+        name: "move_dialog_click_on_cancel_keeps_the_file",
+        area: FeatureArea::FileOps,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: Some(2195),
+        description: "clicking the move dialog's Cancel button keeps the file, as Escape does",
+    },
+    ScenarioMeta {
+        name: "move_dialog_escape_keeps_the_file",
+        area: FeatureArea::FileOps,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: Some(2195),
+        description: "Escape in the move dialog keeps the file, as clicking Cancel does",
+    },
 ];
 
 /// Print the human-readable scenario table to stdout.
@@ -11784,5 +11816,164 @@ mod no_arg_gui_launch_first_frame_mod {
              screen:\n{}",
             driver.screen()
         );
+    }
+}
+
+// A dialog button click and its keyboard counterpart must reach the same
+// outcome on every backend. The move-file dialog carries a text input, so
+// it paints in-canvas everywhere (never as a native alert) and its buttons
+// are real click targets on GTK as well as TUI. Each input mode is its own
+// scenario because confirming or cancelling closes the dialog; the four
+// share one fixture and one post-condition per outcome, which is what makes
+// them a parity check.
+
+#[cfg(test)]
+mod move_dialog_click_keyboard_parity_mod {
+    use quadraui::testing::ConformanceDriver;
+
+    /// Scratch project for this thread: `foo.txt` beside an empty `sub/`.
+    fn project_dir(tag: &str) -> std::path::PathBuf {
+        crate::harness::scratch_dir(&format!("vimcode_move_dialog_parity_{tag}"))
+    }
+
+    /// An engine showing the move-file dialog for `foo.txt`, its
+    /// destination input already holding `sub`.
+    fn engine_fixture(tag: &str) -> crate::core::Engine {
+        let dir = project_dir(tag);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("foo.txt"), "hello").unwrap();
+
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.cwd = dir.clone();
+        engine.start_move_file_dialog(&dir.join("foo.txt"), &dir);
+        engine
+            .dialog
+            .as_mut()
+            .and_then(|d| d.input.as_mut())
+            .expect("the move dialog carries a destination input")
+            .value = "sub".to_string();
+        engine
+    }
+
+    /// Centre of the painted dialog button labelled `label`: the painted
+    /// run reading exactly `label` (a bracketed hotkey letter aside) on the
+    /// same row as the dialog's `Cancel` button, so the title's own `Move`
+    /// never matches. Read from the frame inventory, in the backend's own
+    /// units.
+    fn button_center<D: ConformanceDriver>(driver: &D, label: &str) -> (f32, f32) {
+        let inv = driver.inventory();
+        let runs = inv.text_runs();
+        let cancel_row = runs
+            .iter()
+            .find(|r| r.text.trim_matches(|c| c == '[' || c == ']') == "Cancel")
+            .map(|r| r.bounds)
+            .unwrap_or_else(|| panic!("the dialog must paint a Cancel button; painted: {runs:?}"));
+        runs.iter()
+            .map(|r| (r.text.replace(['[', ']'], ""), r.bounds))
+            .find(|(text, b)| {
+                text == label
+                    && b.y < cancel_row.y + cancel_row.height
+                    && cancel_row.y < b.y + b.height
+            })
+            .map(|(_, b)| (b.x + b.width / 2.0, b.y + b.height / 2.0))
+            .unwrap_or_else(|| {
+                panic!("the dialog must paint a {label:?} button beside Cancel; painted: {runs:?}")
+            })
+    }
+
+    fn assert_dialog_open<D: ConformanceDriver>(driver: &D) {
+        assert!(
+            driver.screen_has("Move 'foo.txt'"),
+            "precondition: the move dialog must paint in-canvas; painted: {:?}",
+            driver.inventory().text_runs()
+        );
+    }
+
+    fn assert_moved<D: ConformanceDriver>(driver: &D, tag: &str, how: &str) {
+        let dir = project_dir(tag);
+        assert!(
+            !driver.screen_has("Move 'foo.txt'"),
+            "confirming the move by {how} must close the dialog; painted: {:?}",
+            driver.inventory().text_runs()
+        );
+        assert!(
+            dir.join("sub").join("foo.txt").exists() && !dir.join("foo.txt").exists(),
+            "confirming the move by {how} must move foo.txt into sub/"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn assert_kept<D: ConformanceDriver>(driver: &D, tag: &str, how: &str) {
+        let dir = project_dir(tag);
+        assert!(
+            !driver.screen_has("Move 'foo.txt'"),
+            "cancelling by {how} must close the dialog; painted: {:?}",
+            driver.inventory().text_runs()
+        );
+        assert!(
+            dir.join("foo.txt").exists() && !dir.join("sub").join("foo.txt").exists(),
+            "cancelling by {how} must leave foo.txt where it was"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    crate::backend_conformance! {
+        label: move_dialog_click_on_move_moves_the_file,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture("click_move"),
+        size: (1000, 600),
+        body: |driver| {
+            driver.render();
+            assert_dialog_open(driver);
+            let (x, y) = button_center(driver, "Move");
+            driver.click(x, y);
+            driver.render();
+            assert_moved(driver, "click_move", "clicking Move");
+        },
+    }
+
+    crate::backend_conformance! {
+        label: move_dialog_enter_moves_the_file,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture("enter_move"),
+        size: (1000, 600),
+        body: |driver| {
+            driver.render();
+            assert_dialog_open(driver);
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.render();
+            assert_moved(driver, "enter_move", "Enter");
+        },
+    }
+
+    crate::backend_conformance! {
+        label: move_dialog_click_on_cancel_keeps_the_file,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture("click_cancel"),
+        size: (1000, 600),
+        body: |driver| {
+            driver.render();
+            assert_dialog_open(driver);
+            let (x, y) = button_center(driver, "Cancel");
+            driver.click(x, y);
+            driver.render();
+            assert_kept(driver, "click_cancel", "clicking Cancel");
+        },
+    }
+
+    crate::backend_conformance! {
+        label: move_dialog_escape_keeps_the_file,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture("escape_cancel"),
+        size: (1000, 600),
+        body: |driver| {
+            driver.render();
+            assert_dialog_open(driver);
+            driver.press_named(quadraui::NamedKey::Escape);
+            driver.render();
+            assert_kept(driver, "escape_cancel", "Escape");
+        },
     }
 }
