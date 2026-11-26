@@ -1336,6 +1336,22 @@ pub const SCENARIO_REGISTRY: &[ScenarioMeta] = &[
         issue: None,
         description: "Escape closes an open menu-bar dropdown without executing any of its items",
     },
+    ScenarioMeta {
+        name: "chrome_menu_bar_keyboard_navigation_runs_an_item",
+        area: FeatureArea::Chrome,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: Some(2176),
+        description: "Arrow keys walk an open menu-bar dropdown across menus and items, and Enter runs the highlighted item",
+    },
+    ScenarioMeta {
+        name: "chrome_status_bar_segment_click_opens_go_to_line",
+        area: FeatureArea::Chrome,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: Some(2176),
+        description: "Clicking the status bar's cursor-position segment opens the go-to-line picker",
+    },
     // ── Settings scenarios ────────────────────────────────────────────
     ScenarioMeta {
         name: "settings_number_enables_line_numbers",
@@ -10862,16 +10878,16 @@ mod chrome_menu_bar_keyboard_navigation_runs_an_item_mod {
                 driver.press_named(NamedKey::Down);
             }
             assert!(
-                !screen_row_has(driver, "View: Toggle Sidebar"),
+                !screen_row_has(driver, PALETTE_FIRST_ROW),
                 "precondition: the command palette is still closed while the \
                  dropdown has keyboard focus"
             );
             driver.press_named(NamedKey::Enter);
 
             // The palette lists every menu command as "<Menu>: <Item>", so
-            // its rows are what prove the highlighted item ran.
+            // its first row is what proves the highlighted item ran.
             assert!(
-                screen_row_has(driver, "View: Toggle Sidebar"),
+                screen_row_has(driver, PALETTE_FIRST_ROW),
                 "Enter on the highlighted 'Command Palette' item must open the \
                  command palette; painted: {:?}",
                 driver.inventory().text_runs()
@@ -10880,6 +10896,7 @@ mod chrome_menu_bar_keyboard_navigation_runs_an_item_mod {
     }
 
     const VIEW_DOWNS_TO_COMMAND_PALETTE: usize = 4;
+    const PALETTE_FIRST_ROW: &str = "File: New Tab";
 }
 
 #[cfg(test)]
