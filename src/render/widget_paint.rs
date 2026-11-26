@@ -180,14 +180,129 @@ pub(crate) fn context_menu_row_heights(backend: &dyn Backend) -> (f32, f32) {
     (layout.item_height, layout.separator_height)
 }
 
-/// Paint a dialog centred in `viewport` and return the layout the paint
-/// resolved, in absolute coordinates.
+/// Paint `dialog` inside `viewport` at the host-measured `layout` and
+/// return that layout, in absolute coordinates.
+///
+/// The box keeps the size vimcode measured for it (wide enough for its
+/// body text, a two-row input slot on the cell grid) rather than the
+/// fixed-width box `Dialog`'s own `Primitive::layout` resolves.
+// TODO(#2175): paint the `Dialog` directly once quadraui's `Dialog` takes a
+// host size hint (preferred width / measure) through `Primitive::layout`.
 pub(crate) fn draw_dialog(
     backend: &mut dyn Backend,
     viewport: Rect,
-    dialog: &quadraui::Dialog,
+    dialog: quadraui::Dialog,
+    layout: quadraui::DialogLayout,
 ) -> quadraui::DialogLayout {
-    draw_widget_plain(backend, viewport, dialog).layout
+    let sized = HostSizedDialog { dialog, layout };
+    draw_widget_plain(backend, viewport, &sized).layout
+}
+
+/// A [`quadraui::Dialog`] that lays out at a host-resolved
+/// [`quadraui::DialogLayout`] instead of measuring itself. Every other
+/// part of the widget contract (paint, sub-regions, focus, event handling,
+/// accessibility) is the dialog's own.
+struct HostSizedDialog {
+    dialog: quadraui::Dialog,
+    layout: quadraui::DialogLayout,
+}
+
+impl quadraui::A11yPrimitive for HostSizedDialog {
+    fn a11y_info(&self) -> quadraui::A11yInfo {
+        self.dialog.a11y_info()
+    }
+
+    fn a11y_children(&self) -> Vec<quadraui::A11yChild> {
+        self.dialog.a11y_children()
+    }
+
+    fn a11y_focus_key(&self) -> Option<String> {
+        self.dialog.a11y_focus_key()
+    }
+}
+
+impl quadraui::Primitive for HostSizedDialog {
+    type Layout = quadraui::primitives::dialog::DialogPrimitiveLayout;
+    type Event = quadraui::DialogHit;
+
+    fn id(&self) -> Option<&WidgetId> {
+        quadraui::Primitive::id(&self.dialog)
+    }
+
+    fn font_role(&self) -> quadraui::FontRole {
+        quadraui::Primitive::font_role(&self.dialog)
+    }
+
+    fn capture(&self) -> quadraui::frame::OwnedContent {
+        self.dialog.capture()
+    }
+
+    fn layout(&self, ctx: &quadraui::LayoutCtx, rect: Rect) -> Self::Layout {
+        let mut resolved = quadraui::Primitive::layout(&self.dialog, ctx, rect);
+        resolved.layout = self.layout.clone();
+        resolved
+    }
+
+    fn paint_bleed(&self, style: &quadraui::Style) -> f32 {
+        self.dialog.paint_bleed(style)
+    }
+
+    fn paint_zone(
+        &self,
+        layout: &Self::Layout,
+        units: quadraui::primitive::Units,
+    ) -> Option<Rect> {
+        self.dialog.paint_zone(layout, units)
+    }
+
+    fn paint(
+        &self,
+        layout: &Self::Layout,
+        surface: &mut dyn quadraui::PaintSurface,
+        env: &quadraui::PaintEnv,
+    ) {
+        self.dialog.paint(layout, surface, env)
+    }
+
+    fn paint_cells(
+        &self,
+        layout: &Self::Layout,
+        cells: &mut dyn quadraui::CellSurface,
+        env: &quadraui::PaintEnv,
+    ) {
+        self.dialog.paint_cells(layout, cells, env)
+    }
+}
+
+impl Interactive for HostSizedDialog {
+    type State = quadraui::primitives::dialog::DialogState;
+    type Action = quadraui::primitives::dialog::DialogAction;
+
+    fn focus(&self) -> quadraui::FocusSpec {
+        self.dialog.focus()
+    }
+
+    fn handle(
+        &self,
+        state: &mut Self::State,
+        event: &quadraui::RoutedEvent,
+        layout: &Self::Layout,
+        cx: &mut quadraui::EventCx,
+    ) -> quadraui::Handled<Self::Action> {
+        self.dialog.handle(state, event, layout, cx)
+    }
+
+    fn a11y_actions(&self, state: &Self::State) -> Vec<quadraui::A11yAction> {
+        self.dialog.a11y_actions(state)
+    }
+
+    fn sub_regions(&self, layout: &Self::Layout) -> Vec<(Rect, SubTarget)> {
+        self.dialog.sub_regions(layout)
+    }
+
+    fn sub_region_name(&self, sub: SubTarget) -> Option<&'static str> {
+        self.dialog.sub_region_name(sub)
+    }
 }
 
 /// The `ToolbarSubPart::Button` index of the visible item whose

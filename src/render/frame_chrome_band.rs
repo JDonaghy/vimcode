@@ -668,8 +668,8 @@ pub fn paint_dialog_rung(
     char_width: f64,
     line_height: f64,
 ) -> quadraui::DialogLayout {
-    let (dialog, _) = dialog_generic_layout(panel, viewport, char_width, line_height);
-    crate::render::draw_dialog(b, viewport, &dialog)
+    let (dialog, layout) = dialog_generic_layout(panel, viewport, char_width, line_height);
+    crate::render::draw_dialog(b, viewport, dialog, layout)
 }
 
 /// The [`FrameOp::ToastStack`] rung's whole body on both backends.

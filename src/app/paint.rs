@@ -792,9 +792,9 @@ impl App {
 
                         if sc.help_open {
                             let viewport = q_sb;
-                            let (dialog, _) =
+                            let (dialog, dlayout) =
                                 render::sc_help_dialog_layout(viewport, cw as f32, lh as f32);
-                            let _ = render::draw_dialog(backend, viewport, &dialog);
+                            let _ = render::draw_dialog(backend, viewport, dialog, dlayout);
                         }
                     } else {
                         // Git panel is the active tab but there's no repo open
