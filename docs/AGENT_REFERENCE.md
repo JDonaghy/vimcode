@@ -150,6 +150,31 @@ To validate a *new* scenario before adding it to `tui.yaml`:
    occasionally dropped/misrouted a keystroke — both fixed by changing the
    *scenario* (a longer settle; a single wrap-around `k` press instead of 8
    `j`s) rather than adding delays to paper over either.
+4. `wait_idle` is not a safe default settle, in either direction. It can
+   return almost immediately if nothing has been painted *yet* (the
+   `first-frame-painted` false-negative this file's own header already
+   warns about), **and** it can hard-fail the whole step — not silently
+   continue — if the stream never goes quiet for the requested `ms` within
+   `timeout_ms` (seen right after dismissing a terminal-pane output
+   overlay: a live blinking cursor kept the stream "unquiet" for the full
+   budget every time). Prefer `expect_within` on a concrete signal
+   instead — ideally one proving the *right* thing now owns the screen
+   (e.g. the new buffer's own content), not just an already-true string
+   that would pass on the very first poll and buy no real delay at all.
+   A real mouse click into the editor can also serve as a stronger,
+   more-synchronous settle than another keystroke — except right after
+   opening a surface a click would read as an "outside click" on
+   (confirmed: clicking the editor while a toast was open reliably
+   dismissed it, breaking everything after).
+5. A colon-prefixed ex command (`:e <file>`, `:Notifications`, `:set
+   ...`) sent as one `type_text` string occasionally lost the leading
+   `:` specifically under a real pty — the rest of the string then ran as
+   plain `NORMAL`-mode keystrokes instead of a command line, and nothing
+   visibly happened. Sending the colon as its own `key: ':'` step first,
+   confirmed clean across a dozen real `run-spec` trials where the
+   combined-burst form was not (`tests/smoke-spec/tui.yaml`'s
+   `toast-open-probe-b-colon-2193` and its siblings), fixed every
+   instance of this found so far.
 
 ### Test lanes: which command covers which backend (#645)
 
