@@ -153,6 +153,18 @@ impl App {
                     )
                 });
             let menu_event = if plain_char_in_open_menu || pointer_off_menu_labels {
+                // A move off the labels still clears the closed bar's hover
+                // highlight; the move itself goes on to whatever sits under
+                // the pointer.
+                let hover_to_clear = pointer_off_menu_labels
+                    && matches!(event, UiEvent::MouseMoved { .. })
+                    && menu_system.borrow().menu_bar().focused_item.is_some();
+                if hover_to_clear
+                    && menu_system.borrow_mut().handle(&event, backend, bar_rect)
+                        != quadraui::MenuEvent::Ignored
+                {
+                    self.draw_needed.set(true);
+                }
                 quadraui::MenuEvent::Ignored
             } else {
                 menu_system.borrow_mut().handle(&event, backend, bar_rect)
