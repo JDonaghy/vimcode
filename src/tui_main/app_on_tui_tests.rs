@@ -8314,6 +8314,52 @@ mod tests {
             );
         }
 
+        /// A confirm-move dialog whose body names a long absolute
+        /// destination must widen to fit it: the whole body line paints
+        /// on one row of an 80-column screen, not clipped at a fixed box
+        /// width.
+        #[test]
+        fn confirm_move_dialog_paints_its_whole_body_at_80_cols() {
+            let mut engine = plain_engine();
+            engine.confirm_move_file(
+                std::path::Path::new("/Users/john/src/project/src/main.rs"),
+                std::path::Path::new("/Users/john/src/project/src/bin/tools"),
+            );
+            assert!(engine.dialog.is_some(), "confirm_move_file opens a dialog");
+            let h = harness_no_sidebar(engine);
+            let body = "Move 'main.rs' to '/Users/john/src/project/src/bin/tools'?";
+            assert!(
+                h.driver.screen_has(body),
+                "the confirm-move body must paint unclipped; screen:\n{}",
+                h.driver.screen()
+            );
+        }
+
+        /// A dialog with more body lines than a fixed row cap still paints
+        /// its last line on a 24-row screen.
+        #[test]
+        fn dialog_paints_every_body_line_of_a_twelve_line_body() {
+            let mut engine = plain_engine();
+            engine.dialog = Some(crate::core::engine::Dialog {
+                title: "Lines".to_string(),
+                body: (1..=12).map(|i| format!("ZQBODY{i:02}")).collect(),
+                buttons: vec![crate::core::engine::DialogButton {
+                    label: "OK".to_string(),
+                    hotkey: 'o',
+                    action: "ok".to_string(),
+                }],
+                selected: 0,
+                tag: String::new(),
+                input: None,
+            });
+            let h = harness_no_sidebar(engine);
+            assert!(
+                h.driver.screen_has("ZQBODY12"),
+                "the twelfth body line must paint; screen:\n{}",
+                h.driver.screen()
+            );
+        }
+
         /// Mirrors `shell_app.rs`'s test of the same name: `:CheckNerdFonts`
         /// must paint on a real driver frame, with both the Nerd Font glyph
         /// row and the ASCII fallback row visible on the same screen.
