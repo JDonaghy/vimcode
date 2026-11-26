@@ -235,7 +235,7 @@ pub(crate) struct App {
     /// an insertion bar) rather than a new-split overlay.
     pub(crate) cached_tab_slots_abs: Rc<RefCell<TabSlotsAbsMap>>,
     /// Per-group `(Rect, TabBarLayout)` — the exact pixel-accurate geometry
-    /// `render_content` just painted (via `Backend::draw_tab_bar_icons_layout`).
+    /// `render_content` just painted (the layout the `TabBar` widget resolved).
     /// Consumed by tab-bar click hit-testing instead of char-cell `hit_regions`,
     /// which don't match proportional-font tab layout.
     pub(crate) cached_group_tab_bar_layouts: Rc<RefCell<GroupTabBarLayoutMap>>,

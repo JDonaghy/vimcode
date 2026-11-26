@@ -239,7 +239,7 @@ impl App {
     }
 
     /// Left edge of the bottom panel as last painted — the same `x`
-    /// `render_content` hands `draw_tab_bar` / the terminal pane, i.e. the
+    /// `render_content` hands the bottom tab strip / the terminal pane, i.e. the
     /// editor's left edge, right of the activity bar and sidebar.
     ///
     /// [`render::BottomPanelMetrics::panel_left`]. Falls back to `0.0`
@@ -569,12 +569,9 @@ impl App {
     /// Multi-group (post-split) layouts get a bar per group at the top edge of
     /// its own bounds; a single group gets one full-width bar at the editor top.
     ///
-    /// Painting goes through `render::paint_tab_bars` →
-    /// `Backend::draw_tab_bar_icons` rather than a `Surface::TabBar` push,
-    /// because quadraui's `Surface` enum carries no icon sidecar. With an
-    /// empty sidecar the two are byte-identical — quadraui's `draw_tab_bar`
-    /// forwards to `draw_tab_bar_icons` with `&[]` — so this is a pure
-    /// superset of the old call.
+    /// Painting goes through `render::paint_tab_bars`, which paints each
+    /// `TabBar` widget (icons included) through the widget contract; the same
+    /// widgets then reach the frame as `Surface::Widget`s for zone routing.
     #[allow(clippy::too_many_arguments)]
     // TODO(#2177): drop once `tree_layout` moves onto the widget contract.
     #[allow(deprecated)]
@@ -1370,8 +1367,8 @@ impl App {
         // silently stayed pinned at the default size forever.
         sync_ui_font_size(&engine.settings, backend);
         // Push the UI_FONT() family+size onto the paint backend's `ui_font`,
-        // which `draw_status_bar`, `draw_tree`, `draw_tab_bar_icons`, and
-        // `draw_menu_bar` now all honour for both paint and measurement. Re-set
+        // which the status bar, tree, tab bar and menu bar widgets now all
+        // honour for both paint and measurement. Re-set
         // every frame (not just once) so a runtime `:set ui_font_size=N` takes
         // effect immediately.
         // Push `settings.font_family`/`font_size` onto the paint backend's editor
@@ -1412,7 +1409,7 @@ impl App {
         // override partway through the frame would desync paint from
         // click/hover for all of those, not just the editor. The one place
         // that must NOT see this value — sidebar panel content
-        // (`tree_layout`/`list_layout`/`form_layout`/`msv_layout` all read
+        // (the tree, list, form and multi-section layouts all read
         // `current_line_height` directly) — gets it suspended narrowly,
         // around that one call; see `render_content`'s `FrameOp::
         // SidebarPanel` arm.

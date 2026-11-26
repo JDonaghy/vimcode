@@ -25,8 +25,6 @@ use super::*;
 /// Folder button is painted below it; a second, muted line explains there's
 /// nothing to pick from yet (no list, and any stale cached list layout is
 /// cleared so a leftover rect from a previous frame can't be hit).
-// TODO(#2174): drop once `draw_list/list_layout` moves onto the widget contract.
-#[allow(deprecated)]
 pub(crate) fn paint_welcome_panel(
     engine: &Engine,
     theme: &Theme,
@@ -147,11 +145,10 @@ pub(crate) fn paint_welcome_panel(
         max_content_width: None,
         show_v_scrollbar: true,
     };
-    backend.draw_list(list_rect, &list);
-    let list_layout = backend.list_layout(list_rect, &list);
+    let painted = crate::render::draw_widget_plain(backend, list_rect, &list).layout;
     engine
         .welcome_list_layout
-        .replace(Some((list_rect, list_layout)));
+        .replace(Some((list_rect, painted)));
 }
 
 /// Resolve `pos` (absolute, same units the last frame painted the panel
@@ -176,9 +173,9 @@ pub(crate) fn welcome_panel_click_target(
         }
     }
 
-    if let Some((list_rect, list_layout)) = engine.welcome_list_layout.borrow().as_ref() {
+    if let Some((list_rect, painted)) = engine.welcome_list_layout.borrow().as_ref() {
         if let quadraui::ListViewHit::Item(idx) =
-            list_layout.hit_test(pos.x - list_rect.x, pos.y - list_rect.y)
+            painted.hit_test(pos.x - list_rect.x, pos.y - list_rect.y)
         {
             // Most-recently-opened first, mirroring the `.rev()` the paint
             // side above built the list items from.

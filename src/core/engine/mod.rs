@@ -4987,8 +4987,8 @@ pub struct Engine {
     /// reason `plugin_view_tab_form_controller` is kept separate from
     /// `plugin_view_form_controller`.
     pub plugin_view_tab_tree_controller: std::rc::Rc<std::cell::RefCell<quadraui::TreeController>>,
-    /// The `Backend::list_layout` cached from the last frame that painted a
-    /// `ViewBody::List`-kind plugin view in the sidebar, alongside
+    /// The list-local `ListViewLayout` the `ListView` widget resolved in the
+    /// last frame that painted a `ViewBody::List`-kind plugin view in the sidebar, alongside
     /// the rect it was resolved against — same "paint caches, click reads"
     /// split as `Engine::ext_panel_tree_layout` / `Engine::board_layout`.
     /// `selected_idx`/`scroll_offset` are *not* re-derived from here; they
@@ -5002,8 +5002,8 @@ pub struct Engine {
     #[allow(clippy::type_complexity)]
     pub plugin_view_tab_list_layout:
         std::cell::RefCell<Option<(quadraui::Rect, quadraui::ListViewLayout)>>,
-    /// The `Backend::list_layout` cached from the last frame that painted the
-    /// welcome panel's recent-folders list (`EditorOp::Welcome`), alongside
+    /// The list-local `ListViewLayout` the `ListView` widget resolved in the
+    /// last frame that painted the welcome panel's recent-folders list (`EditorOp::Welcome`), alongside
     /// the rect it was resolved against — same "paint caches, click reads"
     /// split as `plugin_view_list_layout`. Rows are hit-tested from this
     /// cache rather than re-derived, so a click lands on exactly what was

@@ -34,10 +34,9 @@ use crate::core::engine::PluginViewHost;
 // app-level composition. quadraui states no order for any of it, so the
 // ordering is vimcode's to state and `render.rs` is where vimcode states
 // cross-backend contracts. The *rasterisers* underneath every rung are
-// already quadraui's (`draw_editor`, `draw_minimap`, `draw_tab_bar_icons`,
-// `draw_status_bar`, `draw_split`, `draw_drop_overlay`) — there is no
-// per-backend painting left to lift, only per-backend *sequencing*, which is
-// what this slice deletes.
+// already quadraui's (the editor, minimap, tab bar, status bar, split and
+// drop-overlay painters) — there is no per-backend painting left to lift,
+// only per-backend *sequencing*, which is what this slice deletes.
 
 /// One rung of the shared **editor band** — the surfaces vimcode stacks
 /// inside `AppShellLayout::main_content_bounds`.
@@ -660,9 +659,7 @@ pub fn quickfix_scroll_top(qf: &QuickfixPanel, visible_rows: usize) -> usize {
 
 /// The [`BottomOp::Quickfix`] rung's whole body on both backends.
 ///
-/// One `quickfix_to_list_view` adapter call and one `Backend::draw_list`.
-// TODO(#2174): drop once `draw_list` moves onto the widget contract.
-#[allow(deprecated)]
+/// One `quickfix_to_list_view` adapter call and one `ListView` widget paint.
 pub fn paint_quickfix_rung(
     b: &mut dyn quadraui::Backend,
     qf: &QuickfixPanel,
@@ -674,7 +671,7 @@ pub fn paint_quickfix_rung(
     }
     let mut list = quickfix_to_list_view(qf);
     list.scroll_offset = scroll_top;
-    b.draw_list(rect, &list);
+    let _ = crate::render::draw_widget_plain(b, rect, &list);
 }
 
 /// The [`BottomOp::SeparatedStatus`] rung's whole body on both backends.
@@ -796,7 +793,7 @@ pub fn paint_bottom_panel_rung(
         engine.terminal_open,
         !screen.bottom_tabs.output_lines.is_empty(),
     );
-    let layout = crate::render::draw_tab_bar(
+    let layout = crate::render::paint_tab_bar(
         b,
         quadraui::Rect::new(rect.x, rect.y, rect.width, lh),
         &tab_bar,
@@ -839,7 +836,7 @@ pub fn paint_bottom_panel_rung(
                 }
                 TerminalToolbar::TabStrip(bar) => {
                     crate::core::engine::TerminalToolbarHits::TabStrip {
-                        layout: crate::render::draw_tab_bar(b, toolbar_rect, &bar, None),
+                        layout: crate::render::paint_tab_bar(b, toolbar_rect, &bar, None),
                         origin_x: toolbar_rect.x as f64,
                     }
                 }
@@ -1031,8 +1028,7 @@ pub fn paint_bottom_panel_rung(
             // the `Form` default (which would render the view's likely-empty
             // field list instead). `paint_plugin_view_list`/
             // `paint_plugin_view_table` are not called for the dock host —
-            // both functions paint via `Backend::draw_list`/
-            // `draw_data_table` before reaching their own
+            // both functions paint their widget before reaching their own
             // `PluginViewHost::Dock => return false` cache-selection arm, so
             // calling them here would paint content with no corresponding
             // cached hit-test layout, leaving a click over it to fall through
@@ -1134,17 +1130,7 @@ pub fn paint_tab_bars<'a>(
         .into_iter()
         .map(|target| {
             let hover = hovered_close.and_then(|(gid, i)| (gid == target.group_id).then_some(i));
-            // `draw_tab_bar_icons_layout` with an empty sidecar is
-            // byte-identical to `draw_tab_bar_layout` (quadraui's
-            // `draw_tab_bar_layout` literally forwards to it with `&[]`), so
-            // the Nerd-Fonts-off path keeps today's geometry exactly.
-            let layout = if target.icons.is_empty() {
-                crate::render::draw_tab_bar(backend, target.rect, target.bar, hover)
-            } else {
-                let mut bar = target.bar.clone();
-                bar.icons = target.icons.to_vec();
-                crate::render::draw_tab_bar(backend, target.rect, &bar, hover)
-            };
+            let layout = crate::render::paint_tab_bar(backend, target.rect, target.bar, hover);
             PaintedTabBar {
                 group_id: target.group_id,
                 rect: target.rect,

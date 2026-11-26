@@ -489,8 +489,7 @@ pub fn build_screen_layout_with_breadcrumb_row(
             let is_active = gid == engine.active_group;
             let has_split = is_active || engine.is_in_diff_view();
             // Built once and reused for measurement *and* paint — the
-            // sidecar the backend hands to `tab_bar_layout_icons` is the same
-            // one it hands to `draw_tab_bar_icons`.
+            // sidecar measured here is the one the widget paints with.
             let tab_icons = build_tab_bar_icons(&tabs);
             let hit_regions = compute_tab_bar_layout(
                 &tabs,
@@ -506,13 +505,14 @@ pub fn build_screen_layout_with_breadcrumb_row(
             } else {
                 None
             };
-            let bar = build_tab_bar_primitive(
+            let mut bar = build_tab_bar_primitive(
                 &tabs,
                 has_split,
                 diff_toolbar.as_ref(),
                 tab_scroll_offset,
                 accent,
             );
+            bar.icons = tab_icons;
             GroupTabBar {
                 group_id: gid,
                 tabs,
@@ -521,7 +521,6 @@ pub fn build_screen_layout_with_breadcrumb_row(
                 tab_scroll_offset,
                 hit_regions,
                 bar,
-                icons: tab_icons,
             }
         })
         .collect();

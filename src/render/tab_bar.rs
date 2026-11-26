@@ -29,13 +29,10 @@ pub struct GroupTabBar {
     /// edge of group bounds). Backends hit-test clicks against this directly
     /// via [`resolve_tab_bar_click`] instead of re-deriving geometry.
     pub hit_regions: quadraui::TabBarLayout,
-    /// Pre-built quadraui `TabBar` primitive — backends draw this directly.
+    /// Pre-built quadraui `TabBar` widget, painted as-is through the widget
+    /// contract. Its `icons` carry the [`build_tab_bar_icons`] sidecar, the
+    /// same one [`Self::hit_regions`] was measured with.
     pub bar: quadraui::TabBar,
-    /// Per-tab icon sidecar parallel to `bar.tabs`, from
-    /// [`build_tab_bar_icons`]. Empty when Nerd Fonts are off. Backends must
-    /// pass this to **both** `Backend::draw_tab_bar_icons` and
-    /// `Backend::tab_bar_layout_icons`.
-    pub icons: Vec<Option<quadraui::TabIcon>>,
 }
 
 // ── Tab bar hit region constants (char-cell units) ──────────────────────────
@@ -52,9 +49,9 @@ pub const TAB_CLOSE_COLS: u16 = 2;
 ///
 /// `icon_cols` is the per-tab icon reservation from
 /// [`quadraui::tab_icon_cols`] — glyph width plus a 1-column gap, or `0`
-/// for an undecorated tab. It must be folded in here because
-/// `TuiBackend::draw_tab_bar_icons` adds `tab_icon_cols` to its per-tab width
-/// budget; a hit box measured without it sits one glyph left of the painted tab.
+/// for an undecorated tab. It must be folded in here because the `TabBar`
+/// widget adds `tab_icon_cols` to its per-tab width budget when it paints; a
+/// hit box measured without it sits one glyph left of the painted tab.
 fn tab_hit_width(t: &TabInfo, icon_cols: u16) -> usize {
     quadraui::tui::display_width(&t.name) + TAB_CLOSE_COLS as usize + icon_cols as usize
 }
@@ -64,17 +61,16 @@ fn tab_hit_width(t: &TabInfo, icon_cols: u16) -> usize {
 ///
 /// The result is a slice **parallel to `tabs`** (and therefore to the
 /// `quadraui::TabBar::tabs` that [`build_tab_bar_primitive`] derives from the
-/// same slice): entry `i` decorates tab `i`. Pass it to
-/// `Backend::draw_tab_bar_icons` *and* `Backend::tab_bar_layout_icons` — a
-/// caller that paints with icons but measures without them reports slot and
-/// close-button bounds shifted left of the painted glyphs.
+/// same slice): entry `i` decorates tab `i`. It becomes the widget's
+/// `TabBar::icons` *and* feeds [`compute_tab_bar_layout`] — a caller that
+/// paints with icons but measures without them reports slot and close-button
+/// bounds shifted left of the painted glyphs.
 ///
-/// Returns an **empty** vec when Nerd Fonts are off. `&[]` is quadraui's
-/// "no icons at all" argument and makes `draw_tab_bar_icons` byte-identical to
-/// `draw_tab_bar`, so the no-Nerd-Font geometry is exactly what it was before
-/// this feature existed. Deliberately *not* the ASCII fallbacks
-/// [`icons::file_icon`] would otherwise return: a bare `R`/`P`/`#` before every
-/// tab label is noise, not parity.
+/// Returns an **empty** vec when Nerd Fonts are off. An empty `icons` is
+/// quadraui's "no icons at all" value and reserves no icon columns, so the
+/// no-Nerd-Font geometry is that of a plain tab bar. Deliberately *not* the
+/// ASCII fallbacks [`icons::file_icon`] would otherwise return: a bare
+/// `R`/`P`/`#` before every tab label is noise, not parity.
 pub fn build_tab_bar_icons(tabs: &[TabInfo]) -> Vec<Option<quadraui::TabIcon>> {
     if !icons::nerd_fonts_enabled() {
         return Vec::new();
@@ -546,15 +542,12 @@ pub fn register_nerd_font_fallback(b: &mut dyn quadraui::Backend) {
     b.set_nerd_font_fallback(&family);
 }
 
-/// One tab bar ready to be painted via `Surface::TabBar` (GTK) or
-/// `render_tab_bar` (TUI).
+/// One tab bar ready to be painted through the widget contract and pushed
+/// into the frame as a `Surface::Widget`.
 pub struct TabBarDrawTarget<'a> {
     pub rect: quadraui::Rect,
+    /// The widget itself, icons included — see [`GroupTabBar::bar`].
     pub bar: &'a quadraui::TabBar,
-    /// Per-tab icon sidecar parallel to `bar.tabs`. Pass to **both**
-    /// `Backend::draw_tab_bar_icons` and `Backend::tab_bar_layout_icons` —
-    /// see [`build_tab_bar_icons`].
-    pub icons: &'a [Option<quadraui::TabIcon>],
     /// Group this tab bar belongs to — the active (and only) group in
     /// single-group mode.
     pub group_id: GroupId,
@@ -595,7 +588,6 @@ pub fn tab_bar_draw_targets<'a>(
                 tab_row_h as f32,
             ),
             bar: &gtb.bar,
-            icons: &gtb.icons,
             group_id: gtb.group_id,
         })
         .collect()
