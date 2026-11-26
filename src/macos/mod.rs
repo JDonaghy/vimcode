@@ -224,14 +224,10 @@ mod mac_driver_tests {
         let text: String = (0..500).map(|i| format!("line {i}\n")).collect();
         engine.buffer_mut().insert(0, &text);
         engine.settings.minimap = true;
-        // Nerd-font tab icons OFF, deliberately. `render::build_tab_bar_icons`
-        // returns an empty sidecar when they are off, which is the only input
-        // `MacBackend::draw_tab_bar_icons` accepts without firing its
-        // `debug_assert!` — per-tab icon glyphs are a *documented* macOS gap,
-        // not a bug, and because it is a `debug_assert!` rather than a
-        // `todo!()` a release binary paints icon-less tabs instead of aborting.
-        // Leaving them on here would make both tests below fail on that gap
-        // and assert nothing about the minimap, so it is scoped out on purpose.
+        // Nerd-font tab icons OFF, deliberately: `render::build_tab_bar_icons`
+        // returns an empty sidecar when they are off, so the tab bar paints
+        // plain labels and both tests below assert on the minimap alone,
+        // independent of whether the icon font resolves on this host.
         engine.settings.use_nerd_fonts = Some(false);
         engine
     }

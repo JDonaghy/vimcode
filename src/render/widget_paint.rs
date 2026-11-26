@@ -115,7 +115,7 @@ pub(crate) fn status_bar_layout(
 
 /// Paint a tab bar and return its bar-relative layout. `hovered_close` is
 /// the tab whose close glyph the pointer is over.
-pub(crate) fn draw_tab_bar(
+pub(crate) fn paint_tab_bar(
     backend: &mut dyn Backend,
     rect: Rect,
     bar: &quadraui::TabBar,

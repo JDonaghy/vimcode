@@ -13,6 +13,8 @@ use std::sync::Mutex;
 #[cfg(test)]
 mod app_on_tui_tests;
 mod backend;
+#[cfg(test)]
+mod list_and_tab_bar_widget_tests;
 
 // `quadraui::Backend::set_current_line_height`/`set_current_char_width`
 // default to a no-op, which is what the local `impl crate::app::TextMetricsBackend`

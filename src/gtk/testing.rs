@@ -1954,7 +1954,7 @@ mod tests {
 
     /// The quadraui#594 driver helpers resolve against vimcode's editor
     /// tab bar — verify that [`crate::render::EDITOR_TAB_BAR_WIDGET_ID`] is
-    /// really the id `GtkBackend::draw_tab_bar` cached the layout under, and
+    /// really the id the `TabBar` widget recorded its painted layout under, and
     /// the bar paints during a plain harness frame.
     ///
     /// Also pins the `None` contract: an index past the last visible tab
@@ -2007,52 +2007,13 @@ mod tests {
 
     /// With a single tab group, clicking a tab's × must close it.
     ///
-    /// # It found a real bug, fixed upstream by quadraui#615
-    ///
-    /// This test exposed a genuine GTK paint-vs-hit-test divergence in
-    /// quadraui. The upstream fix is what made it pass. **The assertion below
-    /// never changed** — it was correct all along.
-    ///
-    /// This test was green before #659 and went red after it, and **the code
-    /// under test did not change**. Only the source of the click coordinate
-    /// did, from this module's own `tab_close_center` to quadraui#594's
-    /// `GtkDriver::tab_close_center`. The two disagreed because they read
-    /// different things:
-    ///
-    /// * the deleted local helper read `App::cached_tab_close_abs`, derived
-    ///   from `Backend::tab_bar_layout()` — the *same* no-paint measurement
-    ///   `click::pixel_to_click_target` resolves against;
-    /// * `GtkDriver::tab_close_center` reads the `TabBarLayout` that
-    ///   `GtkBackend::draw_tab_bar` cached **while painting**.
-    ///
-    /// So the old assertion was a closed loop: it could only ever fail if
-    /// `tab_bar_layout()` disagreed with itself. Pointing it at the painted
-    /// geometry opened the loop, and the loop turned out to be open by a whole
-    /// tab's width.
-    ///
-    /// # Exact quadraui defect (confirmed by instrumenting `render_content`)
-    ///
-    /// `GtkBackend::tab_bar_layout` added `rect.x` to every hit range **twice**:
-    ///
-    /// 1. `crate::backend::shift_tab_bar_hits(&mut hits, rect.x as f64)`,
-    ///    added after `tab_bar_layout_to_hits` (whose own doc comment says its
-    ///    spans are bar-relative and the caller owes exactly one `shift_tab_bar_hits`);
-    /// 2. the older hand-rolled `let x_off = rect.x as f64; …` loop at the
-    ///    bottom, which was left in place — it walks `slot_positions`, `close_bounds`
-    ///    and `right_segment_bounds` and adds `x_off` a second time.
-    ///
-    /// Deleting either one fixes it, and quadraui#615 deleted the second.
-    /// `gtk::draw_tab_bar` (the paint path) always shifted exactly once, which is
-    /// why the painted glyphs and `GtkDriver::tab_close_center` agreed with each
-    /// other and only the no-paint query was wrong.
-    ///
-    /// The net effect on a user was that *whenever the tab bar did not start
-    /// at x == 0* — any time the sidebar/activity bar is open — every entry in
-    /// `App::cached_tab_pixel_hits` was one `rect.x` too far right, so
-    /// `click::resolve_pixel_tab_click` matched nothing and GTK silently fell
-    /// back to `resolve_charcell_tab_click`. That fallback kept *selecting* a tab
-    /// roughly right but never resolved the narrow × zone, so clicking a tab's
-    /// close button did nothing at all.
+    /// The click point comes from `GtkDriver::tab_close_center`, which reads
+    /// the `TabBarLayout` the `TabBar` widget resolved **while painting**,
+    /// while `click::pixel_to_click_target` resolves against vimcode's own
+    /// cached copy of that layout. The two must agree for every bar origin,
+    /// including one right of the sidebar/activity bar (`rect.x > 0`), where
+    /// an extra origin shift would push every hit range one `rect.x` too far
+    /// right and leave the narrow × zone unreachable.
     #[test]
     fn single_group_tab_close_button_closes_that_tab() {
         let mut h = harness(engine_with_three_tabs_one_group(), 1400, 900);
@@ -2284,11 +2245,11 @@ mod tests {
     /// With icons painted, a click on the painted × must still close the tab
     /// it sits on.
     ///
-    /// GTK caches click geometry from a *second*, no-paint measurement pass
-    /// (`App::cached_tab_pixel_hits`). quadraui's own doc is explicit that a
-    /// caller which paints with icons must measure with
-    /// `tab_bar_layout_icons`: the icon reservation widens every decorated
-    /// tab, so the icon-less twin reports every slot and close-button bound
+    /// GTK hit-tests clicks against cached tab geometry
+    /// (`App::cached_tab_pixel_hits`), which must be measured with the same
+    /// `TabBar::icons` the widget paints with: the icon reservation widens
+    /// every decorated tab, so an icon-less measurement reports every slot
+    /// and close-button bound
     /// shifted left of the painted glyphs, by a cumulative one icon width per
     /// preceding tab. The × zone is narrow (`tighten_close_bounds` trims it to
     /// the glyph box), so a drift moves it clean off every cached hit zone.
@@ -2319,7 +2280,7 @@ mod tests {
             tab_names(&h),
             vec!["alpha703.rs", "gamma703.md"],
             "clicking tab 1's painted × must close tab 1 — measuring with \
-             the icon-less `tab_bar_layout` while painting with icons closes \
+             an icon-less tab-bar layout while painting with icons closes \
              the tab to its left"
         );
     }
@@ -3102,8 +3063,8 @@ mod tests {
 
     /// Tab labels must also honour `Backend::set_ui_font` — the other
     /// non-dialog surface whose acceptance this test asserts (breadcrumb
-    /// already covered above). `draw_tab_bar_icons`'s paint call and its
-    /// no-paint measurement twin both use `ui_font`. Proving the *size* half
+    /// already covered above). The `TabBar` widget's paint and its layout
+    /// both measure in the chrome font `ui_font` sets. Proving the *size* half
     /// reaches the tab bar is proof the *family* half reaches it too: this is
     /// the practical form of "chrome glyph extents change when `UI_FONT_FAMILY`
     /// changes, on a surface that is not a dialog" that a hardcoded `const`
@@ -5167,7 +5128,7 @@ mod sidebar_panel_clicks {
     /// `render::apply_bottom_panel_route`.
     ///
     /// The click is aimed at the geometry the frame actually painted — the
-    /// `slot_positions` `draw_tab_bar` returned into
+    /// `slot_positions` the painted `TabBar` widget returned into
     /// `engine.bottom_tab_bar_hits`, and the tab-strip row from
     /// `engine.bottom_panel_geometry` — never a guessed offset, so a strip
     /// that paints somewhere else fails rather than passing by luck.
@@ -9932,8 +9893,7 @@ mod panel_surfaces {
         // `editor_area_h` — is identical either way); only the *active* tab
         // and its content differ: the terminal grid (`Backend::draw_terminal`)
         // vs. the debug-output text display (`Backend::draw_text_display`),
-        // plus which tab is highlighted in the strip `Backend::draw_tab_bar`
-        // paints above them.
+        // plus which tab is highlighted in the tab strip painted above them.
         let region = |kind: crate::render::BottomPanelKind| {
             bottom_region_pixels(1400, 900, move |e| {
                 e.terminal_open = true;

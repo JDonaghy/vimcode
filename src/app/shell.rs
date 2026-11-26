@@ -139,8 +139,6 @@ impl quadraui::ShellApp for App {
         self.sync_per_frame_backend_state(backend, &engine, &theme);
     }
 
-    // TODO(#2174): drop once `draw_list` moves onto the widget contract.
-    #[allow(deprecated)]
     fn render_content(
         &self,
         backend: &mut dyn quadraui::Backend,
@@ -814,7 +812,7 @@ impl quadraui::ShellApp for App {
                         ) {
                             let list =
                                 render::tab_switcher_to_quadraui_list_view(ts, geo.visible_rows);
-                            backend.draw_list(geo.bounds, &list);
+                            let _ = render::draw_widget_plain(backend, geo.bounds, &list);
                             self.tab_switcher_popup_rect.set(Some(geo.bounds));
                             composed.push(render::FrameOp::TabSwitcher);
                         }

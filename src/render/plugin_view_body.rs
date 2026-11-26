@@ -72,10 +72,9 @@ fn plugin_view_to_list(
 }
 
 /// Paint a `ViewBody::List`-kind view into `rect` and cache the resolved
-/// `Backend::list_layout` for [`route_plugin_view_list_click`]. Returns
-/// `false` when `name` isn't a `List`-kind view.
-// TODO(#2174): drop once `draw_list/list_layout` moves onto the widget contract.
-#[allow(deprecated)]
+/// list-local `ListViewLayout` the paint produced for
+/// [`route_plugin_view_list_click`]. Returns `false` when `name` isn't a
+/// `List`-kind view.
 pub(crate) fn paint_plugin_view_list(
     engine: &Engine,
     name: &str,
@@ -90,8 +89,7 @@ pub(crate) fn paint_plugin_view_list(
     let selected = engine.plugin_view_selected(host);
     let scroll_top = engine.plugin_view_scroll_top(host);
     let list = plugin_view_to_list(name, title, items, selected, scroll_top, has_focus);
-    backend.draw_list(rect, &list);
-    let layout = backend.list_layout(rect, &list);
+    let layout = crate::render::draw_widget_plain(backend, rect, &list).layout;
     let cache = match host {
         PluginViewHost::Sidebar => &engine.plugin_view_list_layout,
         PluginViewHost::Tab => &engine.plugin_view_tab_list_layout,
@@ -1416,10 +1414,9 @@ pub(crate) fn handle_plugin_view_text_key(
 // `Chart` has no scroll or selection state of its own — a data point can be
 // clicked but there is nothing to navigate — so unlike List/Table it needs
 // no `Engine` selection/scroll plumbing, only the layout cache. It also
-// paints and lays out in a *single* `Backend::draw_chart` call rather than
-// List's `draw_list` + `list_layout` pair, and that call's returned
-// `ChartLayout` is in the ABSOLUTE coordinate frame (shifted by `rect.x`/
-// `rect.y` already — see `Backend::chart_layout`'s doc comment), the
+// paints and lays out in a *single* `Backend::draw_chart` call, and that
+// call's returned `ChartLayout` is in the ABSOLUTE coordinate frame
+// (shifted by `rect.x`/`rect.y` already — see `Backend::chart_layout`'s doc comment), the
 // opposite of `ListViewLayout`'s LOCAL frame. So the click router below
 // must *not* subtract `rect.x`/`rect.y` before calling `hit_test`.
 

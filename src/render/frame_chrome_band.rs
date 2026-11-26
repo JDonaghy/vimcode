@@ -121,7 +121,7 @@ pub enum FrameOp {
     /// The unified picker / command palette — [`paint_picker_rung`] on both
     /// backends.
     UnifiedPicker,
-    /// The Ctrl+Tab MRU popup (`Backend::draw_list`).
+    /// The Ctrl+Tab MRU popup (a `ListView` widget).
     TabSwitcher,
     /// `Backend::draw_context_menu`.
     ContextMenu,
