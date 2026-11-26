@@ -340,11 +340,11 @@ impl App {
     /// divider lines *within* each group.
     ///
     /// `window_editors` collects each window's owned `quadraui::Editor` for
-    /// the caller's `FrameHitMap`. `Surface::Editor` owns its `Editor` by
+    /// the caller's click surfaces. `Surface::Editor` owns its `Editor` by
     /// value, so the one pushed onto the frame is a clone taken immediately
-    /// before `window_editors` takes the original — same content, so the
-    /// map hit-tests against data identical to what was painted rather than
-    /// a second, independently-built copy that could drift.
+    /// before `window_editors` takes the original — same content, so clicks
+    /// hit-test against the rect that was painted rather than a second,
+    /// independently-built copy that could drift.
     ///
     /// TUI's twin is `render_impl::render_all_windows`, which also paints its
     /// within-group separators (`render_separators`) from the same rung.
@@ -371,7 +371,7 @@ impl App {
             // (an empty placeholder — `rw.lines` is `vec![]` for a
             // plugin-view window, see `render::build_rendered_window`'s
             // short-circuit) so its indices stay 1:1 with `screen.windows`
-            // for `compose_editor_band_rungs`' later `FrameHitMap` build.
+            // for `compose_editor_band_rungs`' later click-surface record.
             if let Some(view_name) = &rw.plugin_view {
                 let engine = self.engine.borrow();
                 engine.plugin_view_tab_form_rect.set(rect);
@@ -1439,7 +1439,7 @@ impl App {
         self.status_segment_map.borrow_mut().clear();
     }
 
-    /// Compose the **editor band** and recover this frame's `FrameHitMap` from it.
+    /// Compose the **editor band** and record this frame's click surfaces from it.
     ///
     /// Walks `render::paint_editor_band_rungs`, the single loop both this
     /// method and TUI now call — see that function's own doc for which rungs
@@ -1450,8 +1450,6 @@ impl App {
     /// used); `metrics` is `(line_height, char_width)` and `tab_metrics` is
     /// `(tab_row_h, tab_bar_h)`, both in pixels.
     #[allow(clippy::too_many_arguments)]
-    // TODO(#2173): drop once `hit_map` moves onto the widget contract.
-    #[allow(deprecated)]
     pub(crate) fn compose_editor_band_rungs(
         &self,
         backend: &mut dyn quadraui::Backend,
@@ -1462,7 +1460,6 @@ impl App {
         metrics: (f64, f64),
         tab_metrics: (f64, f64),
     ) {
-        use quadraui::{ScreenLayout as QSL, Surface};
         let (lh, cw) = metrics;
         let (tab_row_h, tab_bar_h) = tab_metrics;
 
@@ -1480,7 +1477,7 @@ impl App {
         self.tab_visible_counts.borrow_mut().clear();
 
         // `window_editors`/`hit_bars` stash what the `Windows`/`TabBars` rungs
-        // painted, past the walk, so the `FrameHitMap` references the SAME objects
+        // painted, past the walk, so the click surfaces reference the SAME objects
         // just painted rather than a second copy that could drift.
         // Both scrollbars ARE painted for the editor on GTK. quadraui#968 taught
         // `gtk::editor::draw_editor` to paint both scrollbars itself. Geometry comes
@@ -1517,38 +1514,22 @@ impl App {
             debug_assert!(false, "GTK {why}");
         }
 
-        // ── Recover a FrameHitMap for Editor/TabBar zone detection ─────────────
-        // Pure `.push()` accumulation into a *separate* `ScreenLayout`, built
-        // from the same `Editor` objects painted by the `Windows` rung above
-        // (`window_editors`, same order as `screen.windows` so
-        // `FrameZone::Editor { idx }` maps straight back to
-        // `cached_layout.windows[idx]`) plus the `TabBar` surfaces the
-        // `TabBars` rung recorded. `ScreenLayout::hit_map()`
-        // makes no `backend.draw_*()` calls, so accumulating into it can never
-        // reorder or repeat the real painting done above — see
-        // `click::pixel_to_click_target` for the consumer side.
-        //
-        // Editors are pushed first and the tab bars after, so the first tab
-        // bar's `FrameZone::TabBar { idx }` is `window_editors.len()`, not `0`
-        // — the *global* surface index `cached_tab_bar_zones` is keyed by.
-        let mut hit_frame = QSL::new();
+        // ── Record the editor band's hit surfaces ──────────────────────────────
+        // The same `Editor` rects painted by the `Windows` rung
+        // (`window_editors`, in `screen.windows` order, so a pane's index maps
+        // straight back to `cached_layout.windows`) plus the `TabBar` widgets the
+        // `TabBars` rung recorded, as `FrameTree` nodes. Recording makes no
+        // `backend.draw_*()` calls, so it can never reorder or repeat the real
+        // painting done above — see `click::pixel_to_click_target` for the
+        // consumer side.
+        let mut band_hits = crate::click::EditorBandHits::new();
         for editor in &window_editors {
-            hit_frame.push(Surface::Editor {
-                rect: editor.rect,
-                editor: editor.clone(),
-            });
+            band_hits.push_editor(editor.rect);
         }
-        let mut tab_bar_zones: HashMap<usize, (core::window::GroupId, quadraui::Rect)> =
-            HashMap::new();
-        for (surface_idx, (group_id, rect, bar)) in (window_editors.len()..).zip(hit_bars) {
-            hit_frame.push(Surface::Widget {
-                rect,
-                widget: Box::new(bar.clone()),
-            });
-            tab_bar_zones.insert(surface_idx, (group_id, rect));
+        for (group_id, rect, bar) in hit_bars {
+            band_hits.push_tab_bar(group_id, rect, bar.clone());
         }
-        *self.cached_frame_hit_map.borrow_mut() = Some(hit_frame.hit_map());
-        *self.cached_tab_bar_zones.borrow_mut() = tab_bar_zones;
+        *self.cached_editor_band_hits.borrow_mut() = Some(band_hits);
 
         // Refresh the drop geometry the *drag hit-test* reads
         // (`handle_mouse_drag_msg` → `compute_tab_drop_zone`), unconditionally

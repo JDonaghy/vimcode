@@ -9,9 +9,6 @@
 //!
 //! Tab-bar hit-testing uses `quadraui::TabBarLayout::hit_test` — see
 //! [`GroupTabBarLayoutMap`].
-// TODO(#2173): drop once click routing moves from `FrameHitMap` onto `FrameTree`.
-#![allow(deprecated)]
-
 use crate::core::engine::EngineAction;
 use crate::core::window::GroupId;
 use crate::core::{Engine, WindowId};
@@ -116,16 +113,10 @@ pub(crate) fn pixel_to_click_target(
     // `hit_regions` on `cached_layout` do NOT match the drawn geometry — clicks
     // must resolve against this actual painted geometry instead.
     group_tab_bar_layouts: &GroupTabBarLayoutMap,
-    // Cached `quadraui::FrameHitMap` covering the Editor/TabBar surfaces
-    // painted this frame, plus a `FrameZone::TabBar { idx } -> (GroupId,
-    // rect)` table keyed by the tab bar's *global* surface index (editors are
-    // pushed into the same `ScreenLayout` before any tab bar, so a tab bar's
-    // `idx` is offset by however many editor surfaces preceded it — a plain
-    // 0-based `Vec` here would look up the wrong entry, or none at all).
-    // `None` before the first paint. See `frame_zone_to_screen_zone` for how
-    // these replace `screen_zone_hit_test`'s manual Window/TabBar rect-walk.
-    frame_hit_map: Option<&quadraui::FrameHitMap>,
-    tab_bar_zones: &HashMap<usize, (GroupId, quadraui::Rect)>,
+    // The editor band's tab bars and panes as painted this frame (see
+    // [`EditorBandHits`]). `None` before the first paint, when
+    // `screen_zone_hit_test`'s manual Window/TabBar rect-walk answers instead.
+    band_hits: Option<&EditorBandHits>,
     mutate_focus: bool,
     // The shared `quadraui::DragState` a real press arms so a
     // following drag-move traverses the whole file instead of re-seeking
@@ -201,9 +192,9 @@ pub(crate) fn pixel_to_click_target(
     let tab_bar_height = render_mod::tab_bar_height_px(line_height, engine.settings.breadcrumbs);
     let single_tab_hidden = engine.is_tab_bar_hidden(engine.active_group);
 
-    let zone = frame_hit_map
-        .and_then(|hit_map| {
-            let z = frame_zone_to_screen_zone(hit_map, tab_bar_zones, cached_layout, x, y);
+    let zone = band_hits
+        .and_then(|hits| {
+            let z = hits.zone_at(cached_layout, x, y);
             (!matches!(z, ScreenZone::None)).then_some(z)
         })
         .unwrap_or_else(|| {
@@ -292,48 +283,84 @@ pub(crate) fn pixel_to_click_target(
     }
 }
 
-/// Resolve the top-level `ScreenZone` using the cached `quadraui::FrameHitMap`,
-/// which covers exactly the `Editor`/`TabBar` surfaces painted in
-/// `App::render_content` via `quadraui::ScreenLayout::hit_map()`
-/// — pushed from the SAME objects/rects already painted, so
-/// this can never drift from what's on screen. Returns `ScreenZone::None`
-/// when the point isn't in an Editor/TabBar zone (including breadcrumb/
-/// divider pixels, which have no `FrameZone` equivalent — the caller falls
-/// back to `render_mod::screen_zone_hit_test` for those).
-pub(crate) fn frame_zone_to_screen_zone(
-    hit_map: &quadraui::FrameHitMap,
-    // Keyed by `FrameZone::TabBar { idx }`'s global surface index, NOT a
-    // per-tab-bar position — see the doc comment on `pixel_to_click_target`'s
-    // `tab_bar_zones` parameter.
-    tab_bar_zones: &HashMap<usize, (GroupId, quadraui::Rect)>,
-    cached_layout: &render::ScreenLayout,
-    x: f64,
-    y: f64,
-) -> ScreenZone {
-    match hit_map.hit_test(x as f32, y as f32) {
-        quadraui::FrameZone::Widget { idx, .. } => {
-            if let Some((group_id, rect)) = tab_bar_zones.get(&idx) {
-                return ScreenZone::TabBar {
-                    group_id: *group_id,
-                    local_x: x - rect.x as f64,
-                    bar_width: rect.width as f64,
-                };
-            }
-        }
-        quadraui::FrameZone::Editor { idx } => {
-            if let Some(rw) = cached_layout.windows.get(idx) {
-                let r = &rw.rect;
-                return ScreenZone::Window {
-                    window_id: rw.window_id,
-                    window_idx: idx,
-                    rel_x: x - r.x,
-                    rel_y: y - r.y,
-                };
-            }
-        }
-        _ => {}
+/// The editor band's clickable surfaces as the last paint placed them.
+///
+/// Tab bars are on quadraui's widget contract, so they are `FrameTree`
+/// nodes and resolve through [`quadraui::FrameTree::hit_test`]. Editor panes
+/// are not widgets, so they keep their own painted rects, indexed the same
+/// as `ScreenLayout::windows`. Tab bars sit above the panes: a point both
+/// contain resolves to the tab bar.
+#[derive(Default)]
+pub(crate) struct EditorBandHits {
+    tab_bars: quadraui::FrameTree,
+    /// The group each `tab_bars` node belongs to, in node order. Every
+    /// editor tab bar paints under the same `WidgetId`, so the node's
+    /// position, not its id, names the group.
+    tab_bar_groups: Vec<GroupId>,
+    /// Each pane's painted rect, at its `ScreenLayout::windows` index.
+    editors: Vec<quadraui::Rect>,
+}
+
+impl EditorBandHits {
+    pub(crate) fn new() -> Self {
+        Self::default()
     }
-    ScreenZone::None
+
+    /// Record the next editor pane. Panes are pushed in
+    /// `ScreenLayout::windows` order.
+    pub(crate) fn push_editor(&mut self, rect: quadraui::Rect) {
+        self.editors.push(rect);
+    }
+
+    /// Record `group`'s tab bar, painted at `rect`.
+    pub(crate) fn push_tab_bar(
+        &mut self,
+        group: GroupId,
+        rect: quadraui::Rect,
+        bar: quadraui::TabBar,
+    ) {
+        self.tab_bars.push(bar.id, rect, Box::new(bar));
+        self.tab_bar_groups.push(group);
+    }
+
+    /// The top-level zone under `(x, y)`: a tab bar first, then the topmost
+    /// pane. `ScreenZone::None` for everything else, including breadcrumb
+    /// and divider pixels, which the caller resolves through
+    /// `render::screen_zone_hit_test`.
+    pub(crate) fn zone_at(
+        &self,
+        cached_layout: &render::ScreenLayout,
+        x: f64,
+        y: f64,
+    ) -> ScreenZone {
+        let point = quadraui::Point::new(x as f32, y as f32);
+        if let Some(node) = self.tab_bars.hit_test(point) {
+            let group = self
+                .tab_bars
+                .nodes()
+                .iter()
+                .position(|n| std::ptr::eq(n, node))
+                .and_then(|i| self.tab_bar_groups.get(i));
+            if let Some(&group_id) = group {
+                return ScreenZone::TabBar {
+                    group_id,
+                    local_x: x - node.rect.x as f64,
+                    bar_width: node.rect.width as f64,
+                };
+            }
+        }
+        let pane = self.editors.iter().rposition(|rect| rect.contains(point));
+        if let Some((idx, rw)) = pane.and_then(|idx| Some((idx, cached_layout.windows.get(idx)?))) {
+            let r = &rw.rect;
+            return ScreenZone::Window {
+                window_id: rw.window_id,
+                window_idx: idx,
+                rel_x: x - r.x,
+                rel_y: y - r.y,
+            };
+        }
+        ScreenZone::None
+    }
 }
 
 /// Tab bar inner hit-test: resolve which tab/button a click hit.
@@ -398,16 +425,15 @@ pub(crate) fn resolve_tab_right_click(
     char_width: f64,
     cached_layout: &render::ScreenLayout,
     group_tab_bar_layouts: &GroupTabBarLayoutMap,
-    frame_hit_map: Option<&quadraui::FrameHitMap>,
-    tab_bar_zones: &HashMap<usize, (GroupId, quadraui::Rect)>,
+    band_hits: Option<&EditorBandHits>,
 ) -> Option<(GroupId, usize)> {
     use crate::core::engine::TabBarClickTarget as T;
 
     let tab_bar_height = render_mod::tab_bar_height_px(line_height, engine.settings.breadcrumbs);
     let single_tab_hidden = engine.is_tab_bar_hidden(engine.active_group);
-    let zone = frame_hit_map
-        .and_then(|hit_map| {
-            let z = frame_zone_to_screen_zone(hit_map, tab_bar_zones, cached_layout, x, y);
+    let zone = band_hits
+        .and_then(|hits| {
+            let z = hits.zone_at(cached_layout, x, y);
             (!matches!(z, ScreenZone::None)).then_some(z)
         })
         .unwrap_or_else(|| {
@@ -500,8 +526,7 @@ pub(crate) fn handle_mouse_click(
     char_width: f64,
     cached_layout: &render::ScreenLayout,
     group_tab_bar_layouts: &GroupTabBarLayoutMap,
-    frame_hit_map: Option<&quadraui::FrameHitMap>,
-    tab_bar_zones: &HashMap<usize, (GroupId, quadraui::Rect)>,
+    band_hits: Option<&EditorBandHits>,
     drag: &mut quadraui::DragState,
 ) -> (Option<bool>, Option<EngineAction>) {
     match pixel_to_click_target(
@@ -513,8 +538,7 @@ pub(crate) fn handle_mouse_click(
         char_width,
         cached_layout,
         group_tab_bar_layouts,
-        frame_hit_map,
-        tab_bar_zones,
+        band_hits,
         true, // real click: focus/tab/gutter side effects are intended
         drag,
         alt, // Alt-press arms the minimap's file-wide (old #1187) track; plain press now fine-seeks by default
@@ -585,8 +609,7 @@ pub(crate) fn handle_mouse_double_click(
     char_width: f64,
     cached_layout: &render::ScreenLayout,
     group_tab_bar_layouts: &GroupTabBarLayoutMap,
-    frame_hit_map: Option<&quadraui::FrameHitMap>,
-    tab_bar_zones: &HashMap<usize, (GroupId, quadraui::Rect)>,
+    band_hits: Option<&EditorBandHits>,
     drag: &mut quadraui::DragState,
 ) {
     if let ClickTarget::BufferPos(wid, line, col) = pixel_to_click_target(
@@ -598,8 +621,7 @@ pub(crate) fn handle_mouse_double_click(
         char_width,
         cached_layout,
         group_tab_bar_layouts,
-        frame_hit_map,
-        tab_bar_zones,
+        band_hits,
         true, // real click: focus/tab/gutter side effects are intended
         drag,
         false, // double-click has no Alt-fine-seek concept
@@ -625,8 +647,7 @@ pub(crate) fn handle_mouse_drag(
     char_width: f64,
     cached_layout: &render::ScreenLayout,
     group_tab_bar_layouts: &GroupTabBarLayoutMap,
-    frame_hit_map: Option<&quadraui::FrameHitMap>,
-    tab_bar_zones: &HashMap<usize, (GroupId, quadraui::Rect)>,
+    band_hits: Option<&EditorBandHits>,
     drag: &mut quadraui::DragState,
 ) {
     if let ClickTarget::BufferPos(wid, line, col) = pixel_to_click_target(
@@ -638,8 +659,7 @@ pub(crate) fn handle_mouse_drag(
         char_width,
         cached_layout,
         group_tab_bar_layouts,
-        frame_hit_map,
-        tab_bar_zones,
+        band_hits,
         false, // drag continuation: pure query, no focus/tab/gutter side effects
         drag,
         false, // mutate_focus is false, so the minimap-press rung never runs

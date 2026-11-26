@@ -315,8 +315,7 @@ impl App {
             self.cached_char_width,
             layout,
             &self.cached_group_tab_bar_layouts.borrow(),
-            self.cached_frame_hit_map.borrow().as_ref(),
-            &self.cached_tab_bar_zones.borrow(),
+            self.cached_editor_band_hits.borrow().as_ref(),
             true, // resolving the original tab-bar mouse-down; switching tabs is intended
             &mut drag_rc.borrow_mut(),
             false, // re-resolving a tab-bar press; the minimap rung cannot match here
@@ -1158,8 +1157,7 @@ impl App {
                                 self.cached_char_width,
                                 layout,
                                 &self.cached_group_tab_bar_layouts.borrow(),
-                                self.cached_frame_hit_map.borrow().as_ref(),
-                                &self.cached_tab_bar_zones.borrow(),
+                                self.cached_editor_band_hits.borrow().as_ref(),
                                 &mut drag,
                             )
                         } else {
@@ -1749,8 +1747,7 @@ impl App {
                         self.painted_char_width(),
                         layout,
                         &self.cached_group_tab_bar_layouts.borrow(),
-                        self.cached_frame_hit_map.borrow().as_ref(),
-                        &self.cached_tab_bar_zones.borrow(),
+                        self.cached_editor_band_hits.borrow().as_ref(),
                         &mut drag_rc.borrow_mut(),
                     );
                 }

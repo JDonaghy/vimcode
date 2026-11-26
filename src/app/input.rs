@@ -121,8 +121,7 @@ impl App {
                     self.cached_char_width,
                     layout,
                     &self.cached_group_tab_bar_layouts.borrow(),
-                    self.cached_frame_hit_map.borrow().as_ref(),
-                    &self.cached_tab_bar_zones.borrow(),
+                    self.cached_editor_band_hits.borrow().as_ref(),
                     true, // real click: focus/tab/gutter side effects are intended
                     &mut drag,
                     false, // Ctrl+click has no Alt-fine-seek concept
@@ -238,8 +237,7 @@ impl App {
                         self.cached_char_width,
                         layout,
                         &self.cached_group_tab_bar_layouts.borrow(),
-                        self.cached_frame_hit_map.borrow().as_ref(),
-                        &self.cached_tab_bar_zones.borrow(),
+                        self.cached_editor_band_hits.borrow().as_ref(),
                         &mut drag_rc.borrow_mut(),
                     );
                 }

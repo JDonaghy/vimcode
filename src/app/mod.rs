@@ -266,26 +266,12 @@ pub(crate) struct App {
     /// Cached ScreenLayout from the last draw_editor paint pass. Click handlers
     /// read this instead of recomputing geometry from engine state.
     pub(crate) cached_screen_layout: Rc<RefCell<Option<render::ScreenLayout>>>,
-    /// Accumulated `quadraui::FrameHitMap` covering the `Editor`/`TabBar`
-    /// zones painted in `render_content`. Built via
-    /// `quadraui::ScreenLayout::hit_map()`: pushes the SAME
-    /// `Editor`/`TabBar` objects and rects already painted at their existing
-    /// call sites, purely for hit-testing, so it can never reorder or
-    /// duplicate real painting. `click::pixel_to_click_target` consults this
-    /// first to resolve the top-level Editor/TabBar zone, falling back to
-    /// `render::screen_zone_hit_test`'s manual rect-walk for
-    /// breadcrumb/divider zones (which have no `FrameZone` equivalent) and
-    /// for the brief window before the first paint populates this cache.
-    // TODO(#2173): drop once `FrameHitMap` moves onto the widget contract.
-    #[allow(deprecated)]
-    pub(crate) cached_frame_hit_map: Rc<RefCell<Option<quadraui::FrameHitMap>>>,
-    /// Parallel table for resolving `FrameZone::TabBar { idx }`, keyed by the
-    /// global surface index. `ScreenLayout::zone_for`'s `idx` enumerates ALL
-    /// surfaces in `cached_frame_hit_map` (editors THEN tab bars), so a tab bar's
-    /// global index is offset by however many editors were pushed before it.
-    /// Keying by the global `idx` instead of position fixes lookup.
-    pub(crate) cached_tab_bar_zones:
-        Rc<RefCell<HashMap<usize, (core::window::GroupId, quadraui::Rect)>>>,
+    /// The editor band's tab bars and panes as `render_content` last painted
+    /// them. `click::pixel_to_click_target` resolves the top-level
+    /// Editor/TabBar zone against this first, falling back to
+    /// `render::screen_zone_hit_test`'s manual rect-walk for breadcrumb and
+    /// divider zones and for the brief window before the first paint.
+    pub(crate) cached_editor_band_hits: Rc<RefCell<Option<crate::click::EditorBandHits>>>,
     /// A sidebar panel claimed the current press, so the rest of the gesture
     /// (`MouseMoved` with the left button held, then `MouseUp`) belongs to it —
     /// that is what lets a panel scrollbar thumb or a tree drag keep tracking

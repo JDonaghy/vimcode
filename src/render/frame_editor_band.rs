@@ -307,7 +307,7 @@ impl EditorBandUnits {
 // [`EditorOp::Windows`] (every editor window's text, gutter, per-window
 // status line and the `:split`/`:vsplit` divider lines within each group)
 // accumulates each window's owned `quadraui::Editor` into `window_editors` so
-// `App`'s own `FrameHitMap` hit-tests the exact objects just painted.
+// `App`'s click surfaces hit-test the exact objects just painted.
 // [`EditorOp::TabBars`] (one tab bar per editor group) similarly recovers
 // the rasteriser's exact *pixel* hit geometry into `hit_bars`.
 // [`EditorOp::GroupDividers`] (the between-*group* `Ctrl+W v`/`Ctrl+W s`
@@ -326,7 +326,7 @@ impl EditorBandUnits {
 /// of `units` — only the `TabBars`/`TabDragOverlay` rungs need it) is the
 /// tab strip's own painted row height. `window_editors`/`hit_bars` accumulate
 /// across the `Windows`/`TabBars` calls — the caller destructures them back
-/// out once this returns, to build its `FrameHitMap`. Returns the rungs
+/// out once this returns, to record its click surfaces. Returns the rungs
 /// actually composed, in order, for the caller to validate with
 /// [`check_editor_band_order`].
 #[allow(clippy::too_many_arguments)]

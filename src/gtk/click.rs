@@ -484,9 +484,8 @@ mod cross_split_drag_focus_tests {
             char_width,
             &screen,
             &tab_pixel_hits,
-            None, // no cached FrameHitMap in this test — exercises the
+            None, // no cached band hits in this test — exercises the
             // `screen_zone_hit_test` fallback path
-            &HashMap::new(),
             false, // mutate_focus: drag continuation
             &mut quadraui::DragState::default(),
             false, // no Alt context in this test
@@ -530,7 +529,6 @@ mod cross_split_drag_focus_tests {
             &screen,
             &tab_pixel_hits,
             None,
-            &HashMap::new(),
             true, // mutate_focus: genuine click
             &mut quadraui::DragState::default(),
             false, // no Alt context in this test
@@ -544,36 +542,29 @@ mod cross_split_drag_focus_tests {
 }
 
 #[cfg(test)]
-mod frame_hit_map_tests {
-    //! `frame_zone_to_screen_zone` and the `frame_hit_map` branch of
-    //! `pixel_to_click_target` map `quadraui::FrameZone::TabBar { idx }` /
-    //! `FrameZone::Editor { idx }` back to `render::ScreenZone`. These tests
-    //! build a real `quadraui::FrameHitMap` via `ScreenLayout::hit_map()` from
-    //! the same `Surface::Editor` / `Surface::TabBar` construction
-    //! `App::render_content` uses, instead of exercising only the `screen_zone_hit_test`
-    //! fallback.
+mod editor_band_hits_tests {
+    //! `EditorBandHits::zone_at` and the `band_hits` branch of
+    //! `pixel_to_click_target` map the editor band's tab-bar `FrameTree`
+    //! nodes and pane rects back to `render::ScreenZone`. These tests build
+    //! the hits from the same `to_q_editor` / `tab_bar_draw_targets`
+    //! construction `App::compose_editor_band_rungs` records, instead of
+    //! exercising only the `screen_zone_hit_test` fallback.
     use super::*;
     use crate::core::WindowRect;
     use crate::render::build_screen_layout;
-    use quadraui::{ScreenLayout as QSL, Surface};
 
-    /// Lay out a single window / single (unsplit) tab bar and build the
-    /// `FrameHitMap` + `tab_bar_zones` table the way `render_content` does
-    /// (`src/gtk/mod.rs` ~7712-7839), so these tests exercise the production
-    /// construction, not a hand-rolled stand-in — crucially including the
-    /// same "editors pushed first, tab bars after" ordering, since
-    /// `FrameZone::TabBar { idx }` carries the *global* surface index across
-    /// that whole `ScreenLayout`, not a per-tab-bar position. `tab_bar_zones`
-    /// must therefore be keyed by that same global index, not `0..`.
-    fn build_hit_map(
+    /// Lay out `engine`'s groups and record the band hits the way
+    /// `compose_editor_band_rungs` does: every pane in `screen.windows`
+    /// order, then every tab bar. Also returns each tab bar's group and rect.
+    fn build_band_hits(
         engine: &Engine,
         theme: &Theme,
         line_height: f64,
         char_width: f64,
     ) -> (
         render::ScreenLayout,
-        quadraui::FrameHitMap,
-        HashMap<usize, (GroupId, quadraui::Rect)>,
+        EditorBandHits,
+        Vec<(GroupId, quadraui::Rect)>,
     ) {
         let bounds = WindowRect::new(0.0, 0.0, 800.0, 600.0);
         let (rects, _) = engine.calculate_group_window_rects(bounds, (line_height * 1.6).ceil());
@@ -588,35 +579,23 @@ mod frame_hit_map_tests {
             crate::render::gtk_minimap_sizing(),
         );
 
-        let window_editors: Vec<quadraui::Editor> =
-            screen.windows.iter().map(render_mod::to_q_editor).collect();
-        let mut hit_frame = QSL::new();
-        for editor in &window_editors {
-            hit_frame.push(Surface::Editor {
-                rect: editor.rect,
-                editor: editor.clone(),
-            });
+        let mut hits = EditorBandHits::new();
+        for rw in &screen.windows {
+            hits.push_editor(render_mod::to_q_editor(rw).rect);
         }
 
         let tab_row_h = render_mod::tab_row_height_px(line_height);
         let tab_bar_h = render_mod::tab_bar_height_px(line_height, engine.settings.breadcrumbs);
-        let mut tab_bar_zones: HashMap<usize, (GroupId, quadraui::Rect)> = HashMap::new();
-        for (next_surface_idx, target) in (window_editors.len()..).zip(
-            render_mod::tab_bar_draw_targets(engine, &screen, tab_row_h, tab_bar_h),
-        ) {
-            hit_frame.push(Surface::Widget {
-                rect: target.rect,
-                widget: Box::new(target.bar.clone()),
-            });
-            tab_bar_zones.insert(next_surface_idx, (target.group_id, target.rect));
+        let mut bars = Vec::new();
+        for target in render_mod::tab_bar_draw_targets(engine, &screen, tab_row_h, tab_bar_h) {
+            hits.push_tab_bar(target.group_id, target.rect, target.bar.clone());
+            bars.push((target.group_id, target.rect));
         }
-
-        let hit_map = hit_frame.hit_map();
-        (screen, hit_map, tab_bar_zones)
+        (screen, hits, bars)
     }
 
     #[test]
-    fn frame_zone_to_screen_zone_resolves_editor_point() {
+    fn zone_at_resolves_editor_point() {
         let mut engine = Engine::new();
         engine.buffer_mut().insert(0, "hello world");
         let wid = engine.active_window_id();
@@ -624,8 +603,7 @@ mod frame_hit_map_tests {
         let line_height = 18.0;
         let char_width = 9.0;
 
-        let (screen, hit_map, tab_bar_zones) =
-            build_hit_map(&engine, &theme, line_height, char_width);
+        let (screen, hits, _) = build_band_hits(&engine, &theme, line_height, char_width);
         let rw = screen
             .windows
             .first()
@@ -633,8 +611,7 @@ mod frame_hit_map_tests {
         let x = rw.rect.x + char_width * 2.0;
         let y = rw.rect.y + line_height * 2.0;
 
-        let zone = frame_zone_to_screen_zone(&hit_map, &tab_bar_zones, &screen, x, y);
-        match zone {
+        match hits.zone_at(&screen, x, y) {
             ScreenZone::Window {
                 window_id,
                 window_idx,
@@ -643,12 +620,12 @@ mod frame_hit_map_tests {
                 assert_eq!(window_id, wid);
                 assert_eq!(window_idx, 0);
             }
-            other => panic!("expected ScreenZone::Window from the FrameHitMap path, got {other:?}"),
+            other => panic!("expected ScreenZone::Window from the band hits, got {other:?}"),
         }
     }
 
     #[test]
-    fn frame_zone_to_screen_zone_resolves_tab_bar_point() {
+    fn zone_at_resolves_tab_bar_point() {
         let mut engine = Engine::new();
         engine.buffer_mut().insert(0, "hello world");
         let group_id = engine.active_group;
@@ -656,38 +633,77 @@ mod frame_hit_map_tests {
         let line_height = 18.0;
         let char_width = 9.0;
 
-        let (screen, hit_map, tab_bar_zones) =
-            build_hit_map(&engine, &theme, line_height, char_width);
-        assert!(
-            !tab_bar_zones.is_empty(),
-            "single-group mode should still push one tab bar surface"
-        );
-        let (zone_group, rect) = *tab_bar_zones
-            .values()
-            .next()
-            .expect("just asserted tab_bar_zones is non-empty");
+        let (screen, hits, bars) = build_band_hits(&engine, &theme, line_height, char_width);
+        let &(zone_group, rect) = bars
+            .first()
+            .expect("single-group mode should still record one tab bar");
         assert_eq!(zone_group, group_id);
         let x = rect.x as f64 + 2.0;
         let y = rect.y as f64 + 2.0;
 
-        let zone = frame_zone_to_screen_zone(&hit_map, &tab_bar_zones, &screen, x, y);
-        match zone {
+        match hits.zone_at(&screen, x, y) {
             ScreenZone::TabBar {
-                group_id: resolved, ..
-            } => assert_eq!(resolved, group_id),
-            other => {
-                panic!("expected ScreenZone::TabBar from the FrameHitMap path, got {other:?}")
+                group_id: resolved,
+                local_x,
+                bar_width,
+            } => {
+                assert_eq!(resolved, group_id);
+                assert_eq!(local_x, 2.0);
+                assert_eq!(bar_width, rect.width as f64);
+            }
+            other => panic!("expected ScreenZone::TabBar from the band hits, got {other:?}"),
+        }
+    }
+
+    /// Every editor tab bar paints under one `WidgetId`, so a click on the
+    /// second group's bar must resolve by node position to that group, not
+    /// to whichever group shares the id first.
+    #[test]
+    fn zone_at_resolves_each_split_groups_own_tab_bar() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello world");
+        engine.open_editor_group(crate::core::window::SplitDirection::Vertical);
+        let theme = Theme::onedark();
+        let line_height = 18.0;
+        let char_width = 9.0;
+
+        let (screen, hits, bars) = build_band_hits(&engine, &theme, line_height, char_width);
+        assert_eq!(bars.len(), 2, "a vertical group split records two tab bars");
+        assert_ne!(bars[0].0, bars[1].0);
+        for &(group_id, rect) in &bars {
+            let x = rect.x as f64 + 3.0;
+            let y = rect.y as f64 + 2.0;
+            match hits.zone_at(&screen, x, y) {
+                ScreenZone::TabBar {
+                    group_id: resolved,
+                    local_x,
+                    ..
+                } => {
+                    assert_eq!(resolved, group_id);
+                    assert_eq!(local_x, 3.0);
+                }
+                other => panic!("expected group {group_id:?}'s tab bar, got {other:?}"),
             }
         }
     }
 
     #[test]
-    fn pixel_to_click_target_consults_the_cached_frame_hit_map_for_editor_clicks() {
-        // Proves `pixel_to_click_target` actually takes the `frame_hit_map`
+    fn zone_at_misses_outside_every_surface() {
+        let engine = Engine::new();
+        let theme = Theme::onedark();
+        let (screen, hits, _) = build_band_hits(&engine, &theme, 18.0, 9.0);
+        assert!(matches!(
+            hits.zone_at(&screen, 5000.0, 5000.0),
+            ScreenZone::None
+        ));
+    }
+
+    #[test]
+    fn pixel_to_click_target_consults_the_cached_band_hits_for_editor_clicks() {
+        // Proves `pixel_to_click_target` actually takes the `band_hits`
         // branch (not silently falling through to `screen_zone_hit_test`)
-        // when a real `Some(&FrameHitMap)` is supplied — the production
-        // `Some` path exercised by `render_content`'s cached hit map, as
-        // opposed to the `None` fallback path already covered by
+        // when real hits are supplied — the production `Some` path, as
+        // opposed to the `None` fallback path covered by
         // `cross_split_drag_focus_tests`.
         let mut engine = Engine::new();
         // Pin the no-gutter geometry this test's `char_width * 2.0` pixel math
@@ -699,8 +715,7 @@ mod frame_hit_map_tests {
         let line_height = 18.0;
         let char_width = 9.0;
 
-        let (screen, hit_map, tab_bar_zones) =
-            build_hit_map(&engine, &theme, line_height, char_width);
+        let (screen, hits, _) = build_band_hits(&engine, &theme, line_height, char_width);
         let rw = screen
             .windows
             .first()
@@ -720,17 +735,14 @@ mod frame_hit_map_tests {
             char_width,
             &screen,
             &empty_pixel_hits,
-            Some(&hit_map),
-            &tab_bar_zones,
+            Some(&hits),
             true,
             &mut quadraui::DragState::default(),
             false,
         );
         match target {
             ClickTarget::BufferPos(id, _, _) => assert_eq!(id, wid),
-            other => panic!(
-                "expected a BufferPos hit resolved via the cached FrameHitMap, got {other:?}"
-            ),
+            other => panic!("expected a BufferPos hit resolved via the band hits, got {other:?}"),
         }
     }
 }
@@ -748,9 +760,9 @@ mod single_group_tab_click_dispatch_tests {
     //! Two things make these tests discriminate where the black-box
     //! `gtk::testing` pair does not:
     //!
-    //! 1. `frame_hit_map: None` — forcing the `screen_zone_hit_test` fallback
-    //!    branch. GTK's production routing prefers the cached `quadraui::FrameHitMap`
-    //!    and only falls back here on a hit-map miss / before the first paint.
+    //! 1. `band_hits: None` — forcing the `screen_zone_hit_test` fallback
+    //!    branch. GTK's production routing prefers the cached `EditorBandHits`
+    //!    and only falls back here on a miss / before the first paint.
     //! 2. A **synthetic 100px content offset**, matching the test in `render::tests`.
     //!    The headless harness's default title-bar chrome only shifts ~23px,
     //!    which is small enough that the painted click y falls inside both the
@@ -893,7 +905,7 @@ mod single_group_tab_click_dispatch_tests {
         const CLICK_Y: f64 = CONTENT_Y + 2.0;
 
         /// Resolve a tab-bar click through the production GTK dispatch entry
-        /// point, with `frame_hit_map: None` to force the `screen_zone_hit_test`
+        /// point, with `band_hits: None` to force the `screen_zone_hit_test`
         /// fallback branch (see this module's doc comment).
         fn click(&mut self, local_x: f64) -> ClickTarget {
             pixel_to_click_target(
@@ -906,7 +918,6 @@ mod single_group_tab_click_dispatch_tests {
                 &self.screen,
                 &self.tab_pixel_hits,
                 None,
-                &HashMap::new(),
                 true, // a genuine click
                 &mut quadraui::DragState::default(),
                 false, // no Alt context in this test
@@ -928,7 +939,6 @@ mod single_group_tab_click_dispatch_tests {
                 &self.screen,
                 &self.tab_pixel_hits,
                 None,
-                &HashMap::new(),
                 &mut quadraui::DragState::default(),
             )
         }

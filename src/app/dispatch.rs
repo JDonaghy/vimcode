@@ -416,8 +416,7 @@ impl App {
                         self.cached_char_width,
                         layout,
                         &self.cached_group_tab_bar_layouts.borrow(),
-                        self.cached_frame_hit_map.borrow().as_ref(),
-                        &self.cached_tab_bar_zones.borrow(),
+                        self.cached_editor_band_hits.borrow().as_ref(),
                         false, // pure hover query — must not steal focus or fire gutter actions
                         // scratch: never touched under mutate_focus: false — see click.rs:233-320
                         &mut quadraui::DragState::default(),
@@ -977,8 +976,7 @@ impl App {
                                         self.cached_char_width,
                                         layout,
                                         &self.cached_group_tab_bar_layouts.borrow(),
-                                        self.cached_frame_hit_map.borrow().as_ref(),
-                                        &self.cached_tab_bar_zones.borrow(),
+                                        self.cached_editor_band_hits.borrow().as_ref(),
                                     )
                                 })
                             };

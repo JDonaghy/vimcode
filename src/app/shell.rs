@@ -274,8 +274,8 @@ impl quadraui::ShellApp for App {
         // to undo click drift, from deep inside the keyboard/mouse dispatch tree.
 
         // ══ Editor band ═════════════════════════════════════════════════════
-        // Composed from `render::compose_editor_band`, then the `FrameHitMap`
-        // is recovered from the very objects that walk painted.
+        // Composed from `render::compose_editor_band`, then the click surfaces
+        // are recorded from the very objects that walk painted.
         self.compose_editor_band_rungs(
             backend,
             &engine,

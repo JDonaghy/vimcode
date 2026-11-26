@@ -1857,7 +1857,7 @@ mod tests {
     /// The regression guard at the dispatch layer is
     /// `gtk::click::single_group_tab_click_dispatch_tests::
     /// single_group_tab_click_activates_and_close_button_targets_that_tab`,
-    /// which passes `frame_hit_map: None` and synthetic offsets; the
+    /// which passes `band_hits: None` and synthetic offsets; the
     /// layout-level guards are in `render::tests`.
     #[test]
     fn single_group_tab_click_activates_that_tab() {
