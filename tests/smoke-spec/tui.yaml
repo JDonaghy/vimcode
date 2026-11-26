@@ -2657,6 +2657,93 @@ steps:
     text: 'ZQXW_QUICKOPEN_MARKER_2191'
     ms: 2000
 
+  # vimcode#2192 -- `window_focus_routes_keystrokes_to_the_focused_pane_
+  # via_shell_app` (src/tui_main/app_on_tui_tests.rs) covers `:split` +
+  # window navigation + keystroke routing only via synthetic
+  # `driver.press_named`/`type_text` calls; the `ctrl-w-nav-1970-*`
+  # sections above exercise Ctrl-W between *activity-bar panels*, never a
+  # window split followed by typed text landing in the newly focused
+  # editor pane. Per #1970, that is real-terminal-input-path territory a
+  # synthetic-key driver test cannot validate on its own.
+  #
+  # `:vsplit <new file>` opens a second, empty buffer in a new window to
+  # its *left*, which vim convention leaves focused -- the pre-existing
+  # window (still showing this file's own launch buffer, "line one" as its
+  # first line) sits to the right. Typing into the left pane first, then
+  # `Ctrl-W l` to move focus right, then typing again, proves each
+  # keystroke landed in whichever pane was *actually* focused at the time:
+  # the right pane's marker is asserted as a literal, immediate prefix of
+  # "line one" (its own first line, with nothing typed into it yet before
+  # the switch) -- the same adjacency reasoning the driver test's own
+  # comment spells out, since a flat "does the screen contain this marker
+  # anywhere" can't tell which pane a keystroke actually reached when both
+  # panes are visible on the same screen at once.
+  - type: type_text
+    id: 'open-vsplit-2192'
+    text: ':vsplit split_pane_2192.txt'
+  - type: key
+    id: 'open-vsplit-enter-2192'
+    key: enter
+  - type: expect_within
+    id: 'vsplit-opens-two-panes-2192'
+    text: 'split_pane_2192.txt'
+    ms: 2000
+  - type: key
+    id: 'split-left-insert-2192'
+    key: 'i'
+  - type: expect_within
+    id: 'split-left-insert-mode-2192'
+    text: 'INSERT'
+    ms: 2000
+  - type: type_text
+    id: 'split-left-type-marker-2192'
+    text: 'ZQXW_SPLIT_LEFT_2192'
+  - type: expect_within
+    id: 'split-left-marker-typed-2192'
+    text: 'ZQXW_SPLIT_LEFT_2192'
+    ms: 2000
+  - type: key
+    id: 'split-left-esc-2192'
+    key: esc
+  - type: expect_within
+    id: 'split-left-back-to-normal-2192'
+    text: 'NORMAL'
+    ms: 2000
+
+  - type: key
+    id: 'ctrl-w-arm-move-right-2192'
+    key: 'ctrl+w'
+  - type: key
+    id: 'ctrl-w-move-right-2192'
+    key: 'l'
+  - type: key
+    id: 'split-right-insert-2192'
+    key: 'i'
+  - type: expect_within
+    id: 'split-right-insert-mode-2192'
+    text: 'INSERT'
+    ms: 2000
+  - type: type_text
+    id: 'split-right-type-marker-2192'
+    text: 'ZQXW_SPLIT_RIGHT_2192'
+  - type: key
+    id: 'split-right-esc-2192'
+    key: esc
+  - type: expect_within
+    id: 'keystrokes-land-in-the-focused-pane-not-the-other-2192'
+    text: 'ZQXW_SPLIT_RIGHT_2192line one'
+    ms: 2000
+
+  - type: type_text
+    id: 'close-split-2192'
+    text: ':close'
+  - type: key
+    id: 'close-split-enter-2192'
+    key: enter
+  - type: wait_idle
+    id: 'settle-after-close-split-2192'
+    ms: 300
+    timeout_ms: 4000
   # vimcode#2193 -- `ext_install_offer_toast_keyboard_focus_tab_enter_
   # dont_ask_again_via_shell_app` (src/tui_main/app_on_tui_tests.rs)
   # exercises the install-offer toast's own Tab/Enter/"Don't ask again"
