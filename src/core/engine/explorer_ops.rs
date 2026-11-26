@@ -561,6 +561,15 @@ impl Engine {
                     None,
                     Some(placeholder.to_string()),
                 );
+                drop(tree);
+                // Starting the inline edit must grant engine-level explorer
+                // focus regardless of what had focus a moment before — on
+                // TUI, `route_focus_key` gates every panel arm (including
+                // `Explorer`) on `sidebar_band_focused`, and a prior click
+                // into the editor (`src/app/mouse_tabs.rs`'s
+                // `clear_sidebar_focus`) can leave this flag stale-false
+                // even while the explorer tree is visibly mid-edit.
+                self.explorer_has_focus = true;
             }
             ExplorerAction::Delete => {
                 if idx < self.explorer_rows.len() {
@@ -580,6 +589,9 @@ impl Engine {
                         Some(0),
                         None,
                     );
+                    // Same stale-focus hazard as the `NewFile`/`NewFolder`
+                    // arm above — see its comment.
+                    self.explorer_has_focus = true;
                 }
             }
             ExplorerAction::MoveFile => {
