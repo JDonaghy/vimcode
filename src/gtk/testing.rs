@@ -11761,6 +11761,92 @@ mod command_center {
             (r, g, b)
         );
     }
+    /// With no menu open, hovering a menu-bar label highlights it, and moving
+    /// the pointer on to the Command Center clears that highlight: the File
+    /// label's painted background returns to its unhovered colour.
+    #[test]
+    fn menu_bar_hover_clears_when_the_pointer_moves_to_the_command_center() {
+        let mut h = harness(engine_with_tab_history(), 1400, 900);
+        h.driver.render();
+
+        let menu_row = h.menu_row_rect.get();
+        let (_app_icon, items_rect) = crate::render::split_menu_row_for_app_icon(menu_row, 0.0);
+        let menu_bar = h.engine.borrow().menu_system.borrow().menu_bar();
+        let file_idx = menu_bar
+            .items
+            .iter()
+            .position(|i| i.label.replace('&', "") == "File")
+            .expect("the menu bar must carry a File item");
+        let file = {
+            use quadraui::DrawsPrimitives as _;
+            h.driver
+                .backend()
+                .layout_primitive(items_rect, &menu_bar)
+                .layout
+                .visible_items
+                .iter()
+                .find(|vi| vi.item_idx == file_idx)
+                .expect("the File menu item must be visible")
+                .bounds
+        };
+        // A background pixel inside the File item, clear of its glyphs.
+        let probe = (file.x as i32 + 2, (file.y + file.height / 2.0) as i32);
+        let rest_bg = h.driver.pixel(probe.0, probe.1);
+
+        h.driver.dispatch(quadraui::UiEvent::MouseMoved {
+            position: quadraui::Point::new(file.x + file.width / 2.0, file.y + file.height / 2.0),
+            buttons: quadraui::ButtonMask::default(),
+        });
+        h.driver.render();
+        assert_eq!(
+            h.engine
+                .borrow()
+                .menu_system
+                .borrow()
+                .menu_bar()
+                .focused_item,
+            Some(file_idx),
+            "precondition: hovering File focuses it"
+        );
+        assert_ne!(
+            h.driver.pixel(probe.0, probe.1),
+            rest_bg,
+            "precondition: the hovered File label paints a highlight"
+        );
+
+        let centre = h
+            .engine
+            .borrow()
+            .command_center_layout
+            .borrow()
+            .clone()
+            .expect("the Command Center paints on GTK")
+            .back_bounds
+            .expect("the back arrow must have painted bounds");
+        h.driver.dispatch(quadraui::UiEvent::MouseMoved {
+            position: quadraui::Point::new(
+                centre.x + centre.width / 2.0,
+                centre.y + centre.height / 2.0,
+            ),
+            buttons: quadraui::ButtonMask::default(),
+        });
+        h.driver.render();
+        assert_eq!(
+            h.engine
+                .borrow()
+                .menu_system
+                .borrow()
+                .menu_bar()
+                .focused_item,
+            None,
+            "moving onto the Command Center must clear the menu-bar hover"
+        );
+        assert_eq!(
+            h.driver.pixel(probe.0, probe.1),
+            rest_bg,
+            "the File label must paint unhighlighted once the pointer leaves it"
+        );
+    }
 
     /// The smoke-spec's hit-test pixel coordinates were derived from a model
     /// that never accounted for the Command Center (back/forward nav arrows +
