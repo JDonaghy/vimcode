@@ -23708,11 +23708,14 @@ fn test_help_menu_keybindings_action() {
 // ── Crash log path ─────────────────────────────────────────────────────
 
 #[test]
-fn test_crash_log_path_uses_temp_dir() {
+fn test_crash_log_path_is_under_the_vimcode_config_dir() {
+    // Lives alongside swap files under `vimcode_config_dir()` rather than
+    // the raw OS temp dir, so it inherits the same per-test `$HOME`
+    // isolation swap files already had — see `crash_log_path()`'s own doc.
     let path = crate::core::swap::crash_log_path();
     assert!(
-        path.starts_with(std::env::temp_dir()),
-        "crash log should be in temp dir: {:?}",
+        path.starts_with(crate::core::paths::vimcode_config_dir()),
+        "crash log should live under the vimcode config dir: {:?}",
         path
     );
     assert!(path.ends_with("vimcode-crash.log"));
