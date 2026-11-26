@@ -15,10 +15,12 @@ use std::sync::Mutex;
 use vimcode_core::core::engine::PendingPlatformAction;
 use vimcode_core::core::swap;
 
-/// `swap::crash_log_path()` is one fixed path under the OS temp dir shared
-/// by every test in this binary — `cargo test` runs them in parallel
-/// threads by default, so without this lock one test's write/remove races
-/// another's.
+/// `swap::crash_log_path()` is one fixed path under the real
+/// `vimcode_config_dir()` shared by every test in this binary (integration
+/// tests link the library as an external crate, so `paths::set_test_home`'s
+/// thread-local override is unreachable here) — `cargo test` runs them in
+/// parallel threads by default, so without this lock one test's
+/// write/remove races another's.
 static CRASH_LOG_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
