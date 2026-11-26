@@ -478,6 +478,14 @@ pub const SCENARIO_REGISTRY: &[ScenarioMeta] = &[
         description: "Explorer tree row click lands on its own hit band",
     },
     ScenarioMeta {
+        name: "explorer_row_click_after_editor_focus_returns_keyboard_focus_to_the_tree",
+        area: FeatureArea::Panels,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: None,
+        description: "Clicking an Explorer row after the editor had focus must grant the Explorer keyboard focus",
+    },
+    ScenarioMeta {
         name: "explorer_drag_and_drop_opens_confirm_move_dialog",
         area: FeatureArea::DragDrop,
         driver_cap: DriverCap::ClickInput,
@@ -4068,6 +4076,65 @@ mod issue_984_explorer_chevron_needs_a_double_click {
     }
 }
 
+// Every sidebar panel grants its own keyboard-focus flag on a mouse press
+// into its content — `search_set_focus`/`ext_sidebar_has_focus`/
+// `dap_sidebar_has_focus`/`sc_set_focus`/`settings_has_focus`/
+// `ext_panel_has_focus`/`ai_has_focus`/`board_has_focus` each flip true at
+// the top of their `try_route_sidebar_mouse_event` arm (`src/app/sidebar.rs`)
+// on `is_press`/`starts_interaction` — except Explorer, whose arm never did.
+// A click that drops focus to the editor (`clear_sidebar_focus`, called from
+// every editor-area click per `src/app/mouse_tabs.rs`) then clicking back
+// into the Explorer tree left `explorer_has_focus` stale-false: the very
+// next keystroke failed `route_focus_key`'s `sidebar_band_focused` gate and
+// fell through to the editor instead of the tree. This is the same root
+// cause `fix-explorer-inline-edit-focus` fixed for the New File/New
+// Folder/Rename toolbar and context-menu paths; this scenario covers the
+// plain-click path those fixes didn't touch.
+#[cfg(test)]
+mod explorer_click_focus_grant {
+    use super::*;
+
+    /// A folder (for the row to click) plus a 3-line text file already open
+    /// in the editor (so cursor-line movement is observable in the painted
+    /// status bar), explorer visible.
+    fn engine_with_folder_and_open_file(tag: &str) -> crate::core::Engine {
+        let dir =
+            crate::harness::scratch_dir(&format!("vimcode_test_explorer_click_focus_grant_{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("efg_dir")).unwrap();
+        std::fs::write(dir.join("efg_dir").join("efg_child"), b"").unwrap();
+        std::fs::write(
+            dir.join("efg_sample.txt"),
+            b"efg line one\nefg line two\nefg line three\n",
+        )
+        .unwrap();
+
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.cwd = dir.clone();
+        engine.explorer_rebuild_rows();
+        engine.session.explorer_visible = true;
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_EXPLORER,
+        ));
+        let _ = engine.open_file_with_mode(
+            &dir.join("efg_sample.txt"),
+            crate::core::engine::OpenMode::Permanent,
+        );
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: explorer_row_click_after_editor_focus_returns_keyboard_focus_to_the_tree,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_with_folder_and_open_file("grant"),
+        size: (800, 480),
+        body: |driver| {
+            crate::harness::explorer_row_click_after_editor_focus_returns_keyboard_focus_to_the_tree(driver);
+        },
+    }
+}
+
 // The scrollbar in the left editor tab group doesn't work, and clicking it
 // instead triggers a resize between tab groups. `SCROLLBAR_IMPLEMENTATION.md`'s
 // own "Known Limitations" section already named the first half ("non-active
@@ -7496,6 +7563,60 @@ pub fn activity_bar_click_cycles_through_fixed_panels<D: ConformanceDriver + Dri
         driver.screen_has("EXPLORER") || driver.screen_has("Explorer"),
         "clicking the Explorer activity-bar icon must switch the sidebar \
          back to Explorer, completing the round trip: {:?}",
+        driver.inventory()
+    );
+}
+
+/// A click into the editor drops every sidebar's keyboard focus
+/// (`clear_sidebar_focus`, `src/app/mouse_tabs.rs`) — `explorer_has_focus`
+/// starts `false` by construction (`Engine::new_for_test`'s default) for
+/// the same reason, so this scenario's fixture needs no extra click to
+/// reach that state; it is simply never granted in the first place, exactly
+/// as it would be right after a real user finished editing a file. Clicking
+/// into the Explorer tree afterward must restore its own keyboard focus —
+/// the same grant-on-press contract every other sidebar panel already
+/// honors (`search_set_focus`/`ext_sidebar_has_focus`/etc. in
+/// `try_route_sidebar_mouse_event`) — so the very next keystroke reaches
+/// the tree instead of leaking to the editor underneath.
+///
+/// Fixture precondition: a folder (`efg_dir`) visible in the tree, and a
+/// 3-line file already open so the painted status-bar "Ln N," cursor
+/// position is the oracle for "did this keystroke move the editor cursor."
+pub fn explorer_row_click_after_editor_focus_returns_keyboard_focus_to_the_tree<
+    D: ConformanceDriver + DriverInput,
+>(
+    driver: &mut D,
+) {
+    assert!(
+        driver.screen_has("Ln 1,"),
+        "precondition: the cursor starts on line 1"
+    );
+    assert!(
+        driver.screen_has("efg_dir"),
+        "precondition: the explorer must paint the test folder"
+    );
+
+    // Click the folder's own label in the Explorer tree — real mouse-click
+    // routing through `try_route_sidebar_mouse_event`'s Explorer arm, not a
+    // direct engine-state poke.
+    driver.click_text("efg_dir");
+
+    // If the click above failed to grant Explorer's keyboard focus, this `j`
+    // falls through to the editor in NORMAL mode and moves the cursor to
+    // line 2. If focus correctly landed on the tree, `dispatch_explorer_key`
+    // consumes it as a tree-navigation key instead and the editor cursor
+    // never moves.
+    driver.type_text("j");
+    assert!(
+        !driver.screen_has("Ln 2,"),
+        "clicking the Explorer tree must grant it keyboard focus -- 'j' \
+         leaked through to the editor and moved its cursor instead: {:?}",
+        driver.inventory()
+    );
+    assert!(
+        driver.screen_has("Ln 1,"),
+        "the editor cursor must stay exactly where it was before the \
+         Explorer click: {:?}",
         driver.inventory()
     );
 }
