@@ -25506,6 +25506,79 @@ fn test_tab_context_menu_close_right_keeps_tabs_before_target() {
     );
 }
 
+/// `ContextMenuTarget::Tab`'s plain "Close" item (as opposed to the
+/// "Close to the Right"/"Close Others"/etc. variants already covered
+/// above) -- the simplest action in this target's menu, confirming
+/// `context_menu_confirm`'s dispatch reaches `Engine::close_tab_at`.
+#[test]
+fn test_tab_context_menu_close_closes_only_the_target_tab() {
+    let mut e = Engine::new();
+    e.new_tab(None);
+    let gid = e.active_group;
+    assert_eq!(e.active_group().tabs.len(), 2);
+    let tab_ids: Vec<_> = e.active_group().tabs.iter().map(|t| t.id).collect();
+
+    e.open_tab_context_menu(gid, 0, 0, 0);
+    {
+        let cm = e.context_menu.as_mut().unwrap();
+        let idx = cm.items.iter().position(|i| i.action == "close").unwrap();
+        cm.selected = idx;
+    }
+    let action = e.context_menu_confirm();
+    assert_eq!(action.as_deref(), Some("close"));
+    assert!(e.context_menu.is_none(), "confirming closes the menu");
+
+    let remaining: Vec<_> = e.active_group().tabs.iter().map(|t| t.id).collect();
+    assert_eq!(
+        remaining,
+        vec![tab_ids[1]],
+        "closing tab 0 via the context menu must leave only tab 1"
+    );
+}
+
+// ── Explorer panel context menu (the header's "..." overflow button, not a
+//    right-clicked row -- see `ContextMenuTarget::ExplorerPanel`'s own doc) ──
+
+/// `ContextMenuTarget::ExplorerPanel`'s "Collapse Folders in Explorer" item
+/// -- confirming `context_menu_confirm`'s dispatch reaches
+/// `Engine::explorer_collapse_all`, which clears every expanded directory
+/// except the workspace root. `new_file`/`new_folder` (this target's other
+/// two actions) already have thorough coverage via `dispatch_explorer_crud`
+/// from other entry points (the toolbar button, a right-clicked row); this
+/// is the one action unique to the panel-level ("..." overflow) menu.
+#[test]
+fn test_explorer_panel_context_menu_collapse_all() {
+    let mut e = Engine::new_for_test();
+    let root = e.cwd.clone();
+    e.explorer_expanded.insert(root.join("some_nested_dir"));
+    e.explorer_expanded.insert(root.join("another_dir"));
+    assert!(e.explorer_expanded.len() >= 2);
+
+    e.open_explorer_overflow_menu(0, 0, 1.0);
+    assert!(matches!(
+        e.context_menu.as_ref().unwrap().target,
+        ContextMenuTarget::ExplorerPanel
+    ));
+    {
+        let cm = e.context_menu.as_mut().unwrap();
+        let idx = cm
+            .items
+            .iter()
+            .position(|i| i.action == "collapse_all")
+            .unwrap();
+        cm.selected = idx;
+    }
+    let action = e.context_menu_confirm();
+    assert_eq!(action.as_deref(), Some("collapse_all"));
+
+    assert_eq!(
+        e.explorer_expanded,
+        std::collections::HashSet::from([root]),
+        "Collapse Folders in Explorer must clear every expanded directory \
+         except the workspace root"
+    );
+}
+
 // ── Explorer inline rename improvements ──────────────────────────────────────
 
 #[test]
