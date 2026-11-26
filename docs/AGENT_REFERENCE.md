@@ -110,6 +110,47 @@ PR-body claim; and for keyboard/terminal bugs specifically, require a
 sequences) alongside the driver test, since that is the only tier that exercises
 real terminal input.
 
+### Iterating on `tests/smoke-spec/tui.yaml` locally (#2190)
+
+`tui.yaml`'s own header says it is sealed, additive-only, and validated by
+fleet hardware — not a file to `coord app-drive run-spec` locally and expect
+clean. On at least one real dev machine, a run of the *whole* file hits a
+pre-existing, already-tracked cascade (`explorer-toolbar-owns-row-1-1736`,
+still open) within the first few steps, after which unrelated-looking
+scenarios dozens of steps later fail too — a local full-file run proves
+nothing about new content added near the end of it. CI's own TUI pty job
+never runs this file; it runs the small, deliberately local-friendly
+`tests/smoke-spec/ci-tui.yaml` instead.
+
+To validate a *new* scenario before adding it to `tui.yaml`:
+
+1. Copy just the new steps (plus a `launch`/`first-frame-painted`/
+   `file-content-visible` header, following `ci-tui.yaml`'s shape) into a
+   throwaway scratch spec file under `tests/smoke-spec/`, run it with `coord
+   app-drive run-spec tui-pty <scratch>.yaml --launch "<bin> <sample>" --cwd
+   <dir>` against a `cargo build --release --no-default-features --bin vcd`
+   build, then delete the scratch file before committing — never commit it.
+2. For step-by-step diagnosis (why a step fails, what's actually on screen),
+   drive the binary interactively instead of guessing from one `run-spec`
+   failure message: `coord app-drive open tui-pty --launch ... --cwd ...`
+   (poll `coord app-drive screen --session <id>` for the first real paint —
+   `wait-idle` can return before the first frame ever arrives, same false-
+   negative shape `tui.yaml`'s own header warns about), then alternate
+   `coord app-drive send --session <id> --click/--key ...` with `screen`
+   dumps to see the exact effect of each keystroke. Run every `open`/`send`/
+   `screen`/`close` call for one session inside a single shell invocation —
+   a session opened in one tool call was not reliably reachable from a
+   separate later call in at least one agent sandbox.
+3. A step that's flaky under `run-spec` but not under slower, manually-paced
+   `send` calls is a real timing sensitivity, not a tooling quirk — found
+   this way: two right-clicks on the same row/col under ~300ms apart were
+   misread as a double-click under a real pty (see `tui.yaml`'s own
+   `settle-after-cancel-delete-2190` comment for the measured numbers), and a
+   chain of 8 rapid identical `j` presses with no settle between them
+   occasionally dropped/misrouted a keystroke — both fixed by changing the
+   *scenario* (a longer settle; a single wrap-around `k` press instead of 8
+   `j`s) rather than adding delays to paper over either.
+
 ### Test lanes: which command covers which backend (#645)
 
 | Command | Compiles | Covers |
