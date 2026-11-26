@@ -2657,3 +2657,252 @@ steps:
     text: 'ZQXW_QUICKOPEN_MARKER_2191'
     ms: 2000
 
+  # vimcode#2193 -- `ext_install_offer_toast_keyboard_focus_tab_enter_
+  # dont_ask_again_via_shell_app` (src/tui_main/app_on_tui_tests.rs)
+  # exercises the install-offer toast's own Tab/Enter/"Don't ask again"
+  # focus ring only through synthetic key injection, and its fixture
+  # injects `engine.ext_registry` directly rather than ever triggering the
+  # toast through a real file open. The existing `-1835` section's own
+  # extension-install probe never drives this toast at all -- it only
+  # confirms a manually-placed local extension manifest is picked up.
+  # This is its own section rather than a literal extension of `-1835`
+  # (whose own steps leave the terminal panel open for `-1971`'s `<C-t>`
+  # right after it -- opening a *second* terminal here instead avoids
+  # fighting over that hand-off) since #3509 treats additions as
+  # independent, additive blocks regardless of where in the file they land.
+  #
+  # Getting a real install-offer toast to fire under a real pty needs more
+  # than a right-click or a keybinding: `Engine::lsp_did_open`
+  # (src/core/engine/lsp_ops.rs) only offers an extension when
+  # `settings.lsp_enabled` is true AND the opened file's extension
+  # resolves to a language id via `settings.language_map` AND a local or
+  # registry `ExtensionManifest` advertises that language id. None of
+  # those three are reachable through this file's own launch convention
+  # (LSP disabled, no custom language map) or through any ex command --
+  # `language_map` has no `:set` key (confirmed against
+  # `src/core/settings.rs`'s runtime-settable key list) -- so this section
+  # writes a fresh `settings.json` from the real filesystem instead,
+  # inside a real terminal pane, the same way `-1835`'s own probe creates
+  # a local extension manifest. `Settings::save`'s own mtime watcher
+  # picks up an externally-written settings.json and reloads it live
+  # (confirmed live: the status bar paints "Settings reloaded" the moment
+  # the terminal panel closes), so no relaunch is needed -- the two
+  # custom language ids/extensions are live by the time the terminal
+  # closes and the first `:e` below runs.
+  # Colon split from the rest of the command -- see
+  # `toast-open-probe-b-colon-2193`'s own doc for why, further below.
+  - type: key
+    id: 'toast-setup-open-terminal-colon-2193'
+    key: ':'
+  - type: type_text
+    id: 'toast-setup-open-terminal-2193'
+    text: 'term'
+  - type: key
+    id: 'toast-setup-open-terminal-enter-2193'
+    key: enter
+  - type: expect_within
+    id: 'toast-setup-terminal-ready-2193'
+    text: '[1]'
+    ms: 20000
+  - type: wait_idle
+    id: 'toast-setup-terminal-settle-2193'
+    ms: 500
+    timeout_ms: 5000
+  - type: type_text
+    id: 'toast-setup-write-fixtures-2193'
+    text: "mkdir -p ~/.config/vimcode/extensions/vc-tst-ext-2193a ~/.config/vimcode/extensions/vc-tst-ext-2193b && printf 'name = \"vc-tst-ext-2193a\"\\ndisplay_name = \"ZQXW2193A\"\\nlanguage_ids = [\"vc-tst-lang-2193a\"]\\n\\n[lsp]\\nbinary = \"vc-nonexistent-2193a\"\\ninstall = \"true\"\\n' > ~/.config/vimcode/extensions/vc-tst-ext-2193a/manifest.toml && printf 'name = \"vc-tst-ext-2193b\"\\ndisplay_name = \"ZQXW2193B\"\\nlanguage_ids = [\"vc-tst-lang-2193b\"]\\n\\n[lsp]\\nbinary = \"vc-nonexistent-2193b\"\\ninstall = \"true\"\\n' > ~/.config/vimcode/extensions/vc-tst-ext-2193b/manifest.toml && printf '{\"lsp_enabled\": true, \"use_nerd_fonts\": false, \"language_map\": {\"vctst2193a\": \"vc-tst-lang-2193a\", \"vctst2193b\": \"vc-tst-lang-2193b\"}}' > ~/.config/vimcode/settings.json && printf 'aaa\\nbbb\\n' > probe_a.vctst2193a && printf 'ccc\\nddd\\n' > probe_b.vctst2193b && echo VCTST2193_FIXTURES_READY\r"
+  - type: expect_within
+    id: 'toast-setup-fixtures-ready-2193'
+    text: 'VCTST2193_FIXTURES_READY'
+    ms: 5000
+  - type: wait_idle
+    id: 'toast-setup-settle-after-fixtures-2193'
+    ms: 300
+    timeout_ms: 4000
+  - type: key
+    id: 'toast-setup-close-terminal-2193'
+    key: 'ctrl+t'
+  - type: expect_within
+    id: 'toast-setup-settings-reloaded-2193'
+    text: 'Settings reloaded'
+    ms: 3000
+  # A real settle, not a poll: the status line already shows "Settings
+  # reloaded" by the check above, so polling for the *same* already-true
+  # text again forces no real delay at all. Without a genuine pause here,
+  # a real pty run occasionally dropped the `:e` typed right after --
+  # `sample.txt` stayed the active tab, no toast ever appeared -- the same
+  # "typed right after a focus-changing keystroke lands before it finished
+  # settling" shape as `settle-after-cancel-delete-2190`'s double-click
+  # misread. `wait_idle` is safe here (unlike right after dismissing the
+  # install output pane below, where a live blinking cursor never lets the
+  # stream go quiet and this same step type hard-fails) because nothing
+  # is actively repainting once "Settings reloaded" has already landed.
+  - type: wait_idle
+    id: 'toast-setup-extra-settle-2193'
+    ms: 300
+    timeout_ms: 4000
+  # Belt-and-suspenders alongside the `wait_idle` above (which alone still
+  # let one real run drop the next `:e` even after settling): a second,
+  # content-based confirmation that the editor -- showing `sample.txt`'s
+  # own first line, unchanged since launch -- genuinely owns the screen.
+  - type: expect_within
+    id: 'toast-setup-extra-settle-content-2193'
+    text: 'line one'
+    ms: 2000
+  # A real mouse click directly into the editor's own content, not just
+  # another keystroke -- `wait_idle` plus the content poll above still
+  # occasionally wasn't enough on a real pty for the very next `:e` to
+  # land (`sample.txt` stayed active, no toast ever appeared). A click
+  # here is the same belt-and-suspenders reasoning as the explorer
+  # focus-grant fixes (#2189/#2196): a press is a stronger, more
+  # synchronous focus signal than a keyboard chord's own multi-stage
+  # transition.
+  - type: click
+    id: 'toast-setup-click-editor-2193'
+    row: 2
+    col: 30
+
+  # Open *both* probe files back-to-back, before interacting with either
+  # toast: both stack (confirmed live, over several `coord app-drive`
+  # trials) rather than the second replacing the first. This sidesteps a
+  # much less reliable alternative tried first -- activating toast A's
+  # "Install" (which opens its own terminal output pane, see the deleted
+  # `toast-a-close-revealed-terminal-2193` step this replaces) and *then*
+  # typing a second `:e` afterward -- which a real pty run occasionally
+  # dropped even with the same settle-plus-click belt-and-suspenders
+  # pattern used above. Doing every `:e` up front, while the editor still
+  # unambiguously owns focus, and leaving the one truly fragile
+  # transition (dismissing Install's own output pane) for *last* with
+  # nothing risky after it removes that failure mode entirely.
+  # Colon split from the rest of the command, same reasoning (and the
+  # same fix) as `toast-open-probe-b-colon-2193` below.
+  - type: key
+    id: 'toast-open-probe-a-colon-2193'
+    key: ':'
+  - type: type_text
+    id: 'toast-open-probe-a-2193'
+    text: 'e probe_a.vctst2193a'
+  - type: key
+    id: 'toast-open-probe-a-enter-2193'
+    key: enter
+  - type: expect_within
+    id: 'toast-a-appears-2193'
+    text: 'Install the ZQXW2193A extension?'
+    ms: 3000
+  # A content poll settle, same reasoning as `toast-setup-extra-settle-
+  # content-2193` above -- a real pty run occasionally dropped the very
+  # next `:e` here too. Deliberately *no* click this time (unlike the
+  # belt-and-suspenders pattern above, which is safe before any toast
+  # exists yet): a click into the editor here reliably dismissed toast A
+  # outright -- a real click lands as an "outside click" on whatever
+  # modal-ish surface currently owns the screen, and a toast evidently
+  # counts, even though it's not in `Engine::is_blocking_modal_open`'s
+  # own list. Confirmed by its absence breaking both this step *and*
+  # pass 1's install step much further below, every single real run.
+  - type: expect_within
+    id: 'toast-a-settle-before-probe-b-2193'
+    text: 'aaa'
+    ms: 2000
+  # Typing the leading ':' as part of the same `type_text` burst as the
+  # rest of the command (tried first) was the one real source of
+  # flakiness this whole section still had after every settle above: a
+  # real pty run occasionally lost the colon specifically, so the
+  # following "e probe_b..." typed into NORMAL mode as plain motion keys
+  # instead of a command line, and no toast ever appeared. Sending the
+  # colon as its own discrete keypress first -- confirmed over 5/5 real
+  # `coord app-drive` trials -- is reliable where the combined burst
+  # was not.
+  - type: key
+    id: 'toast-open-probe-b-colon-2193'
+    key: ':'
+  - type: type_text
+    id: 'toast-open-probe-b-2193'
+    text: 'e probe_b.vctst2193b'
+  - type: key
+    id: 'toast-open-probe-b-enter-2193'
+    key: enter
+  - type: expect_within
+    id: 'toast-b-appears-2193'
+    text: 'Install the ZQXW2193B extension?'
+    ms: 3000
+
+  # Pass 2 first (cleanest -- "Don't ask again" has no further side
+  # effects to land safely after): `:Notifications` focuses the stack --
+  # its topmost entry, the more-recently-queued toast B. Tab *twice* from
+  # the default dismiss-"×" focus reaches "Don't ask again"; Enter
+  # activates it, and the status line's own confirmation message is this
+  # step's deterministic oracle (an absent-toast check isn't expressible
+  # with this spec DSL's step types).
+  # Same colon split as `toast-open-probe-b-colon-2193`'s own doc.
+  - type: key
+    id: 'toast-b-focus-stack-colon-2193'
+    key: ':'
+  - type: type_text
+    id: 'toast-b-focus-stack-2193'
+    text: 'Notifications'
+  - type: key
+    id: 'toast-b-focus-stack-enter-2193'
+    key: enter
+  - type: key
+    id: 'toast-b-tab-1-2193'
+    key: tab
+  - type: key
+    id: 'toast-b-tab-2-2193'
+    key: tab
+  - type: key
+    id: 'toast-b-confirm-dont-ask-again-2193'
+    key: enter
+  - type: expect_within
+    id: 'toast-b-dismissal-confirmed-2193'
+    text: "dismissed"
+    ms: 3000
+
+  # Restore the `lsp_enabled: false` convention every other section in
+  # this file assumes, here rather than after pass 1 below: this is the
+  # last point this section is confirmed to leave the editor cleanly
+  # focused with nothing else in flight -- `lsp_enabled`'s own value does
+  # not gate the "Install" button's action, only whether `lsp_did_open`
+  # offers a *fresh* recommendation, so flipping it off before pass 1
+  # does not stop pass 1 from working.
+  # Same colon split as `toast-open-probe-b-colon-2193`'s own doc.
+  - type: key
+    id: 'toast-cleanup-colon-2193'
+    key: ':'
+  - type: type_text
+    id: 'toast-cleanup-2193'
+    text: 'set lsp_enabled=false'
+  - type: key
+    id: 'toast-cleanup-enter-2193'
+    key: enter
+
+  # Pass 1 last: with toast B gone, `:Notifications` now reaches toast A.
+  # Tab *once* from the same default dismiss-"×" focus reaches "Install"
+  # (matching the driver test's own comment on focus order); Enter
+  # activates it, actually running the (harmless, `install = "true"`)
+  # install command and opening its output pane. Nothing in this spec
+  # needs the editor back after this, so dismissing that pane's own
+  # "Press Enter to close…" prompt is this section's last step.
+  # Same colon split as `toast-open-probe-b-colon-2193`'s own doc.
+  - type: key
+    id: 'toast-a-focus-stack-colon-2193'
+    key: ':'
+  - type: type_text
+    id: 'toast-a-focus-stack-2193'
+    text: 'Notifications'
+  - type: key
+    id: 'toast-a-focus-stack-enter-2193'
+    key: enter
+  - type: key
+    id: 'toast-a-tab-to-install-2193'
+    key: tab
+  - type: key
+    id: 'toast-a-confirm-install-2193'
+    key: enter
+  - type: expect_within
+    id: 'toast-a-install-output-opens-2193'
+    text: 'Press Enter to close'
+    ms: 5000
+  - type: key
+    id: 'toast-a-dismiss-output-2193'
+    key: enter
+
