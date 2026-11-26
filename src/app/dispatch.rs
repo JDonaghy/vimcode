@@ -128,7 +128,7 @@ impl App {
             // An open dropdown resolves a plain printable key as type-ahead
             // and consumes it; this host closes the dropdown on such a key
             // and lets it reach the editor instead (the `Ignored` arm below).
-            // TODO(#2176): drop this bypass once quadraui's menu system lets
+            // TODO(#2185): drop this bypass once quadraui's menu system lets
             // a host opt out of dropdown type-ahead.
             let plain_char_in_open_menu = menu_open
                 && matches!(
@@ -140,7 +140,7 @@ impl App {
             // event over `bar_rect`, the empty stretch past the last label
             // included, where the Command Center and the window controls
             // sit. Only a pointer over a label belongs to it here.
-            // TODO(#2176): drop this once the title bar routes through a
+            // TODO(#2177): drop this once the title bar routes through a
             // `FrameTree` that hit-tests those widgets first.
             let pointer_off_menu_labels = !menu_open
                 && render::pointer_position(&event).is_some_and(|p| {

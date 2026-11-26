@@ -32,7 +32,13 @@ where
     let painted: Box<dyn std::any::Any> = painted;
     match painted.downcast::<W::Layout>() {
         Ok(layout) => *layout,
-        Err(_) => backend.layout_primitive(rect, widget),
+        Err(_) => {
+            debug_assert!(
+                false,
+                "draw_dyn returned a layout that is not the widget's own Primitive::Layout"
+            );
+            backend.layout_primitive(rect, widget)
+        }
     }
 }
 
@@ -70,7 +76,7 @@ pub(crate) fn readdress_interaction(
 /// as pressed wherever the pointer is. A press therefore takes the hovered
 /// slot too, so it paints even while the mouse rests on another button of
 /// the same widget; that other button shows no hover tint meanwhile.
-// TODO(#2176): drop once quadraui's paint env carries a press that is not
+// TODO(#2185): drop once quadraui's paint env carries a press that is not
 // tied to the pointer (keyboard activation).
 fn pressed_paints_hovered(
     hovered: Option<quadraui::focus::FocusAddress>,
@@ -187,7 +193,7 @@ pub(crate) fn context_menu_row_heights(backend: &dyn Backend) -> (f32, f32) {
 /// The box keeps the size vimcode measured for it (wide enough for its
 /// body text, a two-row input slot on the cell grid) rather than the
 /// fixed-width box `Dialog`'s own `Primitive::layout` resolves.
-// TODO(#2175): paint the `Dialog` directly once quadraui's `Dialog` takes a
+// TODO(#2185): paint the `Dialog` directly once quadraui's `Dialog` takes a
 // host size hint (preferred width / measure) through `Primitive::layout`.
 pub(crate) fn draw_dialog(
     backend: &mut dyn Backend,

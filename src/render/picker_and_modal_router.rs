@@ -118,9 +118,20 @@ pub fn gtk_picker_sizing(line_height: f32) -> PickerSizing {
 /// chrome `line_height` — read from the `Palette` widget's own layout so
 /// popup sizing and row hit-testing use the same pitch the painter does.
 /// On a cell grid (`line_height <= 1.0`) this is one cell.
+///
+/// The probe ctx is resolved the way `draw_dyn` resolves the painted one:
+/// `line_height` floored at the style's row-height token, with that style
+/// attached. vimcode installs no style of its own, so every backend paints
+/// with `Style::default()`.
 pub fn palette_item_pitch(line_height: f32) -> f32 {
     let probe = quadraui::Palette::default();
-    let ctx = quadraui::LayoutCtx::new(line_height, 1.0, false);
+    let style = quadraui::Style::default();
+    let ctx = quadraui::LayoutCtx::new(
+        quadraui::LayoutCtx::resolve_row_height(line_height, &style),
+        1.0,
+        false,
+    )
+    .with_style(&style);
     let area = quadraui::Rect::new(0.0, 0.0, 400.0, (line_height * 40.0).max(40.0));
     quadraui::Primitive::layout(&probe, &ctx, area)
         .row_height

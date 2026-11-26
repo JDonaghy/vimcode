@@ -809,7 +809,7 @@ pub(crate) fn paint_plugin_view_combo_box_dropdown(
     // form row rather than the box's one-line field, and placed inside the
     // host's rect rather than the whole viewport, so it never spills over
     // neighbouring chrome whose clicks the form host does not receive.
-    // TODO(#2173): route presses through the box's `Interactive::handle`
+    // TODO(#2177): route presses through the box's `Interactive::handle`
     // (`RoutedEvent::PopupEvent`) once plugin-view forms are `FrameTree`
     // nodes, and queue the popup for the runner's popup layer once that
     // layer paints popups while a `ModalStack` entry is open.

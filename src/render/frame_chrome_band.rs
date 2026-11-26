@@ -599,9 +599,7 @@ pub fn context_menu_state_to_panel(cm: &crate::core::engine::ContextMenuState) -
 /// `open` state, so there is nothing to leak when this transient instance
 /// is dropped at the end of the call. A persistent controller would only
 /// matter for driving the `Custom` branch too, which vimcode does not
-/// route through this controller — see [`paint_context_menu_rung`]'s doc
-/// for the capability gap (no `MouseMove` hover) that keeps the in-window
-/// path on vimcode's own state for now.
+/// route through this controller — see [`paint_context_menu_rung`]'s doc.
 ///
 /// Uses the same `ContextMenu`/`WidgetId`s [`paint_context_menu_rung`]'s
 /// in-window path does, so `UiEvent::ContextMenuItemActivated` resolves
@@ -628,14 +626,15 @@ pub fn show_context_menu_now(
 /// panel (to make room for the ASCII border) is per-backend geometry prep and
 /// stays at the call site, not here.
 ///
-/// # Why this stays vimcode's own state instead of quadraui controller
+/// # State, placement and routing
 ///
-/// [`quadraui::ContextMenuController`] matches only `KeyPressed(Escape/Down/Up/
-/// Enter)` and `MouseDown` — there is no `MouseMove` arm — so it cannot
-/// host vimcode's tested hover-follows-pointer behaviour. The highlighted row
-/// must move as the mouse moves over it, before any click. Once quadraui grows a
-/// `MouseMove` hover arm for `ContextMenuController::handle`, this rung, the
-/// click routing, and related state can fold into the controller.
+/// The menu paints as quadraui's `ContextMenu` widget, but its open state,
+/// selected row, placement ([`context_menu_generic_layout`]) and click and
+/// hover routing are vimcode's own (`Engine::context_menu`,
+/// `route_modal_overlay_click`). [`quadraui::ContextMenuController`] owns
+/// all of those itself, hover-follows-pointer included.
+// TODO(#2177): move the in-window menu's state, placement and routing onto
+// `quadraui::ContextMenuController`.
 pub fn paint_context_menu_rung(
     b: &mut dyn quadraui::Backend,
     panel: &ContextMenuPanel,

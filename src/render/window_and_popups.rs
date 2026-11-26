@@ -831,7 +831,7 @@ pub fn paint_editor_popups(
     }
 
     // ── Hover popup (rendered on top of editor) ──────────────────────────────
-    // TODO(#2175): every `Tooltip` in this function paints without its drop
+    // TODO(#2185): every `Tooltip` in this function paints without its drop
     // shadow on pixel backends: `Tooltip` reports no `paint_bleed`, so
     // `draw_dyn` clips the shadow to the box. Nothing to change here once
     // quadraui's `Tooltip::paint_bleed` covers `style.shadow_elevation`.
