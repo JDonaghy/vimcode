@@ -2343,3 +2343,77 @@ steps:
     text: 'unique_fold_body_1971'
     ms: 5000
 
+  # ─────────────────────────────────────────────────────────────────────
+  # Explorer inline-edit keyboard routing -- a ConformanceDriver test
+  # cannot catch this class of bug (this file's own header's warning about
+  # synthetic key values bypassing the real terminal-input-parsing path),
+  # so this section drives it over a real pty with real keystrokes.
+  # Additive (#3509): appended after the #1971 fold section above,
+  # independent of it -- re-selects Explorer via the activity-bar icon
+  # rather than assuming any prior section left it open.
+  #
+  # Real-world trigger: the Explorer sidebar has focus, the user clicks
+  # into the editor to edit a file (`src/app/mouse_tabs.rs` clears every
+  # sidebar's keyboard-focus flag on that click), then clicks the
+  # Explorer toolbar's "New File" button. `Engine::dispatch_explorer_crud`
+  # starts the tree's inline-edit placeholder correctly, but
+  # `explorer_has_focus` is left stale-false, so
+  # `render::route_focus_key`'s `!sidebar_band_focused` gate sends every
+  # following keystroke to the editor instead of the tree.
+  - type: click
+    id: 'click-explorer-icon-inline-edit-focus'
+    row: 1
+    col: 1
+  - type: expect_within
+    id: 'explorer-reselected-inline-edit-focus'
+    text: 'EXPLORER'
+    ms: 5000
+  - type: wait_idle
+    id: 'settle-after-explorer-reselect-inline-edit-focus'
+    ms: 300
+    timeout_ms: 5000
+
+  # Drop explorer focus the same way a real user does: click into the
+  # editor's own content (col 30 is well past the sidebar/tree band, which
+  # ends around col 22 -- see this file's own `explorer-toolbar-owns-row-
+  # 1-1736` comment above for that band's column math).
+  - type: click
+    id: 'click-into-editor-inline-edit-focus'
+    row: 2
+    col: 30
+  - type: wait_idle
+    id: 'settle-after-editor-click-inline-edit-focus'
+    ms: 300
+    timeout_ms: 5000
+
+  # Click the Explorer toolbar's "New File" button. Row 1 is the
+  # view-actions toolbar (see `explorer-toolbar-owns-row-1-1736` above);
+  # col 10 is the "New File" glyph's column, confirmed live against this
+  # exact binary with `coord app-drive screen` before authoring this step.
+  - type: click
+    id: 'click-new-file-toolbar-inline-edit-focus'
+    row: 1
+    col: 10
+  - type: expect_within
+    id: 'inline-edit-starts-inline-edit-focus'
+    text: 'file name'
+    ms: 2000
+  - type: wait_idle
+    id: 'settle-after-inline-edit-starts-inline-edit-focus'
+    ms: 300
+    timeout_ms: 5000
+
+  # The regression: every one of these keystrokes must land in the tree's
+  # inline edit, not fall through to the editor buffer behind it.
+  - type: type_text
+    id: 'type-filename-inline-edit-focus'
+    text: 'newfile1'
+  - type: expect_within
+    id: 'keystrokes-land-in-inline-edit-not-editor'
+    text: 'newfile1'
+    ms: 2000
+
+  - type: key
+    id: 'dismiss-inline-edit-inline-edit-focus'
+    key: esc
+

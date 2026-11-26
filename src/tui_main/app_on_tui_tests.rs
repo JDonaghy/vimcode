@@ -8424,6 +8424,143 @@ mod tests {
             );
         }
 
+        /// Confirming "New File..." from the context menu must grant
+        /// `explorer_has_focus` so the very next keystroke reaches the
+        /// tree's inline edit instead of falling through to the editor.
+        /// Mirrors the real-world trigger `explorer_ops.rs`'s
+        /// `dispatch_explorer_crud` bug report describes: the explorer had
+        /// focus, the user clicked into the editor (dropping it — the same
+        /// `clear_sidebar_focus()` call `context_menu_delete_works_with_
+        /// explorer_focus_cleared` simulates, matching `src/app/
+        /// mouse_tabs.rs`'s own click-into-editor handling), then opened
+        /// the context menu and confirmed "New File...". Drives the
+        /// keystroke through the real `App`-level routing
+        /// (`driver.type_char`, not a direct `Engine::dispatch_explorer_key`
+        /// call) so this exercises the same `route_focus_key` call site
+        /// production input goes through.
+        #[test]
+        fn context_menu_new_file_keystroke_lands_in_inline_edit_not_editor() {
+            let mut engine = engine_with_folder_ctx_menu("new_file_focus_lost", 0);
+
+            // Give the editor an Insert-mode buffer so a mis-routed
+            // keystroke is unambiguous: it would insert text here rather
+            // than being silently dropped or reinterpreted as a Normal-mode
+            // command.
+            engine.mode = crate::core::Mode::Insert;
+            let initial_len = engine.buffer().len_chars();
+            engine.buffer_mut().delete_range(0, initial_len);
+            engine.view_mut().cursor = crate::core::Cursor { line: 0, col: 0 };
+
+            engine.clear_sidebar_focus();
+            assert!(
+                !engine.explorer_has_focus,
+                "precondition: explorer_has_focus starts false, mirroring \
+                 the click-into-editor step"
+            );
+
+            let mut h = harness(engine);
+            let driver = &mut h.driver;
+
+            // Confirm "New File..." (idx 0) in the already-open context menu.
+            driver.press_named(quadraui::NamedKey::Enter);
+            assert!(
+                driver.screen_has("file name"),
+                "confirming 'New File...' must start the tree's inline-edit \
+                 placeholder even with explorer_has_focus starting false; \
+                 screen:\n{}",
+                driver.screen()
+            );
+            assert!(
+                h.engine.borrow().explorer_has_focus,
+                "starting the inline edit must grant engine-level explorer \
+                 focus so the very next keystroke reaches the tree instead \
+                 of falling through to the editor"
+            );
+
+            // Type a filename character through the real App-level routing.
+            driver.type_char('Z');
+            assert_eq!(
+                h.engine
+                    .borrow()
+                    .explorer_tree
+                    .borrow()
+                    .editing_text()
+                    .map(|s| s.to_string()),
+                Some("Z".to_string()),
+                "the typed character must land in the tree's inline edit"
+            );
+            assert_eq!(
+                h.engine.borrow().buffer().len_chars(),
+                0,
+                "the typed character must not be inserted into the editor \
+                 buffer"
+            );
+        }
+
+        /// The `Rename` arm of `dispatch_explorer_crud` must grant
+        /// `explorer_has_focus` exactly like the `NewFile`/`NewFolder` arm
+        /// above — same bug, same fix, different context-menu entry.
+        #[test]
+        fn context_menu_rename_keystroke_lands_in_inline_edit_not_editor() {
+            let mut engine = engine_with_folder_ctx_menu("rename_focus_lost", 7);
+
+            engine.mode = crate::core::Mode::Insert;
+            let initial_len = engine.buffer().len_chars();
+            engine.buffer_mut().delete_range(0, initial_len);
+            engine.view_mut().cursor = crate::core::Cursor { line: 0, col: 0 };
+
+            engine.clear_sidebar_focus();
+            assert!(
+                !engine.explorer_has_focus,
+                "precondition: explorer_has_focus starts false, mirroring \
+                 the click-into-editor step"
+            );
+
+            let mut h = harness(engine);
+            let driver = &mut h.driver;
+
+            // Confirm "Rename" (idx 7) in the already-open context menu.
+            driver.press_named(quadraui::NamedKey::Enter);
+            assert!(
+                h.engine.borrow().explorer_tree.borrow().is_editing(),
+                "confirming 'Rename' must start the tree's inline edit even \
+                 with explorer_has_focus starting false"
+            );
+            assert!(
+                h.engine.borrow().explorer_has_focus,
+                "starting the rename inline edit must grant engine-level \
+                 explorer focus so the very next keystroke reaches the \
+                 tree instead of falling through to the editor"
+            );
+
+            let before = h
+                .engine
+                .borrow()
+                .explorer_tree
+                .borrow()
+                .editing_text()
+                .map(|s| s.to_string());
+            driver.type_char('Z');
+            let after = h
+                .engine
+                .borrow()
+                .explorer_tree
+                .borrow()
+                .editing_text()
+                .map(|s| s.to_string());
+            assert_ne!(
+                before, after,
+                "typing 'Z' during a rename must change the tree's inline \
+                 edit text"
+            );
+            assert_eq!(
+                h.engine.borrow().buffer().len_chars(),
+                0,
+                "the typed character must not be inserted into the editor \
+                 buffer"
+            );
+        }
+
         /// Confirming "Delete" must open the delete-confirmation dialog.
         #[test]
         fn context_menu_delete_opens_confirm_dialog() {
@@ -8443,6 +8580,68 @@ mod tests {
                 "confirming 'Delete' must open the delete-confirmation \
                  dialog; screen:\n{}",
                 driver.screen()
+            );
+        }
+
+        /// INVESTIGATION-ONLY (not committed): mirrors the real-world
+        /// sequence a user reported — explorer open and focused, then a
+        /// click into the main editor (which clears sidebar keyboard focus
+        /// via `Engine::clear_sidebar_focus`, same as
+        /// `App::handle_mouse`'s editor-click rung in `mouse_tabs.rs`),
+        /// then right-click a row to open its context menu, select
+        /// "Delete", and confirm. Checks whether the confirm dialog opens
+        /// and whether confirming it actually deletes the target and
+        /// closes the dialog, with `explorer_has_focus` false throughout.
+        #[test]
+        fn context_menu_delete_works_with_explorer_focus_cleared() {
+            let mut engine = engine_with_folder_ctx_menu("delete_focus_cleared", 8);
+            let target_dir = engine
+                .context_menu_target_path()
+                .map(|(p, _)| p)
+                .expect("context menu must have a target");
+
+            // Simulate "the user clicked into the main editor" after the
+            // explorer had focus, and before ever opening the context menu —
+            // the exact precondition `explorer_ops.rs`'s `dispatch_explorer_crud`
+            // bug report describes.
+            engine.clear_sidebar_focus();
+            assert!(
+                !engine.sidebar_has_focus(),
+                "precondition: sidebar focus must be cleared, mirroring the \
+                 click-into-editor step"
+            );
+
+            let mut h = harness(engine);
+            let driver = &mut h.driver;
+
+            assert!(
+                !driver.screen_has("Confirm Delete"),
+                "precondition: no dialog is open yet"
+            );
+            // Confirm "Delete" in the already-open context menu.
+            driver.press_named(quadraui::NamedKey::Enter);
+            assert!(
+                driver.screen_has("Confirm Delete"),
+                "confirming 'Delete' must open the delete-confirmation \
+                 dialog even with explorer_has_focus == false; screen:\n{}",
+                driver.screen()
+            );
+            assert!(
+                target_dir.exists(),
+                "precondition: delete target must still exist before confirming"
+            );
+
+            // Confirm the dialog itself (default button == "Delete").
+            driver.press_named(quadraui::NamedKey::Enter);
+            assert!(
+                !driver.screen_has("Confirm Delete"),
+                "confirming the delete dialog must close it; screen:\n{}",
+                driver.screen()
+            );
+            assert!(
+                !target_dir.exists(),
+                "confirming the delete dialog must actually delete the \
+                 target on disk"
             );
         }
 
