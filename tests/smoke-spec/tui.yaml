@@ -1886,6 +1886,102 @@ steps:
     id: dismiss-context-menu-root-row-1703
     key: esc
 
+  # vimcode#2190 — every right-click step above opens the Explorer context
+  # menu and immediately dismisses it with `esc`; none of them press Enter
+  # to actually *confirm* a selected item under a real pty. Per #1970, a
+  # `ConformanceDriver` test injects synthetic key values that bypass the
+  # real terminal-input-parsing path and cannot catch a bug that lives
+  # there — exactly the gap shape that let vimcode#2189's "New File..."
+  # confirm bug ship despite a passing driver test. This section closes
+  # that gap for two menu actions: "Delete" (confirmed, then the resulting
+  # dialog is cancelled rather than confirmed, so nothing is actually
+  # deleted and the file tree stays intact for every later step in this
+  # file) and "Open in Integrated Terminal" (actually executed, since it is
+  # non-destructive, then closed with the same `<C-t>` chord the #1971
+  # section below already uses).
+  #
+  # Folder context menu order (`Engine::open_explorer_context_menu`,
+  # `src/core/engine/windows.rs`): 0 New File..., 1 New Folder..., 2 Open
+  # Containing Folder, 3 Open in Integrated Terminal, 4 Find in Folder...,
+  # 5 Copy Path, 6 Copy Relative Path, 7 Rename..., 8 Delete. The menu opens
+  # with index 0 selected (`items.iter().position(|i| i.enabled)`);
+  # `Engine::handle_context_menu_key`'s "k"/"Up" arm wraps from index 0
+  # straight to the last item (`len - 1` = 8 = "Delete") in a single press —
+  # confirmed live, over several trials, against this exact binary with
+  # `coord app-drive send`/`screen` before authoring this step. A chain of
+  # 8 separate "j" presses was tried first and found to flake under a real
+  # pty (sent back-to-back with no settle between them, a handful of real
+  # runs left the tree on the wrong row or closed the menu early) — the
+  # single wrap-around press sidesteps that rather than papering over it
+  # with inter-press delays.
+  - type: click
+    id: right-click-explorer-root-row-confirm-delete-2190
+    row: 2
+    col: 10
+    button: right
+  - type: expect_within
+    id: context-menu-opens-for-confirm-delete-2190
+    text: "New File"
+    ms: 1500
+  - type: key
+    id: context-menu-up-wraps-to-delete-2190
+    key: 'k'
+  - type: key
+    id: context-menu-confirm-delete-2190
+    key: enter
+  - type: expect_within
+    id: context-menu-confirm-opens-delete-dialog-2190
+    text: "Confirm Delete"
+    ms: 1500
+  - type: key
+    id: cancel-delete-dialog-2190
+    key: esc
+  # A full 1000ms of quiet, not the usual ~300ms settle margin: the second
+  # right-click below lands on the *same row/col* as the one above it. A
+  # shorter gap left real pty runs 100% reproducing a double-click-style
+  # misread of the two independent right-clicks — the folder collapsed
+  # instead of opening a fresh context menu, and the next `expect_within`
+  # below found no menu at all. Confirmed over several `coord app-drive
+  # run-spec` trials: ms: 300 reproduced the collapse every time, ms: 1000
+  # did not reproduce it once.
+  - type: wait_idle
+    id: settle-after-cancel-delete-2190
+    ms: 1000
+    timeout_ms: 4000
+
+  - type: click
+    id: right-click-explorer-root-row-confirm-open-terminal-2190
+    row: 2
+    col: 10
+    button: right
+  - type: expect_within
+    id: context-menu-opens-for-confirm-open-terminal-2190
+    text: "New File"
+    ms: 1500
+  - type: key
+    id: context-menu-down-to-open-terminal-1-2190
+    key: 'j'
+  - type: key
+    id: context-menu-down-to-open-terminal-2-2190
+    key: 'j'
+  - type: key
+    id: context-menu-down-to-open-terminal-3-2190
+    key: 'j'
+  - type: key
+    id: context-menu-confirm-open-terminal-2190
+    key: enter
+  - type: expect_within
+    id: context-menu-confirm-opens-terminal-pane-2190
+    text: "Terminal"
+    ms: 5000
+  - type: key
+    id: close-terminal-after-confirm-2190
+    key: 'ctrl+t'
+  - type: wait_idle
+    id: settle-after-close-terminal-2190
+    ms: 300
+    timeout_ms: 4000
+
   # ─────────────────────────────────────────────────────────────────────
   # vimcode#1970 -- Ctrl-W h from a focused sidebar panel (Explorer is the
   # active panel here, re-selected by click-explorer-icon-again above) must
