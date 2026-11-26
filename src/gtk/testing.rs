@@ -1887,6 +1887,71 @@ mod tests {
         );
     }
 
+    /// With two editor groups, clicking an inactive tab in the unfocused
+    /// group's bar must focus that group and activate that tab. Both bars
+    /// paint under the same widget id, so this pins that the click resolves
+    /// to the bar actually under the pointer.
+    #[test]
+    fn tab_click_in_the_unfocused_group_activates_that_groups_tab() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_split_tab_click_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths: Vec<_> = ["zgroupa", "zgroupb1", "zgroupb2"]
+            .iter()
+            .map(|name| {
+                let path = dir.join(format!("{name}.txt"));
+                std::fs::write(&path, "x\n").unwrap();
+                path
+            })
+            .collect();
+
+        let mut engine = Engine::new();
+        engine
+            .open_file_with_mode(&paths[0], crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        let group_a = engine.active_group;
+        engine.open_editor_group(SplitDirection::Vertical);
+        let group_b = engine.active_group;
+        assert_ne!(group_a, group_b, "`open_editor_group` must create a group");
+        for path in &paths[1..] {
+            engine.new_tab(Some(path));
+        }
+        let b_tabs = engine.editor_groups[&group_b].tabs.len();
+        assert!(b_tabs >= 2, "group B must hold both opened tabs");
+        let b1_idx = b_tabs - 2;
+        assert_eq!(
+            engine.editor_groups[&group_b].active_tab,
+            b_tabs - 1,
+            "the last file opened is group B's active tab"
+        );
+        engine.active_group = group_a;
+
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+        let b1 = h
+            .driver
+            .find_bounds("zgroupb1.txt ")
+            .expect("group B's inactive tab label must be painted");
+        h.driver
+            .click(b1.x + b1.width / 2.0, b1.y + b1.height / 2.0);
+
+        let engine = h.engine.borrow();
+        assert_eq!(
+            engine.active_group, group_b,
+            "clicking group B's tab bar must focus group B"
+        );
+        assert_eq!(
+            engine.editor_groups[&group_b].active_tab, b1_idx,
+            "the clicked tab must become group B's active tab"
+        );
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The quadraui#594 driver helpers resolve against vimcode's editor
     /// tab bar — verify that [`crate::render::EDITOR_TAB_BAR_WIDGET_ID`] is
     /// really the id `GtkBackend::draw_tab_bar` cached the layout under, and
