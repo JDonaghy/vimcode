@@ -1451,6 +1451,24 @@ pub fn dialog_generic_layout(
     let layout = dialog.layout(viewport, measure, |_| {
         quadraui::ToolbarItemMeasure::new(0.0)
     });
+    // On a cell grid the painter puts the box on whole cells, so centring
+    // that leaves the box on a half cell is shifted to the cell it paints
+    // on, keeping hit regions on the painted rows and columns.
+    if char_width == 1.0 && line_height == 1.0 {
+        let dx = layout.bounds.x.round() - layout.bounds.x;
+        let dy = layout.bounds.y.round() - layout.bounds.y;
+        if dx != 0.0 || dy != 0.0 {
+            let shifted = quadraui::Rect::new(
+                viewport.x + dx,
+                viewport.y + dy,
+                viewport.width,
+                viewport.height,
+            );
+            let layout =
+                dialog.layout(shifted, measure, |_| quadraui::ToolbarItemMeasure::new(0.0));
+            return (dialog, layout);
+        }
+    }
     (dialog, layout)
 }
 
