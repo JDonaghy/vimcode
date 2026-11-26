@@ -2513,3 +2513,147 @@ steps:
     id: 'dismiss-inline-edit-inline-edit-focus'
     key: esc
 
+  # vimcode#2191 — the command palette and Quick Open (`Ctrl+P`, "Find
+  # Files") are the app's two most-used keyboard entry points, and until
+  # now this file never opened either one under a real pty: both only had
+  # driver-level coverage, and the driver test for the palette
+  # (`command_palette_open_intercepts_keys_via_shell_app`) opens it via a
+  # synthetic `UiEvent::Accelerator` dispatch, not even a real keystroke.
+  # Per #1970, a `ConformanceDriver` test cannot see a bug that lives in
+  # the real terminal-input-parsing path.
+  #
+  # Command palette: `F1` opens it (`src/core/engine/keys.rs`'s hardcoded
+  # `"F1"` arm — used here instead of the configurable `<C-S-p>` default
+  # binding, since a plain terminal without the kitty keyboard protocol
+  # cannot distinguish `Ctrl+Shift+P` from `Ctrl+P` and `F1` has no such
+  # ambiguity). Filtering for "sidebar" and confirming must run "View:
+  # Toggle Sidebar" (`src/core/engine/mod.rs`'s palette item list) and
+  # actually show the Explorer sidebar — a real, observable effect, not
+  # just "the overlay painted and then closed."
+  - type: key
+    id: 'open-command-palette-2191'
+    key: 'f1'
+  - type: expect_within
+    id: 'command-palette-opens-2191'
+    text: 'Command Palette'
+    ms: 2000
+  - type: type_text
+    id: 'command-palette-filter-2191'
+    text: 'sidebar'
+  - type: expect_within
+    id: 'command-palette-matches-toggle-sidebar-2191'
+    text: 'Toggle Sidebar'
+    ms: 1500
+  - type: key
+    id: 'command-palette-confirm-2191'
+    key: enter
+  - type: expect_within
+    id: 'command-palette-command-ran-2191'
+    text: 'EXPLORER'
+    ms: 2000
+  - type: wait_idle
+    id: 'settle-after-palette-command-2191'
+    ms: 500
+    timeout_ms: 4000
+
+  # Quick Open: create a brand-new file with a unique marker (rather than
+  # reusing the launch file, whose exact buffer content by this point in
+  # an additive-only, thousands-of-steps-long file is opaque), switch away
+  # from it, then use Quick Open to jump back to it by a filtered
+  # filename and confirm its real content is what gets painted -- the
+  # issue's own bar ("assert the file's content is now painted", not just
+  # that the overlay closed).
+  #
+  # `picker_populate_files` (src/core/engine/picker.rs) walks the cwd
+  # synchronously, inline in the Ctrl+P keypress itself -- there is no
+  # background scan to out-wait, so the file genuinely has to exist on
+  # disk by the time Ctrl+P runs. Found by hand, several `coord app-drive
+  # run-spec` trials in: a flat `wait_idle`/sleep anywhere in this
+  # sequence does not reliably buy that, because it was this section's own
+  # `:tabnew`/`i`/`:w` key sequence that was flaking under a real pty with
+  # no settle between steps -- the probe file sometimes never made it to
+  # disk at all (confirmed by inspecting the launch dir after a failing
+  # run), the same "events sent faster than the real terminal-input path
+  # can keep up" shape as `settle-after-cancel-delete-2190`'s double-click
+  # misread, just with the file-creation steps as the casualty this time
+  # instead of a click. The fix is the same kind: poll an observable
+  # per-step signal before advancing, not a fixed delay -- the tab bar's
+  # own dirty-dot glyph (`●` while unsaved, replaced by `×` once `:w`
+  # actually lands, confirmed live) is the signal for the save; the tab
+  # bar showing the new filename is the signal `:tabnew` actually opened
+  # it before `i` enters insert mode.
+  - type: type_text
+    id: 'create-quickopen-probe-open-2191'
+    text: ':tabnew quickopen_probe_2191.txt'
+  - type: key
+    id: 'create-quickopen-probe-enter-2191'
+    key: enter
+  - type: expect_within
+    id: 'quickopen-probe-tab-opened-2191'
+    text: 'quickopen_probe_2191.txt'
+    ms: 3000
+  - type: key
+    id: 'create-quickopen-probe-insert-2191'
+    key: 'i'
+  - type: expect_within
+    id: 'quickopen-probe-insert-mode-2191'
+    text: 'INSERT'
+    ms: 2000
+  - type: type_text
+    id: 'create-quickopen-probe-marker-2191'
+    text: 'ZQXW_QUICKOPEN_MARKER_2191'
+  - type: expect_within
+    id: 'quickopen-probe-marker-typed-2191'
+    text: 'ZQXW_QUICKOPEN_MARKER_2191'
+    ms: 2000
+  - type: key
+    id: 'create-quickopen-probe-esc-2191'
+    key: esc
+  - type: expect_within
+    id: 'quickopen-probe-back-to-normal-2191'
+    text: 'quickopen_probe_2191.txt ●'
+    ms: 2000
+  - type: type_text
+    id: 'create-quickopen-probe-save-2191'
+    text: ':w'
+  - type: key
+    id: 'create-quickopen-probe-save-enter-2191'
+    key: enter
+  - type: expect_within
+    id: 'quickopen-probe-saved-clean-2191'
+    text: 'quickopen_probe_2191.txt ×'
+    ms: 3000
+
+  - type: type_text
+    id: 'switch-away-before-quickopen-2191'
+    text: ':e sample.txt'
+  - type: key
+    id: 'switch-away-enter-2191'
+    key: enter
+  - type: expect_within
+    id: 'switched-away-from-probe-2191'
+    text: 'line one'
+    ms: 2000
+
+  - type: key
+    id: 'open-quick-open-2191'
+    key: 'ctrl+p'
+  - type: expect_within
+    id: 'quick-open-opens-2191'
+    text: 'Find Files'
+    ms: 2000
+  - type: type_text
+    id: 'quick-open-filter-2191'
+    text: 'quickopen_probe_2191'
+  - type: expect_within
+    id: 'quick-open-matches-probe-file-2191'
+    text: 'quickopen_probe_2191.txt'
+    ms: 1500
+  - type: key
+    id: 'quick-open-confirm-2191'
+    key: enter
+  - type: expect_within
+    id: 'quick-open-jumps-to-probe-content-2191'
+    text: 'ZQXW_QUICKOPEN_MARKER_2191'
+    ms: 2000
+
