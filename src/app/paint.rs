@@ -576,6 +576,8 @@ impl App {
     /// forwards to `draw_tab_bar_icons` with `&[]` — so this is a pure
     /// superset of the old call.
     #[allow(clippy::too_many_arguments)]
+    // TODO(#2177): drop once `tree_layout` moves onto the widget contract.
+    #[allow(deprecated)]
     pub(crate) fn paint_sidebar_panel_rung(
         &self,
         backend: &mut dyn quadraui::Backend,
@@ -1448,6 +1450,8 @@ impl App {
     /// used); `metrics` is `(line_height, char_width)` and `tab_metrics` is
     /// `(tab_row_h, tab_bar_h)`, both in pixels.
     #[allow(clippy::too_many_arguments)]
+    // TODO(#2173): drop once `hit_map` moves onto the widget contract.
+    #[allow(deprecated)]
     pub(crate) fn compose_editor_band_rungs(
         &self,
         backend: &mut dyn quadraui::Backend,

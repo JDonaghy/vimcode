@@ -9,6 +9,8 @@
 //!
 //! Tab-bar hit-testing uses `quadraui::TabBarLayout::hit_test` — see
 //! [`GroupTabBarLayoutMap`].
+// TODO(#2173): drop once click routing moves from `FrameHitMap` onto `FrameTree`.
+#![allow(deprecated)]
 
 use crate::core::engine::EngineAction;
 use crate::core::window::GroupId;

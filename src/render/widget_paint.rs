@@ -56,10 +56,10 @@ pub(crate) fn readdress_interaction(
     let map = |id: Option<&WidgetId>| {
         let id = id?;
         if id == owner {
-            return Some((owner.clone(), None));
+            return Some((*owner, None));
         }
         let idx = index_of(id)?;
-        Some((owner.clone(), Some(SubTarget(idx as u64))))
+        Some((*owner, Some(SubTarget(idx as u64))))
     };
     pressed_paints_hovered(map(legacy.hovered()), map(legacy.pressed()))
 }
@@ -75,7 +75,7 @@ fn pressed_paints_hovered(
     hovered: Option<quadraui::focus::FocusAddress>,
     pressed: Option<quadraui::focus::FocusAddress>,
 ) -> InteractionState {
-    let hovered = hovered.or(pressed.clone());
+    let hovered = hovered.or(pressed);
     InteractionState::from_targets(hovered, pressed)
 }
 
@@ -124,7 +124,7 @@ pub(crate) fn draw_tab_bar(
     let state = InteractionState::from_targets(
         hovered_close.map(|i| {
             (
-                bar.id.clone(),
+                bar.id,
                 Some(quadraui::primitives::tab_bar::TabBarSubPart::TabClose(i).sub_target()),
             )
         }),
@@ -200,7 +200,7 @@ fn toolbar_interaction(
     let map = |id: Option<&WidgetId>| {
         let idx = toolbar_item_index(layout, id?)?;
         Some((
-            owner.clone(),
+            *owner,
             Some(quadraui::primitives::toolbar::ToolbarSubPart::Button(idx).sub_target()),
         ))
     };

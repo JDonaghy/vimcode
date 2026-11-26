@@ -661,6 +661,8 @@ pub fn quickfix_scroll_top(qf: &QuickfixPanel, visible_rows: usize) -> usize {
 /// The [`BottomOp::Quickfix`] rung's whole body on both backends.
 ///
 /// One `quickfix_to_list_view` adapter call and one `Backend::draw_list`.
+// TODO(#2174): drop once `draw_list` moves onto the widget contract.
+#[allow(deprecated)]
 pub fn paint_quickfix_rung(
     b: &mut dyn quadraui::Backend,
     qf: &QuickfixPanel,

@@ -139,6 +139,8 @@ impl quadraui::ShellApp for App {
         self.sync_per_frame_backend_state(backend, &engine, &theme);
     }
 
+    // TODO(#2174): drop once `draw_list` moves onto the widget contract.
+    #[allow(deprecated)]
     fn render_content(
         &self,
         backend: &mut dyn quadraui::Backend,

@@ -407,6 +407,8 @@ pub fn find_chrome(query: &str, placeholder: &str, theme: &Theme) -> SidebarPane
 pub struct ExtPanelTreeBody(pub quadraui::TreeView);
 
 impl quadraui::BackendWidget for ExtPanelTreeBody {
+    // TODO(#2177): drop once `draw_tree` moves onto the widget contract.
+    #[allow(deprecated)]
     fn render(&self, backend: &mut dyn quadraui::Backend, rect: quadraui::Rect) {
         backend.draw_tree(rect, &self.0);
     }

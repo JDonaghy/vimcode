@@ -25,6 +25,8 @@ use super::*;
 /// Folder button is painted below it; a second, muted line explains there's
 /// nothing to pick from yet (no list, and any stale cached list layout is
 /// cleared so a leftover rect from a previous frame can't be hit).
+// TODO(#2174): drop once `draw_list/list_layout` moves onto the widget contract.
+#[allow(deprecated)]
 pub(crate) fn paint_welcome_panel(
     engine: &Engine,
     theme: &Theme,

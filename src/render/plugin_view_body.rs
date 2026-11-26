@@ -74,6 +74,8 @@ fn plugin_view_to_list(
 /// Paint a `ViewBody::List`-kind view into `rect` and cache the resolved
 /// `Backend::list_layout` for [`route_plugin_view_list_click`]. Returns
 /// `false` when `name` isn't a `List`-kind view.
+// TODO(#2174): drop once `draw_list/list_layout` moves onto the widget contract.
+#[allow(deprecated)]
 pub(crate) fn paint_plugin_view_list(
     engine: &Engine,
     name: &str,
@@ -734,6 +736,8 @@ fn plugin_view_to_table(
 /// Paint a `ViewBody::Table`-kind view into `rect` and cache the resolved
 /// `Backend::data_table_layout` for [`route_plugin_view_table_click`].
 /// Returns `false` when `name` isn't a `Table`-kind view.
+// TODO(#2179): drop once `draw_data_table` moves onto the widget contract.
+#[allow(deprecated)]
 pub(crate) fn paint_plugin_view_table(
     engine: &Engine,
     name: &str,

@@ -276,6 +276,8 @@ pub(crate) struct App {
     /// `render::screen_zone_hit_test`'s manual rect-walk for
     /// breadcrumb/divider zones (which have no `FrameZone` equivalent) and
     /// for the brief window before the first paint populates this cache.
+    // TODO(#2173): drop once `FrameHitMap` moves onto the widget contract.
+    #[allow(deprecated)]
     pub(crate) cached_frame_hit_map: Rc<RefCell<Option<quadraui::FrameHitMap>>>,
     /// Parallel table for resolving `FrameZone::TabBar { idx }`, keyed by the
     /// global surface index. `ScreenLayout::zone_for`'s `idx` enumerates ALL
