@@ -1644,17 +1644,11 @@ impl App {
                 .and_then(|w| w.is_maximized().ok())
                 .unwrap_or(false);
             let controls_bar = render::window_controls_status_bar(theme, maximized);
-            let interaction = self.title_bar_interaction.borrow();
-            let hits = crate::render::draw_status_bar(
-                backend,
-                controls_rect,
-                &controls_bar,
-                &quadraui::InteractionState::from_parts(
-                    interaction.hovered_id().cloned(),
-                    interaction.pressed_id().cloned(),
-                ),
-            );
-            interaction.set_layout(hits);
+            // Hover and press paint from the runner's ambient pointer state;
+            // `title_bar_interaction` keeps only the click-on-release logic.
+            let hits =
+                crate::render::draw_status_bar_ambient(backend, controls_rect, &controls_bar);
+            self.title_bar_interaction.borrow().set_layout(hits);
         }
     }
 }

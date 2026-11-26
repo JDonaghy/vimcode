@@ -670,8 +670,9 @@ mod tests {
 
         let engine = engine_with_dap(true, Some(1u64));
         let bar = debug_toolbar(&engine);
-        let area = ratatui::layout::Rect::new(0, 0, 80, 1);
-        let layout = quadraui::primitives::toolbar::cell_layout::tui_toolbar_layout(&bar, area);
+        let area = quadraui::Rect::new(0.0, 0.0, 80.0, 1.0);
+        let cells = quadraui::LayoutCtx::new(1.0, 1.0, false);
+        let layout = quadraui::Primitive::layout(&bar, &cells, area).layout;
 
         // Hit-test each visible_item that is clickable and assert that it
         // resolves back to its expected DEBUG_BUTTON_IDS entry.
@@ -704,8 +705,9 @@ mod tests {
         // No session → all buttons disabled.
         let engine = engine_with_dap(false, None);
         let bar = debug_toolbar(&engine);
-        let area = ratatui::layout::Rect::new(0, 0, 80, 1);
-        let layout = quadraui::primitives::toolbar::cell_layout::tui_toolbar_layout(&bar, area);
+        let area = quadraui::Rect::new(0.0, 0.0, 80.0, 1.0);
+        let cells = quadraui::LayoutCtx::new(1.0, 1.0, false);
+        let layout = quadraui::Primitive::layout(&bar, &cells, area).layout;
 
         // Every visible_item must be not clickable and hit_test must return Empty.
         for item in &layout.visible_items {

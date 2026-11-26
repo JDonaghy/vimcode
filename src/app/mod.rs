@@ -433,11 +433,11 @@ pub(crate) struct App {
     /// harness can clone a handle and assert the Command Center
     /// never overlaps it.
     pub(crate) title_bar_rect: Rc<Cell<quadraui::Rect>>,
-    /// Hover/press/click tracker for the window-control buttons, shared with
-    /// quadraui's own `full_chrome_demo` reference title bar
-    /// — replaces a hand-rolled `StatusBarLayout::hit_test` call with the
-    /// same primitive so the buttons get real hover/press highlighting and
-    /// click-on-release semantics instead of firing on press.
+    /// Click tracker for the window-control buttons, shared with quadraui's
+    /// own `full_chrome_demo` reference title bar, so a button fires on
+    /// release over the segment it was pressed on rather than on press. The
+    /// buttons' hover/press highlight paints from the runner's ambient
+    /// pointer state, not from this tracker.
     pub(crate) title_bar_interaction: RefCell<quadraui::StatusBarInteraction>,
     /// The last inline window-control action dispatched (`render::
     /// WINDOW_MINIMIZE_ACTION` / `_MAXIMIZE_ACTION` / `_CLOSE_ACTION`), or

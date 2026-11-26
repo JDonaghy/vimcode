@@ -104,6 +104,16 @@ pub(crate) fn draw_status_bar(
     draw_widget(backend, rect, bar, &state).layout
 }
 
+/// Paint a status bar whose hover and press come from the runner's ambient
+/// pointer state, and return its bar-local layout.
+pub(crate) fn draw_status_bar_ambient(
+    backend: &mut dyn Backend,
+    rect: Rect,
+    bar: &quadraui::StatusBar,
+) -> quadraui::StatusBarLayout {
+    draw_widget(backend, rect, bar, &()).layout
+}
+
 /// A status bar's bar-local layout for `rect`, without painting.
 pub(crate) fn status_bar_layout(
     backend: &dyn Backend,
@@ -284,4 +294,33 @@ pub(crate) fn pointer_position(event: &quadraui::UiEvent) -> Option<quadraui::Po
         | UiEvent::Scroll { position, .. } => Some(*position),
         _ => None,
     }
+}
+
+/// Paint `widget` through the TUI backend's widget contract into a fresh
+/// `width` x `height` cell buffer, with nothing hovered or pressed.
+#[cfg(test)]
+pub(crate) fn paint_widget_cells<W>(
+    widget: &W,
+    theme: &quadraui::Theme,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer
+where
+    W: Interactive + 'static,
+    W::Layout: 'static,
+{
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+        .expect("a TestBackend terminal always builds");
+    let mut tui = quadraui::tui::TuiBackend::new();
+    tui.set_current_theme(theme.clone());
+    terminal
+        .draw(|frame| {
+            tui.enter_frame_scope(frame, |b| {
+                let backend: &mut dyn Backend = b;
+                let rect = Rect::new(0.0, 0.0, f32::from(width), f32::from(height));
+                let _ = draw_widget_plain(backend, rect, widget);
+            });
+        })
+        .expect("drawing into a TestBackend never fails");
+    terminal.backend().buffer().clone()
 }
