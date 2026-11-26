@@ -65,17 +65,18 @@ pub(crate) fn readdress_interaction(
 }
 
 /// An interaction state for a hovered/pressed address pair. The widget
-/// painters tint a press only while the pointer is still on the pressed
-/// address, but vimcode also marks a keyboard-activated button as pressed
-/// with no pointer anywhere near it; such a press is reported as hovered
-/// too so it still paints.
+/// painters tint a press only while the pointer is on the pressed address,
+/// but vimcode also marks a keyboard-focused or keyboard-activated button
+/// as pressed wherever the pointer is. A press therefore takes the hovered
+/// slot too, so it paints even while the mouse rests on another button of
+/// the same widget; that other button shows no hover tint meanwhile.
 // TODO(#2176): drop once quadraui's paint env carries a press that is not
 // tied to the pointer (keyboard activation).
 fn pressed_paints_hovered(
     hovered: Option<quadraui::focus::FocusAddress>,
     pressed: Option<quadraui::focus::FocusAddress>,
 ) -> InteractionState {
-    let hovered = hovered.or(pressed);
+    let hovered = pressed.or(hovered);
     InteractionState::from_targets(hovered, pressed)
 }
 
@@ -247,11 +248,7 @@ impl quadraui::Primitive for HostSizedDialog {
         self.dialog.paint_bleed(style)
     }
 
-    fn paint_zone(
-        &self,
-        layout: &Self::Layout,
-        units: quadraui::primitive::Units,
-    ) -> Option<Rect> {
+    fn paint_zone(&self, layout: &Self::Layout, units: quadraui::primitive::Units) -> Option<Rect> {
         self.dialog.paint_zone(layout, units)
     }
 
