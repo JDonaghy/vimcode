@@ -3052,7 +3052,7 @@ mod tests {
         /// shape [`sc_panel_help_dialog_renders_keybindings_table`] (just
         /// above) pins for the Source Control panel's own help dialog.
         /// The popup uses `render::ext_panel_help_tooltip_layout` +
-        /// `Backend::draw_tooltip_with_chrome` with quadraui's
+        /// a `Tooltip` widget painted with `draw_dyn`, using quadraui's
         /// `TooltipChrome` (`TooltipBorder::Full` + a title) — see
         /// that function's doc for why this is the real fix. Drives the
         /// real `?` keypress through a registered `git-insights` ext panel
@@ -17743,7 +17743,7 @@ mod tests {
         ///
         /// Asserted on painted text, not `engine.toasts`: the title and body
         /// the plugin passed have to reach `render::build_toast_stack` ->
-        /// `Backend::draw_toast_overlay` for them to show up in
+        /// the `ToastOverlay` widget's `draw_dyn` paint for them to show up in
         /// `driver.screen()`. The returned id is routed back through
         /// `vimcode.message` so the screen also proves the Lua call handed
         /// the plugin a usable handle rather than nil.

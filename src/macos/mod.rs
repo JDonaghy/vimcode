@@ -469,7 +469,7 @@ mod mac_driver_tests {
         // points in from the run's own left edge lands on that leading
         // space: still inside the header's own background, not the glyph,
         // and not spilling left into the activity-bar rail's own column
-        // (a separate, narrower `draw_activity_bar` paint immediately
+        // (a separate, narrower `ActivityBar` paint immediately
         // adjacent — sampling *outside* this run's bounds landed there
         // instead, sampling neither colour).
         let probe_x = (bounds.x + 2.0) as u32;
@@ -2130,7 +2130,7 @@ mod mac_driver_tests {
     /// click position from the registered zone (ground truth for both
     /// paint and hit-test) rather than `find("*")`: that helper reports
     /// the glyph's *bar-relative* paint position for anything painted
-    /// inside `MacBackend::draw_activity_bar`'s own `CGContextTranslateCTM`
+    /// inside the `ActivityBar` widget paint's own `CGContextTranslateCTM`
     /// save/restore block, not its absolute window position -- a
     /// `MacDriver` text-run-recording quirk unrelated to this issue (the
     /// real pixels paint at the right place; only the recorded text-run

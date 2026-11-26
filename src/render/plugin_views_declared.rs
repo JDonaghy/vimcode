@@ -1314,7 +1314,7 @@ pub fn paint_plugin_view_modal(
 // floats may be open at once, so every function below is driven by a
 // `name`, not a single `Engine` field.
 
-/// The `quadraui::ModalStack`/`Backend::draw_float` id for the float named
+/// The `quadraui::ModalStack`/`Float` widget id for the float named
 /// `name` — distinct per view name (unlike the dock/modal's one shared id)
 /// so two simultaneously-open floats get independently poppable stack
 /// entries. [`plugin_view_float_name_from_widget_id`] is the inverse.
@@ -1454,7 +1454,7 @@ fn populate_plugin_view_float_form_controller(engine: &Engine, name: &str) -> bo
 
 /// Paint `name`'s own content into `content_bounds` —
 /// [`quadraui::FloatLayout::content_bounds`], after the caller has already
-/// painted the float's chrome via `Backend::draw_float`. Only the
+/// painted the float's chrome via the `Float` widget. Only the
 /// field-stack `Form` default and the `TextView` body kind paint anything;
 /// every other body kind has no float-hosted layout cache yet, the same
 /// "accepted, not yet wired" precedent `paint_plugin_view_modal` follows

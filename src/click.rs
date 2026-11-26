@@ -86,7 +86,8 @@ pub(crate) fn tab_bar_available_cols(
 /// functions in render.rs so both backends use one source of truth.
 ///
 /// Tab bar inner hit-testing (which specific tab/button) stays here because
-/// it uses the pixel slot positions from `draw_tab_bar`.
+/// it uses the pixel slot positions in the `TabBarLayout` that
+/// `render::paint_tab_bars` gets back from `draw_dyn`.
 ///
 /// The text-area column is resolved via `backend.editor_col_at_x` (quadraui)
 /// — the same Pango layout + attributes `draw_editor` painted with — so
@@ -108,7 +109,7 @@ pub(crate) fn pixel_to_click_target(
     char_width: f64,
     cached_layout: &render::ScreenLayout,
     // Pixel-accurate per-group tab-bar layout captured from the rasteriser
-    // during `render_content` (via `Backend::draw_tab_bar_icons_layout`).
+    // during `render_content` (the `TabBarLayout` `draw_dyn` returns from `render::paint_tab_bars`).
     // GTK draws tabs with proportional-font Pango widths, so the char-cell
     // `hit_regions` on `cached_layout` do NOT match the drawn geometry — clicks
     // must resolve against this actual painted geometry instead.
@@ -369,7 +370,7 @@ impl EditorBandHits {
 /// pixels for GTK, char cells for TUI. For GTK we resolve against the
 /// pixel-accurate `TabBarLayout` the rasteriser painted this frame
 /// (`group_tab_bar_layouts`, captured in `render_content` via
-/// `Backend::draw_tab_bar_icons_layout`). GTK tabs are laid out with
+/// `render::paint_tab_bars`, from the `TabBarLayout` `draw_dyn` returns). GTK tabs are laid out with
 /// proportional-font Pango widths + fixed pixel padding, so the char-cell
 /// `hit_regions` (correct for TUI) badly mis-measure them. Falls back to
 /// the char-cell path only if no pixel geometry was cached (e.g. a click

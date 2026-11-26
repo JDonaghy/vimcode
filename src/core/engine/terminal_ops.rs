@@ -24,7 +24,7 @@
 //!   (`selected_text()`/`build_rows()`) are done in quadraui's
 //!   `terminal_engine`, using **display-row** coordinates that already
 //!   account for scrollback (`scroll_offset`) — both backends reach them
-//!   only through `Backend::draw_terminal`, so there is zero paint code
+//!   only through the `Terminal` widget's `draw_dyn` paint, so there is zero paint code
 //!   here or in `src/gtk/` / `src/tui_main/` for this.
 //!
 //! The generic `TextRegion` mechanism models a *fixed-bounds, currently

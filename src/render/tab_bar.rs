@@ -267,7 +267,7 @@ pub struct BreadcrumbBar {
     pub bounds: WindowRect,
     /// Pre-built quadraui `StatusBar` primitive — backends draw this directly.
     pub bar: quadraui::StatusBar,
-    /// Cached layout from `Backend::draw_status_bar` — set at draw time,
+    /// Cached layout from `render::draw_status_bar` — set at draw time,
     /// read by `resolve_breadcrumb_click` at click time.
     pub draw_layout: std::cell::RefCell<Option<quadraui::StatusBarLayout>>,
 }
@@ -402,8 +402,8 @@ pub fn resolve_breadcrumb_click(
     BreadcrumbClickResult::Miss
 }
 
-/// One breadcrumb bar ready to be painted via `Surface::StatusBar` (GTK) or
-/// `Backend::draw_status_bar` (TUI).
+/// One breadcrumb bar ready to be painted via `render::draw_status_bar` on
+/// every backend.
 pub struct BreadcrumbDrawTarget<'a> {
     pub rect: quadraui::Rect,
     pub bar: &'a quadraui::StatusBar,
@@ -542,8 +542,8 @@ pub fn register_nerd_font_fallback(b: &mut dyn quadraui::Backend) {
     b.set_nerd_font_fallback(&family);
 }
 
-/// One tab bar ready to be painted through the widget contract and pushed
-/// into the frame as a `Surface::Widget`.
+/// One tab bar ready to be painted through the widget contract (`draw_dyn`)
+/// and recorded as a `FrameTree` node in `click::EditorBandHits`.
 pub struct TabBarDrawTarget<'a> {
     pub rect: quadraui::Rect,
     /// The widget itself, icons included — see [`GroupTabBar::bar`].

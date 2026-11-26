@@ -498,7 +498,7 @@ fn panel_hover_anchor_y(
 /// dwell tooltip, rendered markdown) through the shared
 /// `quadraui::RichTextPopup` primitive — the panel-hover twin of
 /// [`editor_hover_popup_paint`]. This reuses the same `RichTextPopup` /
-/// `Backend::draw_rich_text_popup` path that both backends route through, so
+/// `draw_dyn` paint path that both backends route through, so
 /// the two backends can't drift on the markdown rendering itself — only the
 /// anchor geometry (source-control section walk vs. uniform per-row offset)
 /// is backend-specific, and that's shared too via [`panel_hover_anchor_y`].
@@ -698,7 +698,7 @@ pub fn terminal_scrollbar_geometry(
     })
 }
 
-/// Pre-built terminal primitives ready for `Backend::draw_terminal`.
+/// Pre-built terminal primitives ready for the `Terminal` widget's paint.
 /// Both backends call `build_terminal_draw_data` and then just do the
 /// backend-specific drawing (clear background, enter frame scope, divider).
 pub struct TerminalDrawData {

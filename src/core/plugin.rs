@@ -5920,7 +5920,7 @@ impl PluginManager {
         //
         // Pushes a transient notification onto the same bottom-right toast
         // stack GTK dialogs and the core engine already use (`push_toast`,
-        // painted via `render::build_toast_stack` / `Backend::draw_toast_overlay`
+        // painted via `render::build_toast_stack` and the `ToastOverlay` widget
         // on both backends). `severity` is one of "info" (default), "success",
         // "warning" or "error", matching `quadraui::ToastSeverity`.
         //

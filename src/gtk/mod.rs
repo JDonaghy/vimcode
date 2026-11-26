@@ -425,8 +425,7 @@ mod chrome_paint_tests {
 
             let pango_layout = pangocairo::functions::create_layout(&cr);
             // Use a real `GtkBackend` the same way `click.rs`'s own headless
-            // paint tests do, rather than calling the deprecated
-            // `quadraui::gtk::draw_status_bar` free function directly.
+            // paint tests do.
             //
             // The bar's painted height comes from `rect.height` and `set_current_line_height`
             // is set to match, so the backend's per-frame line height agrees with
@@ -451,11 +450,8 @@ mod chrome_paint_tests {
 
     /// The painted bar must be exactly `LINE_H` tall.
     ///
-    /// The migration off the deprecated `quadraui::gtk::draw_status_bar` free
-    /// function (which took `line_height` as a positional argument) onto
-    /// `Backend::draw_status_bar_interactive` (which takes it inside the
-    /// `Rect`) moved *where* the line height is passed. This asserts the
-    /// painted result is unchanged by that move: rows `0..LINE_H` are filled
+    /// The line height reaches the paint inside the `Rect` handed to
+    /// `render::draw_status_bar`. This asserts the painted height follows it: rows `0..LINE_H` are filled
     /// and rows `LINE_H..ROW_H` are still untouched [`SENTINEL`]. A bar
     /// painted at `GtkBackend::new`'s 16px default instead of the requested
     /// 20px fails here on both halves.
@@ -495,7 +491,7 @@ mod chrome_paint_tests {
     /// measurement is the only version of this check that can fail on a
     /// single invisible button rather than needing all three to break at
     /// once. Segment x-ranges come from the `StatusBarLayout`
-    /// `Backend::draw_status_bar_interactive` returns — the same hit-region
+    /// `render::draw_status_bar` returns — the same hit-region
     /// data the real click handler resolves against
     /// (`render::window_controls_status_bar`'s doc comment) — rather than
     /// hardcoded pixel columns, so a future layout change can't silently

@@ -426,8 +426,8 @@ pub use crate::core::engine::ExplorerRow;
 /// canonical path. Directories get a folder glyph; files get the
 /// extension-based icon from `icons::file_icon`.
 /// Adapt the picker panel's `PickerPanel` render data into a generic
-/// `quadraui::Palette` for rendering through the shared primitive, used by
-/// every backend via `Backend::draw_palette`.
+/// `quadraui::Palette` for rendering through the shared primitive, painted by
+/// every backend through `draw_dyn`.
 ///
 /// Each preview line is built from `picker.preview_highlights[i]` (byte
 /// ranges relative to that line's own text) via [`styled_spans_for_line`],
@@ -541,8 +541,7 @@ pub fn picker_panel_to_palette(picker: &PickerPanel, theme: &Theme) -> quadraui:
 }
 
 /// Convert `Engine`'s settings state into a generic `quadraui::Form`
-/// for rendering through either `quadraui_tui::draw_form` (A.3b) or
-/// `quadraui_gtk::draw_form` (A.3c). Backend-agnostic; reads only
+/// painted through `draw_dyn` on every backend. Backend-agnostic; reads only
 /// engine fields.
 ///
 /// Scope: covers the scrollable field list. Callers still handle the

@@ -466,7 +466,7 @@ fn to_quadraui_theme_chrome(theme: &Theme) -> quadraui::Theme {
         // hardcoded colours (`Theme::default()`'s `bg`/`fg`, unrelated to
         // this literal's `background`/`foreground` override above) unless
         // mapped explicitly. Both backends now paint the command line
-        // through `Backend::draw_command_line_selection`, which reads
+        // through the `CommandLine` widget, which reads
         // these two fields — without this mapping, adopting that call
         // would have silently swapped every colourscheme's themed command
         // line for quadraui's defaults (a regression for TUI, which used
@@ -947,7 +947,7 @@ pub fn window_status_line_to_status_bar(
 
 /// Paint the tab-hover tooltip (the small popup shown when the mouse
 /// hovers a tab and lingers, naming the buffer under the cursor) through
-/// `Backend::draw_status_bar` — the same "single-segment `StatusBar` stands
+/// `render::draw_status_bar` — the same "single-segment `StatusBar` stands
 /// in for a plain text row" technique generalized with an explicit
 /// `unit_w`/`unit_h` scale mirroring the convention `editor_hover_popup_paint`
 /// / `hover_popup_to_quadraui_tooltip` established: `1.0`/`1.0` for

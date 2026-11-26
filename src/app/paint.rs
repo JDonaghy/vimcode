@@ -570,8 +570,9 @@ impl App {
     /// its own bounds; a single group gets one full-width bar at the editor top.
     ///
     /// Painting goes through `render::paint_tab_bars`, which paints each
-    /// `TabBar` widget (icons included) through the widget contract; the same
-    /// widgets then reach the frame as `Surface::Widget`s for zone routing.
+    /// `TabBar` widget (icons included) through the widget contract; each painted
+    /// bar is recorded as a `FrameTree` node in `click::EditorBandHits` for
+    /// click routing.
     #[allow(clippy::too_many_arguments)]
     // TODO(#2177): drop once `tree_layout` moves onto the widget contract.
     #[allow(deprecated)]
@@ -1074,7 +1075,7 @@ impl App {
                     }
 
                     // The `?`-triggered keybindings help popup, drawn over the whole panel
-                    // content area via `Tooltip` + `Backend::draw_tooltip_with_chrome` — see
+                    // content area via a `Tooltip` widget painted with `draw_dyn` — see
                     // `render::ext_panel_help_tooltip_layout`'s own doc for why this is the
                     // real implementation and not a stand-in.
                     if panel.help_open {
@@ -1547,7 +1548,7 @@ impl App {
     ///
     /// One function because all three draw into the *same* strip and their
     /// order within it is fixed by a rasteriser detail rather than by taste:
-    /// `MenuSystem::render` calls `draw_menu_bar` across the whole band, so the
+    /// `MenuSystem::render` paints the menu bar across the whole band, so the
     /// icon slot and the controls must follow it or get erased (the #552
     /// round-2/3 "buttons render blank" regression). Kept off
     /// [`render::FRAME_Z_ORDER`]'s overlay tail because TUI has neither an app icon nor
@@ -1572,7 +1573,7 @@ impl App {
             engine.menu_system.borrow().render(backend, menu_items_rect);
 
             // ── App icon, left of `File` ─────────────────────────────────
-            // `draw_menu_bar` above only filled `menu_items_rect`, so the
+            // The menu bar above only filled `menu_items_rect`, so the
             // reserved slot still shows the frame-clear colour
             // (`theme.background`) rather than the bar's own `tab_bar_bg`.
             // Painting an *item-less* `MenuBar` across the slot fills it
@@ -1604,7 +1605,7 @@ impl App {
         }
 
         // ── Inline window controls (min/max/close) — after the bar ───────────
-        // `menu_system.render()` above repaints `draw_menu_bar` across the full
+        // `menu_system.render()` above repaints the menu bar across the full
         // `menu_row_rect` band, so the controls must be painted *after* it or
         // they get erased. The controls sit in the title-bar band, to the right
         // of the menu labels; the dropdown body drops *below* the band, so painting

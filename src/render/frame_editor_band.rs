@@ -1314,7 +1314,7 @@ pub(crate) mod tests {
         );
         assert!(
             pos(FrameOp::CommandCenter) > pos(FrameOp::MenuDropdown),
-            "`MenuSystem::render` repaints `draw_menu_bar` across the whole \
+            "`MenuSystem::render` repaints the menu bar across the whole \
              band, erasing a command centre drawn first (#676 on GTK, #712 on \
              TUI)"
         );

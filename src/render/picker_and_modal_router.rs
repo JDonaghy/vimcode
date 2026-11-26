@@ -81,7 +81,7 @@ pub struct PickerSizing {
     /// viewports or result lists.
     pub max_visible_cap: usize,
     /// Smallest popup height the backend will actually paint into. Below
-    /// this, the backend's own `draw_palette` silently no-ops (it still
+    /// this, the backend's `Palette` paint silently no-ops (it still
     /// gets a rect, but nothing lands on screen), so a short result list
     /// must never shrink the popup past this floor.
     pub min_popup_h: f32,
@@ -717,7 +717,7 @@ impl PickerHitGeometry {
 
     /// The scroll offset the picker was actually *drawn* at.
     ///
-    /// `draw_palette` clamps its offset to keep `selected` on screen, so the
+    /// The `Palette` paint clamps its offset to keep `selected` on screen, so the
     /// raw `scroll_top` is not what the user is looking at. Both backends
     /// carried a verbatim copy of this eight-line clamp.
     pub fn effective_offset(&self) -> usize {

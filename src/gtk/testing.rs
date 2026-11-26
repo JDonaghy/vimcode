@@ -374,7 +374,7 @@ impl<A: AppLogic> Harness<A> {
     /// Geometry of the painted picker's result list: `(popup_x, list_w,
     /// rows_top, line_height)`. `None` before the picker has painted.
     ///
-    /// Mirrors the row layout `quadraui::gtk::draw_palette` paints with — a
+    /// Mirrors the row layout the GTK `Palette` paint uses — a
     /// title row and a query row (`show_query` is always `true` for vimcode's
     /// picker, see `render::picker_panel_to_palette`) then a 1px separator,
     /// after which each result row is exactly one line high. It is the same
@@ -404,7 +404,7 @@ impl<A: AppLogic> Harness<A> {
     /// Pixel-probe point for on-screen result row `row`: just inside the
     /// popup's left border, vertically centred in the row.
     ///
-    /// `draw_palette` fills the selected row's background across the whole
+    /// The `Palette` paint fills the selected row's background across the whole
     /// list column but starts its text at `x + 8`, so this point reads the
     /// row's *background* — selected vs not — with no glyph in the way.
     pub fn picker_row_probe(&self, row: usize) -> Option<(i32, i32)> {
@@ -2690,7 +2690,7 @@ mod tests {
     /// Clicking a breadcrumb segment must open its dropdown (the scoped
     /// picker) and a selection inside that dropdown must dispatch.
     ///
-    /// The dropdown is a `quadraui::Palette`, and `GtkBackend::draw_palette`
+    /// The dropdown is a `quadraui::Palette`, and its GTK paint
     /// contributes nothing to the painted-text map. Pixel probes below are
     /// the stronger check — they prove the *painted* row the highlight moved
     /// to is the same row the click resolved to.
@@ -9891,8 +9891,8 @@ mod panel_surfaces {
     fn bottom_terminal_panel_paints() {
         // Same `terminal_open` (so `el.terminal_h` — and therefore
         // `editor_area_h` — is identical either way); only the *active* tab
-        // and its content differ: the terminal grid (`Backend::draw_terminal`)
-        // vs. the debug-output text display (`Backend::draw_text_display`),
+        // and its content differ: the terminal grid (the `Terminal` widget)
+        // vs. the debug-output text display (the `TextDisplay` widget),
         // plus which tab is highlighted in the tab strip painted above them.
         let region = |kind: crate::render::BottomPanelKind| {
             bottom_region_pixels(1400, 900, move |e| {
@@ -11288,7 +11288,7 @@ mod command_center {
 
     /// The Edit-menu dropdown must paint in `settings.ui_font_size` — the menu
     /// bar's font — not the editor font. Before the fix,
-    /// `GtkBackend::draw_context_menu` handed the shared Pango layout to the
+    /// the GTK context-menu paint handed the shared Pango layout to the
     /// rasteriser without swapping in `ui_font` first. Varies `ui_font_size` as
     /// the positive control (glyph extents must move) and `settings.font_size`
     /// alone as a regression guard (glyph extents must NOT move, since GTK's
@@ -11692,8 +11692,8 @@ mod command_center {
     /// With no drawn menu row this frame, the title-bar band's background must
     /// reach the canvas as a plain solid fill — `Backend::draw_solid_fill`, which
     /// every backend records as a `chrome:solid-fill` zone — and never as an
-    /// item-less filler `MenuBar` handed to `Backend::draw_menu_bar`. On a
-    /// native-menu backend that call is the platform menu-bar *install* point, so
+    /// item-less filler `MenuBar` widget. On a
+    /// native-menu backend painting a `MenuBar` is the platform menu-bar *install* point, so
     /// an empty bar passed purely for its background wipes the real app menus.
     ///
     /// The two paint identical pixels (quadraui's menu-bar primitive fills its
@@ -17224,7 +17224,7 @@ mod chrome_rung {
 /// **What's covered:** click-to-reposition-cursor, drag-to-select
 /// (`engine.cmd_sel`/`cmd_dragging`), `route_cmdline_selection_key`,
 /// and the visible selection highlight painted by
-/// `Backend::draw_command_line_selection`.
+/// the `CommandLine` widget.
 #[cfg(test)]
 mod command_line_selection {
     use super::*;
@@ -17535,7 +17535,7 @@ mod command_line_selection {
         // (`FT_Load_Glyph` segfaults on concurrent Pango/Cairo teardown).
     }
 
-    /// Adopts quadraui's `Backend::draw_command_line_selection`. GTK
+    /// Paints through quadraui's `CommandLine` widget. GTK
     /// previously painted `draw_command_line` unconditionally — a user who
     /// dragged a selection over the command line got working `cmd_sel` state
     /// and Ctrl+C copy but literally zero pixel change. Asserts on the actual
@@ -17946,7 +17946,7 @@ mod editor_mouse_rungs {
     ///
     /// # Why this asserts on pixels
     ///
-    /// The palette is a `quadraui::Palette` and `GtkBackend::draw_palette`
+    /// The palette is a `quadraui::Palette` and its GTK paint
     /// records no painted text (see this module's header, and the longer
     /// note on `breadcrumb_segment_click_opens_the_dropdown_and_selection_
     /// dispatches`), so `find` / `screen_contains` cannot see its rows. The

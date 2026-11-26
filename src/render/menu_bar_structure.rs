@@ -56,7 +56,7 @@ pub struct DebugToolbarData {
 /// - Pause: `dap_session_active && dap_stopped_thread.is_none()`
 /// - Stop / Restart: `dap_session_active`
 ///
-/// Both backends call this and hand the result to `Backend::draw_toolbar`.
+/// Both backends call this and hand the result to `render::draw_toolbar`.
 pub fn debug_toolbar(engine: &Engine) -> quadraui::Toolbar {
     use crate::core::engine::DEBUG_BUTTON_IDS;
     use crate::icons;
@@ -158,7 +158,7 @@ pub fn draw_debug_toolbar(b: &mut dyn quadraui::Backend, engine: &Engine, rect: 
 /// backends paint this chrome through `SidebarPanelBody::render_with`
 /// (`tui_main::panels::render_debug_sidebar`, `App::paint_sidebar_panel_rung`'s
 /// `PANEL_DEBUG` arm) instead of slicing two rows off `area` by hand and calling
-/// `Backend::draw_status_bar` on each directly — `StatusBars` reserves one row
+/// `render::draw_status_bar` on each directly — `StatusBars` reserves one row
 /// per bar and paints each through the same rasteriser the old code called
 /// separately for each row, and surfaces its hit regions on
 /// `SidebarPanelBodyLayout::status_bar_hit_regions` in the same absolute space
@@ -432,7 +432,7 @@ pub fn resize_edge_overlaps_change_review_band(edge: quadraui::ResizeEdge) -> bo
 pub fn window_controls_status_bar(theme: &Theme, maximized: bool) -> quadraui::StatusBar {
     let bg = theme.tab_bar_bg;
     // `tab_inactive_fg` — NOT `status_fg` — pairs with `tab_bar_bg` by theme
-    // design (it's what `draw_menu_bar` already uses for the File/Edit/...
+    // design (it's what the menu bar uses for the File/Edit/...
     // labels painted immediately to the left, against this exact background).
     // `status_fg` is paired with `status_bg` (the bottom status line's own
     // background) instead.

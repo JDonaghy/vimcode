@@ -1258,7 +1258,7 @@ impl App {
     ///
     /// Every rect fed in here is a *painted* one — `status_segment_map` and
     /// `separated_status_bar_rect` are filled by `render_content` from the
-    /// same `Surface::StatusBar` rects it draws, `global_status_rect` likewise,
+    /// same status-bar rects it paints through `render::draw_status_bar`, `global_status_rect` likewise,
     /// and the breadcrumb bars carry their own draw-time layout. Never hit-test
     /// against freshly recomputed geometry.
     ///

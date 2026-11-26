@@ -784,8 +784,8 @@ mod single_group_tab_click_dispatch_tests {
     /// with `tabs` tabs: contiguous `TAB_W`-wide slots from the bar's left
     /// edge, each with a 15px close (`×`) zone inset near its right edge.
     ///
-    /// Bar-relative, exactly like a real `Backend::draw_tab_bar_icons_layout`
-    /// paint's output — which is what `pixel_to_click_target` matches
+    /// Bar-relative, exactly like the `TabBarLayout` a real `draw_dyn`
+    /// tab-bar paint returns — which is what `pixel_to_click_target` matches
     /// `ScreenZone::TabBar { local_x }` against. Synthetic rather than
     /// rasterised so the test states its own geometry instead of depending on
     /// Pango font metrics. Close regions are pushed before tab-body regions

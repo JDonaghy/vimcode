@@ -80,7 +80,7 @@ pub enum FrameOp {
     ///
     /// Measure-only on **both** backends. The band is actually *painted* from
     /// [`FrameOp::MenuDropdown`], because `MenuSystem::render` repaints
-    /// `draw_menu_bar` across the whole band and would erase anything laid down
+    /// the menu bar across the whole band and would erase anything laid down
     /// first. It is still the first rung of the sequence: every later rung's gate,
     /// and the dropdown arm itself, read the rect this one publishes.
     MenuRow,
@@ -89,7 +89,7 @@ pub enum FrameOp {
     /// extension panels. The surrounding sidebar chrome (header, activity bar,
     /// separator) is quadraui's, painted before `render_content` is entered.
     SidebarPanel,
-    /// The command-line Tab-completion bar (`Backend::draw_status_bar` with
+    /// The command-line Tab-completion bar (`render::draw_status_bar` with
     /// [`wildmenu_to_status_bar`]).
     Wildmenu,
     /// The global status line — drawn only when per-window status lines are
@@ -102,7 +102,7 @@ pub enum FrameOp {
     /// tail.
     ///
     /// `quadraui::FolderPickerController` renders through the existing
-    /// `Palette` primitive (`Backend::draw_palette`) on **both** backends.
+    /// `Palette` widget (painted with `draw_dyn`) on **both** backends.
     FolderPicker,
     /// `MenuSystem::render` — repaints the whole title-bar band, so it must
     /// come before anything else that draws into that band. On GTK this arm
@@ -111,8 +111,8 @@ pub enum FrameOp {
     /// First rung of the overlay tail, and gated identically to
     /// [`Self::MenuRow`] — the band it paints is the band that rung measured.
     MenuDropdown,
-    /// `Backend::draw_command_center`. Must follow [`Self::MenuDropdown`]:
-    /// `MenuSystem::render` repaints `draw_menu_bar` across the entire band,
+    /// The Command Center widget. Must follow [`Self::MenuDropdown`]:
+    /// `MenuSystem::render` repaints the menu bar across the entire band,
     /// including the command centre's columns, and painting the centre first
     /// left a populated-but-invisible `command_center_layout` on both backends.
     CommandCenter,
@@ -123,7 +123,7 @@ pub enum FrameOp {
     UnifiedPicker,
     /// The Ctrl+Tab MRU popup (a `ListView` widget).
     TabSwitcher,
-    /// `Backend::draw_context_menu`.
+    /// The in-window context menu (`render::draw_context_menu`).
     ContextMenu,
     /// The change-review surface — [`paint_change_review_rung`] on both backends.
     /// A full-viewport `quadraui::DiffView` for the currently-shown proposed
@@ -141,10 +141,10 @@ pub enum FrameOp {
     /// `Engine::handle_key`, clicks in `App::handle_mouse_click_msg`) rather
     /// than through [`route_modal_overlay_click`].
     PluginViewModal,
-    /// `Backend::draw_dialog` — modal, so above every rung but the toasts,
+    /// The modal dialog (`render::draw_dialog`) — modal, so above every rung but the toasts,
     /// matching [`route_modal_overlay_click`]'s own arbitration.
     Dialog,
-    /// `Backend::draw_toast_stack` — top of the sequence on both backends, and
+    /// The `ToastOverlay` widget via `draw_dyn` — top of the sequence on both backends, and
     /// the first rung [`route_modal_overlay_click`] arbitrates.
     ToastStack,
 }
@@ -722,7 +722,7 @@ pub fn reconcile_change_review_modal_stack(
         stack.push(change_review_modal_id(), viewport);
         // No quadraui rasteriser marks this surface painted — the
         // three `mark_painted` call sites upstream are wired only for
-        // `draw_palette`/`draw_menu`/`draw_dialog`, and the change-review
+        // the palette, menu and dialog widgets, and the change-review
         // surface is a `DiffView` + `StatusBar`, neither of which is
         // modal-capable there. Without this the entry shows up in
         // `ModalStack::unpainted_ids()` every frame it is open and each
@@ -979,7 +979,7 @@ pub fn measure_title_bar_bands(
         // - edge_inset` never goes negative and all three buttons come back
         // — but `controls` below is narrowed to (nearly) that painted width,
         // and it is *that* narrower rect `paint_title_bar_band` hands to
-        // `Backend::draw_status_bar_interactive` for the actual paint.
+        // `render::draw_status_bar` for the actual paint.
         // `window_controls_status_bar` has no left segments, so re-laying-out
         // at a `bar_width` that only covers the buttons makes the identical
         // subtraction go negative and silently drops the front (lowest-

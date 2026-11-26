@@ -123,7 +123,7 @@ pub(crate) fn build_source_control_data(engine: &Engine) -> Option<SourceControl
 /// the commit message is empty; Push/Pull/Sync are icon-only. Button ids
 /// come from [`crate::core::engine::SC_BUTTON_IDS`] so click dispatch can
 /// map the hit-test result back to a button index. Both backends call this
-/// and hand the result to `Backend::draw_toolbar`.
+/// and hand the result to `render::draw_toolbar`.
 pub fn sc_button_toolbar(sc: &SourceControlData) -> quadraui::Toolbar {
     use crate::core::engine::SC_BUTTON_IDS;
     use crate::icons;

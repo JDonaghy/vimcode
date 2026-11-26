@@ -529,7 +529,7 @@ impl quadraui::ShellApp for App {
                 // a real titlebar. This is layout-only (`menu_bar_layout`, no draw): the
                 // bar itself is painted from the `FrameOp::MenuDropdown` arm below.
                 // Drawing the controls or the Command Center *here* is pointless because
-                // that later `menu_system.render()` repaints `draw_menu_bar` across the
+                // that later `menu_system.render()` repaints the menu bar across the
                 // entire band and erases them. The actual measurement moved above the walk
                 // into the `presence.command_center` block, because the Command Center
                 // rung now composes even when this one does not (native-menu backends).
@@ -660,7 +660,7 @@ impl quadraui::ShellApp for App {
                 }
 
                 // ── Menu dropdown overlay ───────────────────────────────────────
-                // First rung of the band: `MenuSystem::render` repaints `draw_menu_bar`
+                // First rung of the band: `MenuSystem::render` repaints the menu bar
                 // across the whole title-bar strip, so nothing that wants to survive may
                 // be drawn into that band before it. Modal rungs paint above it — a modal
                 // dialog now covers an open dropdown on both backends, matching
@@ -682,7 +682,7 @@ impl quadraui::ShellApp for App {
 
                 // ── Command Center: nav arrows + search box ────────────────────
                 // Painted *after* `menu_system.render()` above, which repaints
-                // `draw_menu_bar` across the entire `menu_row_rect` band and would erase
+                // the menu bar across the entire `menu_row_rect` band and would erase
                 // anything drawn here first — the identical ordering hazard documented on
                 // the window controls. On a native-menu backend (macOS) `presence.
                 // menu_row` is `false`, so `FrameOp::MenuDropdown`'s arm — the one that
@@ -695,8 +695,8 @@ impl quadraui::ShellApp for App {
                 //
                 // The fill is a plain `draw_solid_fill`, same as every other background
                 // band in this file (see `paint_title_bar_band` above), never an empty
-                // filler `MenuBar` handed to `draw_menu_bar`: on a native-menu backend
-                // `draw_menu_bar` doubles as the install point for the platform's real
+                // filler `MenuBar` widget: on a native-menu backend
+                // painting a `MenuBar` doubles as the install point for the platform's real
                 // menu bar (`NSApp.mainMenu` on macOS), so an empty bar passed purely to
                 // get a background would reinstall the menu bar as empty too, wiping every
                 // app menu down to nothing. The two paint the same pixels anyway —
@@ -965,7 +965,7 @@ impl quadraui::ShellApp for App {
                 // Anchored to the full window viewport (matches TUI's
                 // `layout.window_bounds`), not just `main_content_bounds`, so it
                 // sits in the bottom-right corner of the whole app like the
-                // TUI/VSCode toasts. `Backend::draw_toast_stack` does its own
+                // TUI/VSCode toasts. The `ToastOverlay` widget does its own
                 // pango measurement internally (unlike `dialog`/`context_menu`
                 // above, whose generic layout is computed vimcode-side), so its
                 // returned layout is the only source of truth — cached for

@@ -89,7 +89,7 @@ pub fn command_line_click_char_idx(
 /// Convert a mouse selection `sel` (character-count `(anchor, head)`,
 /// either order — the unit `Engine::cmd_sel` uses throughout, INCLUSIVE at
 /// both ends) into the byte-offset `(start, end)` pair
-/// [`quadraui::Backend::draw_command_line_selection`] expects, relative to
+/// `CommandLine` widget's `selection` field expects, relative to
 /// `text`. That pair is EXCLUSIVE at `end` (same contract as
 /// `CommandLineLayout::selection_bounds`) — hence the `hi + 1` below.
 pub fn command_line_selection_bytes(text: &str, sel: (usize, usize)) -> (usize, usize) {
@@ -1013,7 +1013,7 @@ pub fn tab_row_height_px(_line_height: f64) -> f64 {
 /// Breadcrumb row height in pixels — the active [`crate::render::Skin`]'s
 /// `bars.breadcrumb_row` token. Only the row's reserved *height* comes from
 /// the skin; the breadcrumb text itself paints through
-/// `Backend::draw_status_bar` and tracks `settings.ui_font_size` until
+/// `render::draw_status_bar` and tracks `settings.ui_font_size` until
 /// quadraui adds a font override for that method.
 pub fn breadcrumb_row_height_px() -> f64 {
     active_bar_heights().breadcrumb_row as f64

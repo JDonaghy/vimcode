@@ -2679,8 +2679,8 @@ impl Engine {
     ///
     /// The engine doesn't know the actual renderer row count, so this uses
     /// a conservative heuristic. Renderers are the authoritative source of
-    /// truth: `quadraui_tui::draw_palette` and `quadraui_gtk::draw_palette`
-    /// both clamp `scroll_offset` at render time to guarantee the selected
+    /// truth: the `Palette` widget's paint on every backend
+    /// clamps `scroll_offset` at render time to guarantee the selected
     /// item is always visible regardless of the engine's estimate.
     fn picker_update_scroll(&mut self) {
         // Small enough that narrow terminals don't leave the selection
