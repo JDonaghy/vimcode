@@ -1771,8 +1771,9 @@ pub(crate) mod tests {
         // click inside each button's bounds maps back to its index.
         let sc = empty_sc_data();
         let bar = sc_button_toolbar(&sc);
-        let area = ratatui::layout::Rect::new(0, 5, 60, 1);
-        let layout = quadraui::primitives::toolbar::cell_layout::tui_toolbar_layout(&bar, area);
+        let area = quadraui::Rect::new(0.0, 5.0, 60.0, 1.0);
+        let cells = quadraui::LayoutCtx::new(1.0, 1.0, false);
+        let layout = quadraui::Primitive::layout(&bar, &cells, area).layout;
 
         // Push is button index 1 and is enabled (icon-only).
         let push = &layout.visible_items[1];
@@ -1790,8 +1791,9 @@ pub(crate) mod tests {
         // Empty message → Commit disabled → its slot hit-tests as Empty.
         let sc = empty_sc_data();
         let bar = sc_button_toolbar(&sc);
-        let area = ratatui::layout::Rect::new(0, 0, 60, 1);
-        let layout = quadraui::primitives::toolbar::cell_layout::tui_toolbar_layout(&bar, area);
+        let area = quadraui::Rect::new(0.0, 0.0, 60.0, 1.0);
+        let cells = quadraui::LayoutCtx::new(1.0, 1.0, false);
+        let layout = quadraui::Primitive::layout(&bar, &cells, area).layout;
         let commit = &layout.visible_items[0];
         assert!(!commit.clickable, "disabled Commit must not be clickable");
         assert_eq!(

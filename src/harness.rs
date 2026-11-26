@@ -1336,6 +1336,22 @@ pub const SCENARIO_REGISTRY: &[ScenarioMeta] = &[
         issue: None,
         description: "Escape closes an open menu-bar dropdown without executing any of its items",
     },
+    ScenarioMeta {
+        name: "chrome_menu_bar_keyboard_navigation_runs_an_item",
+        area: FeatureArea::Chrome,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: Some(2176),
+        description: "Arrow keys walk an open menu-bar dropdown across menus and items, and Enter runs the highlighted item",
+    },
+    ScenarioMeta {
+        name: "chrome_status_bar_segment_click_opens_go_to_line",
+        area: FeatureArea::Chrome,
+        driver_cap: DriverCap::ClickInput,
+        backends: BackendSet::ALL_MACRO,
+        issue: Some(2176),
+        description: "Clicking the status bar's cursor-position segment opens the go-to-line picker",
+    },
     // ── Settings scenarios ────────────────────────────────────────────
     ScenarioMeta {
         name: "settings_number_enables_line_numbers",
@@ -10808,6 +10824,122 @@ mod chrome_menu_dropdown_escape_closes_without_executing_mod {
             );
         },
     }
+}
+
+#[cfg(test)]
+mod chrome_menu_bar_keyboard_navigation_runs_an_item_mod {
+    use crate::harness::screen_row_has;
+    use quadraui::testing::ConformanceDriver;
+    use quadraui::NamedKey;
+
+    fn chrome_menu_keyboard_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.menu_bar_visible = true;
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: chrome_menu_bar_keyboard_navigation_runs_an_item,
+        backends: [gtk, tui, tui_prod],
+        engine: chrome_menu_keyboard_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                !driver.screen_has("Zoom In") && !driver.screen_has("Go to Line"),
+                "precondition: no menu dropdown is open"
+            );
+
+            driver.click_text("View");
+            assert!(
+                driver.screen_has("Zoom In"),
+                "clicking the 'View' label must open its dropdown; painted: {:?}",
+                driver.inventory().text_runs()
+            );
+
+            // Right/Left walk the open dropdown across the menu bar.
+            driver.press_named(NamedKey::Right);
+            assert!(
+                driver.screen_has("Go to Line") && !driver.screen_has("Zoom In"),
+                "Right must move the open dropdown from View to Go; painted: {:?}",
+                driver.inventory().text_runs()
+            );
+            driver.press_named(NamedKey::Left);
+            assert!(
+                driver.screen_has("Zoom In") && !driver.screen_has("Go to Line"),
+                "Left must move the open dropdown back from Go to View; painted: {:?}",
+                driver.inventory().text_runs()
+            );
+
+            // The dropdown opens with its first item, Toggle Sidebar,
+            // highlighted; Down walks Toggle Terminal, Zoom In, Zoom Out and
+            // Command Palette, skipping the separators between them.
+            for _ in 0..VIEW_DOWNS_TO_COMMAND_PALETTE {
+                driver.press_named(NamedKey::Down);
+            }
+            assert!(
+                !screen_row_has(driver, PALETTE_FIRST_ROW),
+                "precondition: the command palette is still closed while the \
+                 dropdown has keyboard focus"
+            );
+            driver.press_named(NamedKey::Enter);
+
+            // The palette lists every menu command as "<Menu>: <Item>", so
+            // its first row is what proves the highlighted item ran.
+            assert!(
+                screen_row_has(driver, PALETTE_FIRST_ROW),
+                "Enter on the highlighted 'Command Palette' item must open the \
+                 command palette; painted: {:?}",
+                driver.inventory().text_runs()
+            );
+        },
+    }
+
+    const VIEW_DOWNS_TO_COMMAND_PALETTE: usize = 4;
+    const PALETTE_FIRST_ROW: &str = "File: New Tab";
+}
+
+#[cfg(test)]
+mod chrome_status_bar_segment_click_opens_go_to_line_mod {
+    use crate::harness::screen_row_has;
+    use quadraui::testing::ConformanceDriver;
+
+    fn chrome_status_click_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.buffer_mut().insert(0, "zqalpha\nzqbeta\nzqgamma\n");
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: chrome_status_bar_segment_click_opens_go_to_line,
+        backends: [gtk, tui, tui_prod],
+        engine: chrome_status_click_fixture(),
+        size: (1200, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("Ln 1, Col 1"),
+                "precondition: the status bar paints the cursor-position \
+                 segment; painted: {:?}",
+                driver.inventory().text_runs()
+            );
+            assert!(
+                !screen_row_has(driver, GO_TO_LINE_HINT),
+                "precondition: the go-to-line picker starts closed"
+            );
+
+            driver.click_text("Ln 1, Col 1");
+
+            assert!(
+                screen_row_has(driver, GO_TO_LINE_HINT),
+                "clicking the status bar's 'Ln 1, Col 1' segment must open the \
+                 go-to-line picker; painted: {:?}",
+                driver.inventory().text_runs()
+            );
+        },
+    }
+
+    const GO_TO_LINE_HINT: &str = "Type a line number";
 }
 
 // ═══════════════════════════════════════════════════════════════════════

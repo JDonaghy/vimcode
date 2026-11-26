@@ -2718,7 +2718,6 @@ mod button_style_translation_tests {
     use super::*;
     use crate::core::plugin_ui::{PluginView, ViewButtonVariant, ViewField, ViewFieldKind};
     use ratatui::buffer::Buffer;
-    use ratatui::layout::Rect;
 
     fn button_field(id: &str, label: &str, kind: ViewFieldKind) -> ViewField {
         ViewField {
@@ -2794,13 +2793,7 @@ mod button_style_translation_tests {
         let theme = quadraui::Theme::default();
 
         let width = 40u16;
-        let mut buf = Buffer::empty(Rect::new(0, 0, width, 2));
-        quadraui::primitives::form::cell_paint::draw_form(
-            &mut buf,
-            Rect::new(0, 0, width, 2),
-            &form,
-            &theme,
-        );
+        let buf = crate::render::paint_widget_cells(&form, &theme, width, 2);
 
         let danger_row = row_string(&buf, 0, width);
         let danger_bracket = danger_row
@@ -2857,14 +2850,8 @@ mod button_style_translation_tests {
         assert_eq!(form.fields[0].kind, quadraui::FieldKind::Button);
 
         let width = 40u16;
-        let mut buf = Buffer::empty(Rect::new(0, 0, width, 1));
         let theme = quadraui::Theme::default();
-        quadraui::primitives::form::cell_paint::draw_form(
-            &mut buf,
-            Rect::new(0, 0, width, 1),
-            &form,
-            &theme,
-        );
+        let buf = crate::render::paint_widget_cells(&form, &theme, width, 1);
         let row = row_string(&buf, 0, width);
         assert!(
             row.contains("< Go >"),
@@ -2899,14 +2886,8 @@ mod button_style_translation_tests {
         assert_eq!(form.fields[0].kind, quadraui::FieldKind::Button);
 
         let width = 40u16;
-        let mut buf = Buffer::empty(Rect::new(0, 0, width, 1));
         let theme = quadraui::Theme::default();
-        quadraui::primitives::form::cell_paint::draw_form(
-            &mut buf,
-            Rect::new(0, 0, width, 1),
-            &form,
-            &theme,
-        );
+        let buf = crate::render::paint_widget_cells(&form, &theme, width, 1);
         let row = row_string(&buf, 0, width);
         assert!(
             row.contains("< Go >"),
@@ -2928,7 +2909,6 @@ mod layout_knob_translation_tests {
         PluginView, ViewControlWidth, ViewField, ViewFieldKind, ViewLabelAlign, ViewLabelPosition,
     };
     use ratatui::buffer::Buffer;
-    use ratatui::layout::Rect;
 
     fn cell_char(buf: &Buffer, x: u16, y: u16) -> char {
         buf[(x, y)].symbol().chars().next().unwrap_or(' ')
@@ -2955,15 +2935,7 @@ mod layout_knob_translation_tests {
 
     fn paint(view: &PluginView, width: u16, height: u16) -> Buffer {
         let form = plugin_view_to_form("myview", view, 0, 0, false, None);
-        let area = Rect::new(0, 0, width, height);
-        let mut buf = Buffer::empty(area);
-        quadraui::primitives::form::cell_paint::draw_form(
-            &mut buf,
-            area,
-            &form,
-            &quadraui::Theme::default(),
-        );
-        buf
+        crate::render::paint_widget_cells(&form, &quadraui::Theme::default(), width, height)
     }
 
     /// Distance between the opening and closing bracket of row `y`'s
@@ -3554,7 +3526,6 @@ mod layout_container_painted_tests {
     use super::*;
     use crate::core::plugin_ui::{spacer_row, PluginView, ViewButton, ViewField, ViewFieldKind};
     use ratatui::buffer::Buffer;
-    use ratatui::layout::Rect;
 
     fn cell_char(buf: &Buffer, x: u16, y: u16) -> char {
         buf[(x, y)].symbol().chars().next().unwrap_or(' ')
@@ -3595,15 +3566,7 @@ mod layout_container_painted_tests {
 
     fn paint(view: &PluginView, width: u16, height: u16) -> Buffer {
         let form = plugin_view_to_form("myview", view, 0, 0, false, None);
-        let area = Rect::new(0, 0, width, height);
-        let mut buf = Buffer::empty(area);
-        quadraui::primitives::form::cell_paint::draw_form(
-            &mut buf,
-            area,
-            &form,
-            &quadraui::Theme::default(),
-        );
-        buf
+        crate::render::paint_widget_cells(&form, &quadraui::Theme::default(), width, height)
     }
 
     /// A column's `padding` — realised as a blank spacer row before the
