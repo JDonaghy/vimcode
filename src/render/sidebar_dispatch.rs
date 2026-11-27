@@ -18,14 +18,18 @@ use super::*;
 /// Route an explorer-sidebar event through the shared `TreeController`
 /// widget and resolve the result against the engine.
 ///
-/// `metrics` is `(line_height, char_width)` in the caller's native unit —
-/// GTK re-applies the pixel metrics the tree was painted with before
-/// hit-testing (its `Backend::set_current_line_height`/`set_current_char_width`
-/// are inherent, not trait methods, so the caller must set them before this
-/// call); TUI's cell grid needs no such re-application and passes `(1.0,
-/// 1.0)`. Both values are also used to convert a `ContextMenuRequested`'s
-/// pixel/cell `position` back into the `(col, row)` `open_explorer_context_menu`
-/// wants.
+/// The tree hit-tests against `backend`'s current metrics, so a pixel
+/// backend's caller must first re-apply the metrics the tree was painted
+/// with (`Backend::set_current_line_height`/`set_current_char_width`).
+///
+/// `anchor_metrics` is the `(line_height, char_width)` the context menu is
+/// *painted* with — the editor's metrics, not the tree's; TUI's cell grid
+/// passes `(1.0, 1.0)`. It converts a `ContextMenuRequested`'s pixel/cell
+/// `position` into the `(col, row)` `open_explorer_context_menu` stores
+/// (see [`context_menu_anchor_cell`]). On a backend whose sidebar row pitch
+/// differs from the editor line height (macOS's VS Code row-pitch
+/// override), converting with the tree's own metrics instead puts the menu
+/// further below the pointer the lower the clicked row is.
 ///
 /// A `ContextMenuRequested` result is fully resolved here (opening the same
 /// `engine.open_explorer_context_menu` both backends used to call
@@ -38,7 +42,7 @@ pub fn route_explorer_tree_event(
     engine: &mut Engine,
     event: &quadraui::UiEvent,
     rect: quadraui::Rect,
-    metrics: (f64, f64),
+    anchor_metrics: (f64, f64),
     theme: &Theme,
     backend: &mut dyn quadraui::Backend,
 ) -> Option<quadraui::TreeControllerEvent> {
@@ -46,7 +50,7 @@ pub fn route_explorer_tree_event(
         return None;
     }
     populate_explorer_tree_controller(engine, theme);
-    let (lh, cw) = metrics;
+    let (lh, cw) = anchor_metrics;
     let tree_event = engine
         .explorer_tree
         .borrow_mut()
@@ -60,8 +64,7 @@ pub fn route_explorer_tree_event(
                 .get(idx)
                 .map(|row| (row.path.clone(), row.is_dir));
             if let Some((target, is_dir)) = target_info {
-                let cx = (position.x / (cw.max(1.0) as f32)) as u16;
-                let cy = (position.y / (lh.max(1.0) as f32)) as u16;
+                let (cx, cy) = context_menu_anchor_cell(*position, cw, lh);
                 engine.open_explorer_context_menu(target, is_dir, cx, cy);
             }
         }
@@ -191,9 +194,10 @@ pub fn apply_explorer_drop(engine: &mut Engine, src_row: usize, target_row: Opti
 /// hit reaches here instead of [`route_explorer_tree_event`], which only resolves
 /// `Row`/`Chevron` hits).
 ///
-/// `rect`/`metrics`/`pos` share [`route_explorer_tree_event`]'s own contract:
-/// `rect` is the tree's last painted rect, `metrics` is `(line_height,
-/// char_width)` in the caller's native unit, `pos` is in that same space.
+/// `rect`/`metrics`/`anchor_metrics`/`pos` share [`route_explorer_tree_event`]'s
+/// own contract: `rect` is the tree's last painted rect, `metrics` is the
+/// tree's `(line_height, char_width)` in the caller's native unit,
+/// `anchor_metrics` the context menu's, and `pos` is in that same space.
 /// Returns `true` if the fallback fired (opened the cwd/root context menu);
 /// `false` for a hit that either missed `rect` entirely or landed on a real
 /// row ([`route_explorer_tree_event`] already owns that case).
@@ -201,10 +205,10 @@ pub fn route_tree_empty_space_context_menu(
     engine: &mut Engine,
     rect: quadraui::Rect,
     metrics: (f64, f64),
+    anchor_metrics: (f64, f64),
     pos: quadraui::Point,
 ) -> bool {
-    let (lh, cw) = metrics;
-    if explorer_row_at(engine, rect, lh, pos.x as f64, pos.y as f64).is_some() {
+    if explorer_row_at(engine, rect, metrics.0, pos.x as f64, pos.y as f64).is_some() {
         return false;
     }
     let inside = pos.x >= rect.x
@@ -214,8 +218,7 @@ pub fn route_tree_empty_space_context_menu(
     if !inside {
         return false;
     }
-    let cx = (pos.x / (cw.max(1.0) as f32)) as u16;
-    let cy = (pos.y / (lh.max(1.0) as f32)) as u16;
+    let (cx, cy) = context_menu_anchor_cell(pos, anchor_metrics.1, anchor_metrics.0);
     let root = engine.cwd.clone();
     engine.open_explorer_context_menu(root, true, cx, cy);
     true

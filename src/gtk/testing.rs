@@ -4081,6 +4081,123 @@ mod tests {
         );
     }
 
+    /// Right-click the painted [`crate::harness::DEEP_EXPLORER_TARGET`] row
+    /// of a tree long enough to put it in the lower half of the sidebar (yet
+    /// with room for the whole menu below it, so the menu is not clamped
+    /// against the window's bottom edge regardless of its anchor),
+    /// assert the menu painted at the pointer, then left-click the painted
+    /// `item` through `GtkDriver::click`'s real pointer routing — every
+    /// coordinate read off the painted frame, none synthesised from the
+    /// menu's logical item list.
+    fn gtk_right_click_deep_row_then_click_item(
+        tag: &str,
+        item: &str,
+    ) -> (Harness<impl AppLogic>, std::path::PathBuf) {
+        let (engine, target) = crate::harness::engine_with_deep_explorer_tree(tag, 18);
+        let mut h = harness(engine, 1400, 900);
+        let (rx, ry) = h
+            .driver
+            .find(crate::harness::DEEP_EXPLORER_TARGET)
+            .expect("target row must be painted");
+        h.driver.dispatch(quadraui::UiEvent::MouseDown {
+            widget: None,
+            button: quadraui::MouseButton::Right,
+            position: Point::new(rx, ry),
+            modifiers: quadraui::Modifiers::default(),
+        });
+        h.driver.render();
+        let bounds = h
+            .context_menu_layout
+            .borrow()
+            .as_ref()
+            .map(|l| l.bounds)
+            .unwrap_or_else(|| {
+                panic!(
+                    "right-clicking a folder row must paint its context menu; \
+                     painted: {:?}",
+                    h.driver.painted_texts()
+                )
+            });
+        let lh = h.painted_line_height.get().expect("a frame was painted") as f32;
+        // The fixture leaves room below the row, so the menu's top edge sits
+        // within a row of the click; the bottom-edge term covers a menu
+        // placed above the pointer instead.
+        let gap = (bounds.y - ry)
+            .abs()
+            .min((bounds.y + bounds.height - ry).abs());
+        assert!(
+            gap <= 1.5 * lh,
+            "the context menu must paint at the right-clicked row (y={ry}), \
+             not at {bounds:?} ({gap}px away, line height {lh})"
+        );
+        let (ix, iy) = h
+            .driver
+            .find(item)
+            .unwrap_or_else(|| panic!("{item:?} must be painted"));
+        h.driver.click(ix, iy);
+        h.driver.render();
+        (h, target)
+    }
+
+    /// Clicking the painted "New File..." item of a right-click menu must
+    /// start the inline edit, and typing a name + Enter must create the file
+    /// inside the right-clicked folder.
+    #[test]
+    fn explorer_right_click_menu_mouse_click_new_file_creates_file() {
+        let (mut h, target) =
+            gtk_right_click_deep_row_then_click_item("gtk_new_file", "New File...");
+        assert!(
+            h.driver.screen_contains("New file name"),
+            "clicking 'New File...' must start the tree's inline edit; \
+             painted: {:?}",
+            h.driver.painted_texts()
+        );
+        for c in "made.txt".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.press_named(quadraui::NamedKey::Enter);
+        assert!(
+            target.join("made.txt").is_file(),
+            "typing a name and Enter must create the file in the \
+             right-clicked folder"
+        );
+    }
+
+    /// Clicking the painted "New Folder..." item must create the folder
+    /// inside the right-clicked folder.
+    #[test]
+    fn explorer_right_click_menu_mouse_click_new_folder_creates_folder() {
+        let (mut h, target) =
+            gtk_right_click_deep_row_then_click_item("gtk_new_folder", "New Folder...");
+        assert!(
+            h.driver.screen_contains("New folder name"),
+            "clicking 'New Folder...' must start the tree's inline edit; \
+             painted: {:?}",
+            h.driver.painted_texts()
+        );
+        for c in "made_dir".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.press_named(quadraui::NamedKey::Enter);
+        assert!(
+            target.join("made_dir").is_dir(),
+            "typing a name and Enter must create the folder in the \
+             right-clicked folder"
+        );
+    }
+
+    /// Clicking the painted "Delete" item must queue the native
+    /// delete-confirmation dialog.
+    #[test]
+    fn explorer_right_click_menu_mouse_click_delete_opens_confirm_dialog() {
+        let (h, target) = gtk_right_click_deep_row_then_click_item("gtk_delete", "Delete");
+        assert!(
+            h.pending_native_dialog.take().is_some(),
+            "clicking 'Delete' must queue the native delete-confirm dialog"
+        );
+        assert!(target.exists(), "nothing is deleted until confirmed");
+    }
+
     /// GTK half of the explorer context-menu "Open in Integrated
     /// Terminal" scenario — `harness::issue_1418_explorer_context_menu::
     /// context_menu_open_terminal_opens_terminal_tab` (`src/harness.rs`)

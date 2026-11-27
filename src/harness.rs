@@ -6158,6 +6158,46 @@ mod issue_406_sidebar_ctrl_w_navigates {
     }
 }
 
+/// An engine whose open Explorer lists `filler` empty folders (`dir_00`,
+/// `dir_01`, ...) followed by [`DEEP_EXPLORER_TARGET`], so the target folder
+/// is the tree's last row — as far down the sidebar as `filler` pushes it.
+/// For real-pointer context-menu tests: right-click the painted target row,
+/// then click the painted menu item. Returns the engine and the target
+/// folder's path. Nerd fonts off, same as every other fixture here.
+#[cfg(test)]
+pub(crate) fn engine_with_deep_explorer_tree(
+    tag: &str,
+    filler: usize,
+) -> (crate::core::Engine, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!(
+        "vimcode_test_deep_explorer_{tag}_{}_{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for i in 0..filler {
+        std::fs::create_dir_all(dir.join(format!("dir_{i:02}"))).unwrap();
+    }
+    let target = dir.join(DEEP_EXPLORER_TARGET);
+    std::fs::create_dir_all(&target).unwrap();
+
+    let mut engine = crate::core::Engine::new_for_test();
+    engine.settings.use_nerd_fonts = Some(false);
+    engine.explorer_expanded.insert(dir.clone());
+    engine.cwd = dir;
+    engine.explorer_rebuild_rows();
+    engine.session.explorer_visible = true;
+    engine.app_shell.show_panel(&quadraui::WidgetId::new(
+        crate::core::engine::sidebar::PANEL_EXPLORER,
+    ));
+    (engine, target)
+}
+
+/// The last-row folder [`engine_with_deep_explorer_tree`] creates.
+#[cfg(test)]
+pub(crate) const DEEP_EXPLORER_TARGET: &str = "zz_target_dir";
+
 /// `render::apply_explorer_context_action` converges what used to be two
 /// hand-rolled, drifted appliers — TUI's `handle_explorer_context_action` and
 /// GTK's `App::dispatch_explorer_ctx_action` — into one function both backends

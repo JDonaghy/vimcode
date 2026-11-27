@@ -490,20 +490,16 @@ impl App {
         };
         match route {
             render::ContextMenuRoute::Item(idx) => {
-                let mut engine = self.engine.borrow_mut();
-                if let Some(ref mut cm) = engine.context_menu {
-                    cm.selected = idx;
-                }
-                let _act = engine.context_menu_confirm();
-                let needs_tree_refresh = engine.explorer_needs_refresh;
-                if needs_tree_refresh {
-                    engine.explorer_needs_refresh = false;
-                }
-                drop(engine);
+                let (action, target) = {
+                    let mut engine = self.engine.borrow_mut();
+                    if let Some(ref mut cm) = engine.context_menu {
+                        cm.selected = idx;
+                    }
+                    let target = engine.context_menu_target_path();
+                    (engine.context_menu_confirm(), target)
+                };
                 pop_stack();
-                if needs_tree_refresh {
-                    self.refresh_file_tree();
-                }
+                self.apply_confirmed_context_menu_action(action, target);
             }
             render::ContextMenuRoute::Hover(idx) => {
                 let mut engine = self.engine.borrow_mut();

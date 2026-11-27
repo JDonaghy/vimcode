@@ -8387,6 +8387,122 @@ mod tests {
             engine
         }
 
+        /// Right-click the painted [`crate::harness::DEEP_EXPLORER_TARGET`]
+        /// row, assert the menu opened at the pointer, then left-click the
+        /// painted `item` — both presses at coordinates read off the painted
+        /// screen, through the same `UiEvent::MouseDown` path a real terminal
+        /// mouse report takes. Returns the harness for the caller's own
+        /// post-click assertions.
+        fn right_click_deep_row_then_click_item(
+            tag: &str,
+            item: &str,
+        ) -> (
+            crate::harness::ConformanceHarness<
+                quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+            >,
+            std::path::PathBuf,
+        ) {
+            let (engine, target) = crate::harness::engine_with_deep_explorer_tree(tag, 12);
+            let mut h = harness(engine);
+            let (rx, ry) = h
+                .driver
+                .find(crate::harness::DEEP_EXPLORER_TARGET)
+                .unwrap_or_else(|| {
+                    panic!("target row must be painted; screen:\n{}", h.driver.screen())
+                });
+            h.driver.right_click(rx, ry);
+            let first = h.driver.find("New File...");
+            let last = h.driver.find("Delete");
+            let (Some((_, first_y)), Some((_, last_y))) = (first, last) else {
+                panic!(
+                    "right-clicking a folder row must open its context menu; \
+                     screen:\n{}",
+                    h.driver.screen()
+                );
+            };
+            // The menu opens at the pointer, or above it when the rows below
+            // cannot hold it — either way one of its edges hugs the clicked
+            // row (one row for the trigger, one for the ASCII border).
+            assert!(
+                (first_y - ry).abs() <= 2.0 || (ry - last_y).abs() <= 2.0,
+                "the context menu must open at the right-clicked row (y={ry}), \
+                 not first item at y={first_y} / last item at y={last_y}; \
+                 screen:\n{}",
+                h.driver.screen()
+            );
+            let (ix, iy) = h
+                .driver
+                .find(item)
+                .unwrap_or_else(|| panic!("{item:?} must be painted"));
+            h.driver.click(ix, iy);
+            (h, target)
+        }
+
+        /// Clicking "New File..." in a right-click menu must start the inline
+        /// edit, and typing a name + Enter must create the file inside the
+        /// right-clicked folder — exactly what Enter on the item does.
+        #[test]
+        fn mouse_click_new_file_in_right_click_menu_creates_file() {
+            let (mut h, target) =
+                right_click_deep_row_then_click_item("tui_new_file", "New File...");
+            // The nested row's indent truncates both ends of the "New file
+            // name..." / "New folder name..." placeholders at this sidebar
+            // width, hence the partial needles here and below.
+            assert!(
+                h.driver.screen_has("file nam"),
+                "clicking 'New File...' must start the tree's inline edit; \
+                 screen:\n{}",
+                h.driver.screen()
+            );
+            for c in "made.txt".chars() {
+                h.driver.type_char(c);
+            }
+            h.driver.press_named(quadraui::NamedKey::Enter);
+            assert!(
+                target.join("made.txt").is_file(),
+                "typing a name and Enter must create the file in the \
+                 right-clicked folder; screen:\n{}",
+                h.driver.screen()
+            );
+        }
+
+        /// Clicking "New Folder..." must start the folder inline edit and
+        /// create the folder inside the right-clicked folder.
+        #[test]
+        fn mouse_click_new_folder_in_right_click_menu_creates_folder() {
+            let (mut h, target) =
+                right_click_deep_row_then_click_item("tui_new_folder", "New Folder...");
+            assert!(
+                h.driver.screen_has("ew folder"),
+                "clicking 'New Folder...' must start the tree's inline edit; \
+                 screen:\n{}",
+                h.driver.screen()
+            );
+            for c in "made_dir".chars() {
+                h.driver.type_char(c);
+            }
+            h.driver.press_named(quadraui::NamedKey::Enter);
+            assert!(
+                target.join("made_dir").is_dir(),
+                "typing a name and Enter must create the folder in the \
+                 right-clicked folder; screen:\n{}",
+                h.driver.screen()
+            );
+        }
+
+        /// Clicking "Delete" must open the delete-confirmation dialog for the
+        /// right-clicked folder.
+        #[test]
+        fn mouse_click_delete_in_right_click_menu_opens_confirm_dialog() {
+            let (h, _target) = right_click_deep_row_then_click_item("tui_delete", "Delete");
+            assert!(
+                h.driver.screen_has("Confirm Delete"),
+                "clicking 'Delete' must open the delete-confirmation dialog; \
+                 screen:\n{}",
+                h.driver.screen()
+            );
+        }
+
         /// `App::dispatch_context_menu_key` is the exact code path
         /// `crate::harness::issue_1418_explorer_context_menu`'s own doc names
         /// as shared between `gtk` and this "tui" control arm — so, unlike the
