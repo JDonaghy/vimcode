@@ -2148,8 +2148,16 @@ without that tool installed: `t.stub_command(name, path)` puts a fake executable
   invoked. It sees a Lua CLI-style `arg` table (`arg[1]`, `arg[2]`, … are the forwarded
   command-line arguments) and the ordinary Lua `io`/`os` library — `io.write`/`print`
   for stdout, `os.exit(code)` to set the exit code, `os.getenv` to read its environment.
-- **A directory** — copied verbatim onto the stub `PATH`, so a hand-written fake
-  executable travels together with any data files it reads.
+- **A directory** — its files (not subdirectories) copied onto the stub `PATH`, so a
+  hand-written fake executable travels together with any data files it reads. Exactly
+  one of those files must be literally named `name`.
+
+Process stubbing works on Unix only. `vimcode.loop.spawn` runs
+`std::process::Command::new(name)` directly, which on Windows cannot execute either
+the extensionless `#!/bin/sh` shim or the `.cmd` fallback `t.stub_command` also writes
+(`CreateProcessW` needs `cmd.exe /C` for a `.cmd`, and Rust's own `PATH` search only
+appends `.exe`) — a spec using `t.stub_command` with a `.lua` fake will fail to spawn
+it on Windows. A directory-form stub must contain a real `.exe` to work there.
 
 A relative `path` resolves against the spec file's own directory, not wherever
 `vimcode --test-extension` was invoked from, so a spec can keep its fixtures alongside

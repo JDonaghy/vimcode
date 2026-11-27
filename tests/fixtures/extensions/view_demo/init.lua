@@ -15,7 +15,7 @@ vimcode.ui.register_view("view_demo", {
             schema_version = 1,
             fields = {
                 { type = "label", id = "hdr", label = "Counter" },
-                { type = "read_only", id = "count", label = "Count", value = tostring(count) },
+                { type = "read_only", id = "count", label = "Count", value = "Count: " .. tostring(count) },
                 { type = "button", id = "inc", label = "Increment" },
             },
         }

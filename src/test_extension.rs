@@ -161,7 +161,29 @@ fn run_isolated(
     spec_path: &Path,
     spec_src: &str,
 ) -> i32 {
-    let config_dir = scratch.join(".config").join("vimcode");
+    // Set every env var `core::paths::vimcode_config_dir()` consults
+    // *before* calling it, then derive the install dir and state file
+    // from that same function rather than re-deriving the per-platform
+    // layout by hand — the same call every other site in the codebase
+    // makes (`core::engine::lsp_ops`, `core::session`). On Windows this
+    // resolves to `%APPDATA%\vimcode`, which differs from Unix's
+    // `$HOME/.config/vimcode`; deriving it from the real function keeps
+    // this harness honest about that instead of assuming the Unix shape.
+    std::env::set_var("HOME", scratch);
+    std::env::set_var("USERPROFILE", scratch);
+    std::env::set_var("APPDATA", scratch);
+
+    // Pin the terminal-capability env too, so `t.cell(...)`'s `fg`/`bg`
+    // (derived from `TuiBackend::new()`'s `detect_color_depth()` /
+    // `detect_underline_color_support()`, which read `COLORTERM`/`TERM`/
+    // `WT_SESSION`/`TERM_PROGRAM`) are reproducible regardless of whatever
+    // real terminal (or CI runner) happens to be hosting this harness.
+    std::env::set_var("TERM", "xterm-256color");
+    std::env::set_var("COLORTERM", "truecolor");
+    std::env::remove_var("WT_SESSION");
+    std::env::remove_var("TERM_PROGRAM");
+
+    let config_dir = crate::core::paths::vimcode_config_dir();
     let ext_dest = config_dir.join("extensions").join(&manifest.name);
     if let Err(e) = copy_dir_recursive(ext_dir, &ext_dest) {
         eprintln!("vimcode --test-extension: cannot install extension: {e}");
@@ -186,15 +208,6 @@ fn run_isolated(
         eprintln!("vimcode --test-extension: cannot write extension state: {e}");
         return 1;
     }
-
-    // Every platform's `vimcode_config_dir()` is reachable from one of
-    // these three — see `core::paths`. Setting all three is cheap and
-    // keeps this function honest about every platform it might run on,
-    // without any backend-specific code: this is plain `std::env`, not a
-    // `src/{gtk,macos,win,tui_main}` wiring concern.
-    std::env::set_var("HOME", scratch);
-    std::env::set_var("USERPROFILE", scratch);
-    std::env::set_var("APPDATA", scratch);
 
     let stub_bin_dir = scratch.join("stub-bin");
     if let Err(e) = std::fs::create_dir_all(&stub_bin_dir) {
@@ -280,19 +293,43 @@ fn make_executable(_path: &Path) -> std::io::Result<()> {
 
 /// Backs `t.stub_command(name, path)`. `path` is either a fixture
 /// directory (copied verbatim into `stub_bin_dir`, so a hand-written fake
-/// executable travels with any data files it reads) or a `.lua` file
-/// (wrapped in a shim that re-invokes this same binary's hidden
-/// `--run-lua-stub`).
+/// executable travels with any data files it reads — subdirectories are
+/// skipped, matching `copy_dir_recursive`'s one-level contract for this
+/// call site) or a `.lua` file (wrapped in a shim that re-invokes this
+/// same binary's hidden `--run-lua-stub`).
+///
+/// Only spawns on Unix today: `vimcode.loop.spawn` runs
+/// `std::process::Command::new(name)` directly, which on Windows cannot
+/// execute either a `.cmd`/`.bat` shim (that needs `cmd.exe /C`) or an
+/// extensionless `#!/bin/sh` file. A directory-form stub likewise must
+/// already contain a real `.exe` for `name` to resolve on Windows.
 fn stub_command(stub_bin_dir: &Path, name: &str, path: &Path) -> std::io::Result<()> {
+    if name.contains(std::path::is_separator) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("stub_command: name {name:?} must not contain a path separator"),
+        ));
+    }
+
     if path.is_dir() {
+        let mut found = false;
         for entry in std::fs::read_dir(path)? {
             let entry = entry?;
             if !entry.file_type()?.is_file() {
                 continue;
             }
+            if entry.file_name() == name {
+                found = true;
+            }
             let dest = stub_bin_dir.join(entry.file_name());
             std::fs::copy(entry.path(), &dest)?;
             make_executable(&dest)?;
+        }
+        if !found {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("stub_command: {path:?} has no file literally named {name:?}"),
+            ));
         }
         return Ok(());
     }
@@ -308,8 +345,10 @@ fn stub_command(stub_bin_dir: &Path, name: &str, path: &Path) -> std::io::Result
     std::fs::write(&dest, script)?;
     make_executable(&dest)?;
 
-    // Harmless on Unix (never looked up — no `.cmd` in `PATHEXT`), and
-    // what a Windows `PATH` search for a bare `name` actually finds.
+    // `.cmd` shims cannot actually run through `vimcode.loop.spawn` (see
+    // this function's doc comment); written anyway so a stub at least
+    // resolves on `PATH` for any spawn mechanism that does go through a
+    // real shell. Harmless on Unix — no `.cmd` in `PATHEXT` there.
     let cmd_dest = stub_bin_dir.join(format!("{name}.cmd"));
     let cmd_script = format!(
         "@echo off\r\n\"{}\" --run-lua-stub \"{}\" %*\r\n",
@@ -386,6 +425,7 @@ fn run_spec<A: quadraui::AppLogic + 'static>(
     spec_path: &Path,
     stub_bin_dir: PathBuf,
 ) -> i32 {
+    print_extension_load_diagnostics(&engine);
     let harness = Rc::new(RefCell::new(Harness { driver, engine }));
     let spec_dir = spec_path
         .parent()
@@ -429,6 +469,26 @@ fn run_spec<A: quadraui::AppLogic + 'static>(
                 spec_path.display()
             );
             1
+        }
+    }
+}
+
+/// Print whatever `Engine::plugin_init` recorded about the extension
+/// under test — a script-load error (unparsable Lua, a missing
+/// `vimcode.*` API) or a `requires_vimcode` incompatibility skip — to
+/// stderr before the spec runs. Without this, a load failure surfaces
+/// only as an unrelated assertion failing later with a screen dump that
+/// gives no hint why the extension's commands/views never registered.
+fn print_extension_load_diagnostics(engine: &Rc<RefCell<Engine>>) {
+    let eb = engine.borrow();
+    if !eb.message.is_empty() {
+        eprintln!("vimcode --test-extension: {}", eb.message);
+    }
+    if let Some(mgr) = &eb.plugin_manager {
+        for p in &mgr.plugins {
+            if let Some(err) = &p.error {
+                eprintln!("vimcode --test-extension: {} failed to load: {err}", p.name);
+            }
         }
     }
 }
@@ -478,9 +538,12 @@ fn install_assertion_api<A: quadraui::AppLogic + 'static>(
     let t = lua.create_table()?;
 
     // t.keys("ihello<Esc>") — Neovim-notation key injection straight into
-    // the engine, the same `Engine::feed_keys` the production
-    // `vimcode.feedkeys` host API uses, so a spec exercises exactly the
-    // code path a real keystroke would.
+    // the engine via `Engine::feed_keys`, the same entry point the
+    // production `vimcode.feedkeys` host API uses. This bypasses
+    // shell/sidebar-level routing (`TuiBackend::translate_injected` →
+    // `ShellApp::handle` → `App` dispatch), so it does not exercise
+    // accelerators or other shell-routed key handling a real keystroke
+    // would hit first — only `Engine`-level key handling.
     {
         let h = harness.clone();
         t.set(
