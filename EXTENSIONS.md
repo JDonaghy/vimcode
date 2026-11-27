@@ -319,7 +319,7 @@ applied after it returns. The newer namespaces (`vimcode.buffer.*`, `vimcode.win
 `vimcode.keymap.set`/`list`, `vimcode.loop.*`, `vimcode.schedule`/`defer`,
 `vimcode.picker.*`, `vimcode.decor.*`, `vimcode.syntax.*`, `vimcode.undo.*`,
 `vimcode.diagnostics.*`, `vimcode.ui.open_view`, `vimcode.ui.close_view`, `vimcode.ui.toast`, `vimcode.http.*`,
-`vimcode.fire_event`)
+`vimcode.terminal.*`, `vimcode.fire_event`)
 are **immediate**: they act on the live editor at call time.
 
 Immediate calls only work while vimcode is running one of your callbacks (a command,
@@ -716,6 +716,52 @@ local p = vimcode.loop.spawn("rg", { "--line-number", "TODO" }, {
 })
 vimcode.defer(5000, function() p:kill() end)
 ```
+
+### Integrated Terminal (`vimcode.terminal.open`)
+
+`vimcode.loop.spawn` runs a plain child process with no pty attached — fine for
+tools that just read stdin/write stdout, but not for an interactive one that
+needs a real terminal (a shell, `kubectl exec -it`, a REPL, `ssh`). `vimcode.
+terminal.open` runs a command in a real pty and shows it in the editor's own
+integrated terminal panel — the same panel the `` ` `` key opens, not a separate
+hidden surface.
+
+```lua
+local h = vimcode.terminal.open({
+    cmd = { "ssh", "myhost" },     -- required: program + argv, one table
+    cwd = vimcode.cwd(),           -- optional: working directory
+    env = { MY_VAR = "value" },    -- optional
+    title = "My SSH Session",      -- optional, for your own bookkeeping
+    placement = "panel",           -- optional: "panel" | "tab" | "split"
+    on_output = function(chunk) vimcode.message(chunk) end,
+    on_exit = function(code) vimcode.message("exited: " .. code) end,
+})
+
+h:send("echo hello\n")             -- write to its stdin, as if typed
+h:focus()                          -- show the panel and give this pane focus
+h:close()                          -- close the pane outright
+```
+
+- `cmd[1]` is the program; the rest of the table is its argv.
+- `on_output` delivers everything the pty produces once the command starts
+  (its own output, plus the terminal's local echo of anything sent via
+  `h:send(...)` while it's running) in chunks as it arrives — not
+  necessarily whole lines, same caveat as `vimcode.loop.spawn`'s
+  `on_stdout`. It excludes the shell's own prompt and startup banner from
+  before the command started.
+- `on_exit` fires once with the command's exit code. The underlying shell stays
+  open afterwards (it is not auto-closed), so `h:send(...)` still works for an
+  interactive tool that keeps the pane alive past the wrapped command's own exit
+  — e.g. opening with an empty shell command just to get a pty to drive.
+- `placement = "split"` opens the pane into split view alongside whatever else
+  is open; `"panel"` and `"tab"` are equivalent today (there is one terminal
+  panel with tabs, not separate placement surfaces).
+- `title` is stored for your own use; no backend currently paints it into the
+  terminal tab strip.
+- `open` raises an error if the pty could not be started.
+- Unloading a plugin closes every terminal it opened via `vimcode.terminal.open`.
+- This API is allowed by default today. A future manifest `services` allow-list
+  may gate it behind an explicit `terminal` entry — see #2184.
 
 ### Picker API (`vimcode.picker.*`)
 
