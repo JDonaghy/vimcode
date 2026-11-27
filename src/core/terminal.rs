@@ -45,10 +45,10 @@ pub struct ExtTerminalState {
     /// plugin_terminals` (the owning-manager liveness map).
     pub handle_id: u64,
     /// `title = "..."` from `vimcode.terminal.open`'s opts, if given.
-    /// Stored for the extension's own bookkeeping; no backend currently
-    /// paints a per-pane title into the terminal tab strip (that is
-    /// `TerminalPanel`/`build_terminal_toolbar` territory, out of this
-    /// issue's scope), so this is not yet visible anywhere in the UI.
+    /// Stored for the extension's own bookkeeping; no backend paints a
+    /// per-pane title into the terminal tab strip (that is
+    /// `TerminalPanel`/`build_terminal_toolbar` territory), so this is not
+    /// yet visible anywhere in the UI.
     pub title: Option<String>,
     /// Line injected right before the command runs — everything between
     /// this and `end_marker_prefix` in `TerminalSession::full_text()` is

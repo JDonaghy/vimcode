@@ -302,9 +302,23 @@ impl Engine {
             .terminal_panes
             .get(self.terminal_active)
             .is_some_and(|s| s.acp_auth_pending);
+        let ext_handle_id = self
+            .terminal_panes
+            .get(self.terminal_active)
+            .and_then(|s| s.ext_terminal.as_ref())
+            .map(|e| e.handle_id);
         // Exiting split mode before removing the pane keeps tab indices sane.
         self.terminal_split = false;
         self.terminal_panes.remove(self.terminal_active);
+        // The user closed this tab directly (not through `handle:close()` or
+        // the exited-session sweep above) — drop the `plugin_terminals`
+        // liveness entry here too so it can't outlive the pane it describes.
+        if let Some(handle_id) = ext_handle_id {
+            self.plugin_terminals.remove(&handle_id);
+            if let Some(pm) = self.plugin_manager.clone() {
+                pm.remove_terminal_callbacks(handle_id);
+            }
+        }
         if was_acp_auth {
             self.acp_finish_terminal_login(None);
         }
@@ -903,12 +917,28 @@ impl Engine {
                 let already_finalized = self.terminal_panes[i].install_finalized;
                 let was_acp_auth = self.terminal_panes[i].acp_auth_pending;
                 let exit_code = self.terminal_panes[i].session.exit_code();
+                let ext_handle_id = self.terminal_panes[i]
+                    .ext_terminal
+                    .as_ref()
+                    .map(|e| e.handle_id);
                 if let Some(ctx) = ctx {
                     if !already_finalized {
                         self.finalize_install_from_terminal(&ctx);
                     }
                 }
                 self.terminal_panes.remove(i);
+                // The pane is gone (the shell itself exited, e.g. the user
+                // typed `exit`), not just the wrapped command — drop its
+                // `plugin_terminals` liveness entry here too, mirroring
+                // `ext_terminal_close`, so a stale entry can never outlive
+                // the pane it describes and collide with a re-minted handle
+                // id after a `set_plugin_manager` reload.
+                if let Some(handle_id) = ext_handle_id {
+                    self.plugin_terminals.remove(&handle_id);
+                    if let Some(pm) = self.plugin_manager.clone() {
+                        pm.remove_terminal_callbacks(handle_id);
+                    }
+                }
                 // Call after `remove` so `acp_finish_terminal_login`
                 // (which may itself touch `terminal_panes` indirectly via
                 // `acp_launch_terminal_login` on a later retry) never sees
@@ -1745,28 +1775,18 @@ pub fn build_acp_terminal_wrapper(
 /// are joined onto the **same line** as the command itself with `;`,
 /// instead of each being its own `\n`-terminated line.
 ///
-/// That difference matters only because this API's own issue explicitly
-/// targets commands that read from stdin at all — "shells, `kubectl exec
-/// -it`, REPLs, `ssh`" — which `terminal/create`'s ACP commands never do.
-/// A PTY's canonical-mode line discipline queues *every* `\n`-terminated
-/// line written to the master as soon as it's written, independent of
-/// which process is currently reading: if the exit-code/end-marker lines
-/// were written as separate lines after the command's own line (as
-/// [`build_acp_terminal_wrapper`] does), they would already be sitting in
-/// the kernel's input queue by the time the wrapped command starts, and a
-/// command that itself reads stdin (unlike the fire-and-forget tools ACP
-/// wraps) would consume them as its *own* input instead of the shell ever
-/// seeing them — observed directly in this issue's own test before this
-/// fix, with a wrapped `cat` swallowing its own wrapper's trailing
-/// `__ec=$?`/`printf` lines and echoing them back as if they were typed
-/// input. Joining with `;` makes the whole thing **one line** (one
-/// newline, one shell `read()`), so the shell's own parser sequences
-/// "run the command, then capture `$?` and print the end marker" entirely
-/// from the single line it already has in hand, with nothing left queued
-/// for the command to steal — exactly how a human typing
-/// `cat; echo done<Enter>` only ever gets `cat`'s own first keystroke, not
-/// `echo done`, because the shell already consumed and parsed the whole
-/// line before `cat` could call `read()` itself.
+/// This matters because this API wraps commands that read from stdin —
+/// shells, `kubectl exec -it`, REPLs, `ssh` — unlike `terminal/create`'s
+/// fire-and-forget ACP commands. A PTY's canonical-mode line discipline
+/// queues every `\n`-terminated line written to the master as soon as
+/// it's written, regardless of which process is currently reading: if the
+/// exit-code/end-marker lines were separate lines after the command's own
+/// (as [`build_acp_terminal_wrapper`] does), a command that reads its own
+/// stdin would consume them as input instead of the shell ever seeing
+/// them. Joining with `;` keeps it all on one line, so the shell parses
+/// "run the command, then capture `$?` and print the end marker" before
+/// handing control to the command at all — the same reason a human typing
+/// `cat; echo done<Enter>` never gets `echo done` fed to `cat`.
 fn build_ext_terminal_wrapper(
     command: &str,
     args: &[String],
@@ -2172,6 +2192,11 @@ impl Engine {
             return false;
         };
         self.terminal_panes.remove(idx);
+        // The pane is gone; drop its liveness entry too so a later
+        // `set_plugin_manager` reload's eager reap doesn't try to close an
+        // already-closed pane, and so the handle id is free for the next
+        // manager to re-mint without colliding with a still-tracked one.
+        self.plugin_terminals.remove(&id);
         if self.terminal_panes.is_empty() {
             self.terminal_open = false;
             self.terminal_has_focus = false;
@@ -2206,19 +2231,20 @@ impl Engine {
             return false;
         }
         let mut redraw = false;
-        let indices: Vec<usize> = self
+        // Collect handle ids, not pane indices: an `on_output`/`on_exit`
+        // dispatch below may run Lua that calls back into the immediate API
+        // (e.g. `h:close()`), which can remove this or any other pane and
+        // shift every later index in `terminal_panes`. Every pane lookup
+        // after a dispatch therefore re-resolves by id via
+        // `ext_terminal_index`, the same convention `poll_plugin_spawns`
+        // uses for timer/spawn handles.
+        let handle_ids: Vec<u64> = self
             .terminal_panes
             .iter()
-            .enumerate()
-            .filter(|(_, slot)| slot.ext_terminal.is_some())
-            .map(|(i, _)| i)
+            .filter_map(|slot| slot.ext_terminal.as_ref().map(|e| e.handle_id))
             .collect();
-        for idx in indices {
-            let Some(handle_id) = self.terminal_panes[idx]
-                .ext_terminal
-                .as_ref()
-                .map(|e| e.handle_id)
-            else {
+        for handle_id in handle_ids {
+            let Some(idx) = self.ext_terminal_index(handle_id) else {
                 continue;
             };
             let full_text = self.terminal_panes[idx].session.full_text();
@@ -2234,8 +2260,16 @@ impl Engine {
                     &ext.begin_marker,
                     &ext.end_marker_prefix,
                 );
+                // `output` is read from a live vt100 grid snapshot, not an
+                // append-only log: an in-place redraw (`\r`, cursor-up,
+                // `clear`, an alt-screen TUI) or a panel resize can rewrite
+                // bytes before `delivered_len`, which can leave that offset
+                // mid-character rather than on a boundary. `get` (rather
+                // than `[..]`) skips delivery for this tick instead of
+                // panicking; the next tick's snapshot has shifted again and
+                // will usually land on a boundary.
                 let chunk = if output.len() > ext.delivered_len {
-                    Some(output[ext.delivered_len..].to_string())
+                    output.get(ext.delivered_len..).map(str::to_string)
                 } else {
                     None
                 };
@@ -2255,6 +2289,11 @@ impl Engine {
                     }
                 }
             }
+            // Re-resolve: the `on_output` dispatch above may have closed
+            // this pane (or any other), invalidating `idx`.
+            let Some(idx) = self.ext_terminal_index(handle_id) else {
+                continue;
+            };
             let already_delivered = self.terminal_panes[idx]
                 .ext_terminal
                 .as_ref()
@@ -2280,7 +2319,18 @@ impl Engine {
                         self.apply_plugin_ctx(ctx);
                         redraw = true;
                     }
-                    self.plugin_terminals.remove(&handle_id);
+                    // `plugin_terminals` tracks pane *liveness* for the
+                    // unload-reap sweep, not callback registration — the
+                    // pane's shell stays open after the wrapped command
+                    // exits (documented in EXTENSIONS.md: `h:send` still
+                    // works), so this entry must stay until the pane itself
+                    // is removed (`ext_terminal_close`/the exited-session
+                    // prune in `poll_terminal`/`terminal_close_active_tab`).
+                    // Removing it here would make a later `set_plugin_manager`
+                    // reload's eager reap unable to find and close this
+                    // still-open pane, and would free its handle id to be
+                    // re-minted by the next manager while the orphaned pane
+                    // is still sitting in `terminal_panes`.
                     if let Some(pm) = self.plugin_manager.clone() {
                         pm.remove_terminal_callbacks(handle_id);
                     }
@@ -2995,9 +3045,7 @@ mod tests {
     /// `\n`-terminated line (joined with `;`), not three separate lines —
     /// see [`build_ext_terminal_wrapper`]'s doc for why a stdin-reading
     /// command would otherwise consume the trailing lines as its own
-    /// input. RED-able: reusing `build_acp_terminal_wrapper`'s template
-    /// (one `\n` per step) makes this fail since the command and
-    /// `__ec=$?`/`printf` end up on separate lines.
+    /// input.
     #[test]
     fn build_ext_terminal_wrapper_posix_joins_command_and_epilogue_on_one_line() {
         let script = build_ext_terminal_wrapper(
