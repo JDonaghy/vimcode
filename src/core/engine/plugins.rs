@@ -342,6 +342,21 @@ impl Engine {
                     .store(true, std::sync::atomic::Ordering::Relaxed);
             }
         }
+        // Same staleness pattern for `vimcode.terminal.open` — a
+        // pane whose owning manager just went away is closed outright
+        // (`Self::ext_terminal_close`, the same teardown `handle:close()`
+        // uses) rather than calling into the dead Lua state, matching
+        // "closing the extension closes its terminals" from the issue.
+        let dead_terminals: Vec<u64> = self
+            .plugin_terminals
+            .iter()
+            .filter(|(_, mgr)| mgr.upgrade().is_none())
+            .map(|(id, _)| *id)
+            .collect();
+        for id in dead_terminals {
+            self.plugin_terminals.remove(&id);
+            self.ext_terminal_close(id);
+        }
     }
 
     // ── Plugin-declared UI views ───────────────────────────────────────────
@@ -3925,6 +3940,83 @@ impl Engine {
             }
         }
         redraw
+    }
+
+    // ─── `vimcode.terminal.open` ───────────────────────────────────
+
+    /// `vimcode.terminal.open{cmd, cwd, env, title, placement, on_output,
+    /// on_exit}`: run `cmd` in a new, visible integrated-terminal pane and
+    /// wire its captured output/exit status to the given (optional)
+    /// callbacks. Returns the handle id, or `Err` if the terminal could not
+    /// be started (the Lua binding surfaces that as a runtime error,
+    /// matching `plugin_api_spawn`'s convention) or there is no live
+    /// plugin manager.
+    ///
+    /// Registers the callbacks (and the `plugin_terminals` liveness entry)
+    /// *before* spawning the pane, deregistering again on failure — same
+    /// "register first" ordering `plugin_api_http_request` uses, so a
+    /// failed open never leaks a callback registry slot.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn plugin_api_terminal_open(
+        &mut self,
+        cmd: String,
+        args: Vec<String>,
+        cwd: Option<PathBuf>,
+        env: Vec<(String, String)>,
+        title: Option<String>,
+        placement: String,
+        on_output: Option<mlua::RegistryKey>,
+        on_exit: Option<mlua::RegistryKey>,
+    ) -> Result<i64, String> {
+        let Some(pm) = self.plugin_manager.clone() else {
+            return Err("no live plugin manager".to_string());
+        };
+        let id = pm.register_terminal_callbacks(on_output, on_exit);
+        self.plugin_terminals
+            .insert(id, std::rc::Rc::downgrade(&pm));
+        match self.ext_terminal_open(&cmd, &args, &env, cwd.as_deref(), title, &placement, id) {
+            Ok(()) => Ok(id as i64),
+            Err(e) => {
+                self.plugin_terminals.remove(&id);
+                pm.remove_terminal_callbacks(id);
+                Err(e)
+            }
+        }
+    }
+
+    /// `vimcode.terminal.open(...):send(text)` — write to the pane's PTY.
+    /// Returns `false` if the handle is unknown or its pane already closed.
+    pub(crate) fn plugin_api_terminal_send(&mut self, id: i64, text: &str) -> bool {
+        if id < 0 {
+            return false;
+        }
+        self.ext_terminal_send(id as u64, text)
+    }
+
+    /// `vimcode.terminal.open(...):focus()` — show the terminal panel and
+    /// give this pane keyboard focus. Returns `false` if the handle is
+    /// unknown or its pane already closed.
+    pub(crate) fn plugin_api_terminal_focus(&mut self, id: i64) -> bool {
+        if id < 0 {
+            return false;
+        }
+        self.ext_terminal_focus(id as u64)
+    }
+
+    /// `vimcode.terminal.open(...):close()` — close the pane. Also drops
+    /// the handle's callback registration, same as a natural exit. Returns
+    /// `false` if the handle is unknown or its pane already closed.
+    pub(crate) fn plugin_api_terminal_close(&mut self, id: i64) -> bool {
+        if id < 0 {
+            return false;
+        }
+        let id = id as u64;
+        let closed = self.ext_terminal_close(id);
+        self.plugin_terminals.remove(&id);
+        if let Some(pm) = self.plugin_manager.clone() {
+            pm.remove_terminal_callbacks(id);
+        }
+        closed
     }
 
     // ─── `vimcode.http` ─────────────────────────────────────────────────────

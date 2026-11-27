@@ -28,7 +28,7 @@ use super::session::{ExtensionState, HistoryState, SessionGroupLayout, SessionSt
 use super::settings::{EditorMode, Settings};
 use super::syntax::Syntax;
 use super::tab::{Tab, TabId};
-use super::terminal::{default_shell, InstallContext};
+use super::terminal::{default_shell, ExtTerminalState, InstallContext};
 use super::view::{FoldRegion, View};
 use super::vim_regex;
 use super::window::{
@@ -74,6 +74,9 @@ pub struct TerminalSlot {
     /// prompt without a second `finalize_install_from_terminal` firing when the
     /// shell itself exits afterwards. Meaningless when `install_ctx` is `None`.
     pub install_finalized: bool,
+    /// `Some` only for panes opened by `vimcode.terminal.open` — see
+    /// [`ExtTerminalState`]'s doc.
+    pub ext_terminal: Option<ExtTerminalState>,
 }
 
 /// How a register's contents were captured, and therefore how `p`/`P` put them
@@ -4727,6 +4730,17 @@ pub struct Engine {
     /// reap_stale_plugin_timers_and_spawns` closes any of these whose
     /// `upgrade()` now fails.
     plugin_pickers: HashMap<u64, std::rc::Weak<plugin::PluginManager>>,
+    /// Live `vimcode.terminal.open` handles, keyed by the id
+    /// `PluginManager::register_terminal_callbacks` handed out — same id as
+    /// the `handle_id` stored on the pane's `TerminalSlot::ext_terminal`.
+    /// `Weak` for the same unload-detection reason as `plugin_pickers`:
+    /// when `Engine::set_plugin_manager` replaces the manager, `Self::
+    /// reap_stale_plugin_timers_and_spawns` closes any of these panes whose
+    /// `upgrade()` now fails ("closing the extension closes its
+    /// terminals"). There is no separate handle struct here (unlike
+    /// `plugin_spawns`) — the actual resource is the `TerminalSlot` already
+    /// tracked in `terminal_panes`, found back by matching `handle_id`.
+    plugin_terminals: HashMap<u64, std::rc::Weak<plugin::PluginManager>>,
     /// Live `vimcode.http.request` handles, keyed by the id
     /// `PluginManager::register_http_callback` handed out. Polled from
     /// `poll_idle` via [`Self::poll_plugin_http`]. Same "spawn a background
@@ -6000,6 +6014,7 @@ impl Engine {
             plugin_timer_seq: 0,
             plugin_spawns: HashMap::new(),
             plugin_pickers: HashMap::new(),
+            plugin_terminals: HashMap::new(),
             plugin_http_requests: HashMap::new(),
             plugin_fs_ops: HashMap::new(),
             ai_ghost_text: None,

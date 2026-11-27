@@ -4155,7 +4155,7 @@ fn ext_install_with_acquire_runs_no_terminal_command_and_registers_lsp() {
     std::fs::create_dir_all(&data_home).unwrap();
     let _data_home_guard = EnvVarGuard::set("VIMCODE_TEST_DATA_HOME", data_home.as_os_str());
     // `file://` download URLs are a test-build allowance only (second review round on
-    // #1345: a registry manifest must not turn `curl` into arbitrary-file-read). This
+    // A registry manifest must not turn `curl` into arbitrary-file-read). This
     // integration test must opt in explicitly since library `cfg(test)` doesn't apply.
     let _file_url_guard = EnvVarGuard::set(
         vimcode_core::core::tool_acquire::ALLOW_FILE_URL_DOWNLOADS_ENV,
@@ -6045,6 +6045,132 @@ fn unloading_plugin_stops_its_timers_and_spawns_from_calling_back() {
         e.message, "SENTINEL_1624",
         "no timer/spawn callback belonging to the unloaded plugin may fire \
          after it is replaced"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Plugin API — `vimcode.terminal.open`: run a command in the
+// integrated terminal from Lua, with a `send`/`close`/`focus` handle and
+// `on_output`/`on_exit` callbacks.
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Same "real PTY on a background thread, poll-until-condition-or-timeout"
+// shape as the `loop.spawn` tests above — `vimcode.terminal.open` reuses the
+// exact same `TerminalSession` primitive the editor's own integrated
+// terminal panel uses (`Engine::terminal_panes`), just driven from Lua
+// instead of a keypress.
+
+/// Serializes the one test in this section that overrides the
+/// process-global `$SHELL` (`terminal_open_reuses_the_real_terminal_pane_
+/// and_delivers_output_and_exit`, below) against itself only — no other
+/// test in this file reads `$SHELL` — mirroring `new_vim_features.rs`'s
+/// `SHELL_ENV_LOCK` for the same reason: a bare `EnvVarGuard` restores the
+/// value on drop but does nothing to stop a second thread's `set` landing
+/// in the middle of this one's window.
+static TERMINAL_OPEN_SHELL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+#[cfg(unix)]
+fn terminal_open_reuses_the_real_terminal_pane_and_delivers_output_and_exit() {
+    let _lock = TERMINAL_OPEN_SHELL_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // `vimcode.terminal.open` spawns the user's own `$SHELL` (same as the
+    // editor's own terminal panel) and injects the wrapped command as PTY
+    // input. Pinning it to a plain `/bin/sh` keeps the marker-delimited
+    // output this test asserts on independent of the host's interactive
+    // shell config (a login banner, a slow prompt plugin, …) — same
+    // reasoning as `tests/terminal_wheel.rs`.
+    let _shell_guard = EnvVarGuard::set("SHELL", std::ffi::OsStr::new("/bin/sh"));
+    // Absolute `cat`, not a `PATH` lookup — see `posix_tool`'s doc.
+    let cat = posix_tool("cat");
+    let mut e = engine_with_plugin(
+        "",
+        "terminal_open_2180",
+        &format!(
+            r#"
+        _G.out = ""
+        _G.exit_code = nil
+        vimcode.command("OpenTerm", function(_)
+            _G.h = vimcode.terminal.open({{
+                cmd = {{ "{cat}" }},
+                on_output = function(chunk) _G.out = _G.out .. chunk end,
+                on_exit = function(code) _G.exit_code = code end,
+            }})
+        end)
+        vimcode.command("SendInput", function(_)
+            _G.h:send("hello_2180\n")
+            _G.h:send("\4")
+        end)
+        vimcode.command("ReadState", function(_)
+            vimcode.message(_G.out .. "|" .. tostring(_G.exit_code))
+        end)
+        "#
+        ),
+    );
+    exec(&mut e, "OpenTerm");
+
+    // The handle opened a *real* pane in the same `terminal_panes` the
+    // built-in terminal panel paints from — no separate, hidden process
+    // table of its own, and no new rendering surface for this issue to add.
+    assert_eq!(
+        e.terminal_panes.len(),
+        1,
+        "vimcode.terminal.open must spawn into Engine::terminal_panes, the \
+         same pane vector the integrated terminal panel renders"
+    );
+
+    // `cat` echoes stdin back to stdout; EOT (Ctrl-D, 0x04) closes its
+    // stdin so it exits cleanly once `hello_2180` has been echoed.
+    exec(&mut e, "SendInput");
+
+    let reached = poll_until(&mut e, std::time::Duration::from_secs(10), |e| {
+        exec(e, "ReadState");
+        e.message.contains("hello_2180") && e.message.ends_with("|0")
+    });
+    assert!(
+        reached,
+        "on_output must deliver the command's echoed input and on_exit must \
+         fire with exit code 0; last message: {:?}",
+        e.message
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn unloading_plugin_closes_its_terminal_open_panes() {
+    // Absolute `sleep`, not a `PATH` lookup; see `posix_tool`'s doc.
+    let sleep = posix_tool("sleep");
+    let mut e = engine_with_plugin(
+        "",
+        "terminal_open_unload_2180",
+        &format!(
+            r#"
+        vimcode.command("OpenTerm", function(_)
+            vimcode.terminal.open({{ cmd = {{ "{sleep}", "30" }} }})
+        end)
+        "#
+        ),
+    );
+    exec(&mut e, "OpenTerm");
+    assert_eq!(
+        e.terminal_panes.len(),
+        1,
+        "setup: the terminal pane must be open before unload"
+    );
+
+    // "Unload" = install a fresh `PluginManager`, exactly the mechanism
+    // `unloading_plugin_stops_its_timers_and_spawns_from_calling_back` above
+    // uses for `loop.timer`/`loop.spawn`.
+    let fresh = vimcode_core::core::plugin::PluginManager::new().unwrap();
+    e.set_plugin_manager(fresh);
+
+    assert!(
+        e.terminal_panes.is_empty(),
+        "closing the extension (replacing its PluginManager) must close \
+         every terminal pane it opened via vimcode.terminal.open; panes \
+         remaining: {}",
+        e.terminal_panes.len()
     );
 }
 
