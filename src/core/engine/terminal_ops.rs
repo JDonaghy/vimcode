@@ -1839,6 +1839,28 @@ fn is_valid_env_var_name(name: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Text after `marker` on a terminal grid line printed by the marker
+/// wrapper, or `None` when the line does not carry it.
+///
+/// The marker may follow a shell prompt on the same line (a shell that does
+/// not echo the typed command leaves its prompt in front of the first output
+/// line), so the marker can start anywhere on the line. An occurrence right
+/// after a quote is the echoed command text (`printf '%s\n' '<marker>'`),
+/// not the printed marker, and is ignored.
+fn marker_line_tail<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
+    let line = line.trim_end();
+    let mut from = 0;
+    while let Some(off) = line[from..].find(marker) {
+        let at = from + off;
+        let quoted = matches!(line[..at].chars().last(), Some('\'' | '"'));
+        if !quoted {
+            return Some(&line[at + marker.len()..]);
+        }
+        from = at + marker.len();
+    }
+    None
+}
+
 /// Extract the command output produced between the injected
 /// [`build_acp_terminal_wrapper`] begin/end marker lines from a
 /// `TerminalSession::full_text()` snapshot. Returns `(output, exit_code)`:
@@ -1862,18 +1884,19 @@ pub fn extract_acp_terminal_output(
     end_marker_prefix: &str,
 ) -> (String, Option<i64>) {
     let lines: Vec<&str> = full_text.split('\n').collect();
-    let Some(begin_idx) = lines.iter().rposition(|l| l.trim_end() == begin_marker) else {
+    let Some(begin_idx) = lines
+        .iter()
+        .rposition(|l| marker_line_tail(l, begin_marker).is_some_and(str::is_empty))
+    else {
         return (String::new(), None);
     };
     let after_begin = &lines[begin_idx + 1..];
-    let end_idx = after_begin
-        .iter()
-        .position(|l| l.trim_end().starts_with(end_marker_prefix));
+    let end_idx = after_begin.iter().position(|l| {
+        marker_line_tail(l, end_marker_prefix).is_some_and(|code| code.parse::<i64>().is_ok())
+    });
     match end_idx {
         Some(end_idx) => {
-            let code = after_begin[end_idx]
-                .trim_end()
-                .strip_prefix(end_marker_prefix)
+            let code = marker_line_tail(after_begin[end_idx], end_marker_prefix)
                 .and_then(|s| s.parse::<i64>().ok())
                 .unwrap_or(0);
             (after_begin[..end_idx].join("\n"), Some(code))
@@ -3192,6 +3215,22 @@ mod tests {
             "a malicious `env` *name* must be dropped entirely, not \
              spliced in unescaped; got:\n{script}"
         );
+    }
+
+    #[test]
+    fn extract_acp_terminal_output_accepts_markers_after_a_shell_prompt() {
+        let full_text = "printf '%s\\n' '__begin__'\n'/usr/bin/cat'; __ec=$?; printf '%s\\n' \"__end__:$__ec\"\n$ __begin__\n$ hello\n__end__:0\n$";
+        let (output, exit_code) = extract_acp_terminal_output(full_text, "__begin__", "__end__:");
+        assert_eq!(output, "$ hello");
+        assert_eq!(exit_code, Some(0));
+    }
+
+    #[test]
+    fn extract_acp_terminal_output_ignores_the_echoed_command_text() {
+        let full_text = "printf '%s\\n' '__begin__'\nprintf '%s\\n' \"__end__:$__ec\"\n";
+        let (output, exit_code) = extract_acp_terminal_output(full_text, "__begin__", "__end__:");
+        assert_eq!(output, "");
+        assert_eq!(exit_code, None);
     }
 
     #[test]
