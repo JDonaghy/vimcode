@@ -1224,6 +1224,24 @@ pub(crate) fn context_menu_anchor_point(
     )
 }
 
+/// The `(col, row)` cell a context menu opened by a pointer press at `pos`
+/// is stored at (`ContextMenuState::screen_x`/`screen_y`) — the inverse of
+/// [`context_menu_anchor_point`]. `char_width`/`line_height` must be the
+/// metrics the menu is later *painted* with, not the metrics of whatever
+/// surface was clicked: a sidebar row pitch that differs from the editor's
+/// line height would place the menu `row × (painted − clicked)` pixels away
+/// from the pointer.
+pub fn context_menu_anchor_cell(
+    pos: quadraui::Point,
+    char_width: f64,
+    line_height: f64,
+) -> (u16, u16) {
+    (
+        (pos.x as f64 / char_width.max(1.0)) as u16,
+        (pos.y as f64 / line_height.max(1.0)) as u16,
+    )
+}
+
 /// Compute a backend-agnostic [`quadraui::ContextMenuLayout`] for a
 /// `ContextMenuPanel` from just `char_width`/`line_height`. Ports the
 /// char-count width budget both backends independently duplicated, now

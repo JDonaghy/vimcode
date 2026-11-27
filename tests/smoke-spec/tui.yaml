@@ -1983,6 +1983,121 @@ steps:
     timeout_ms: 4000
 
   # ─────────────────────────────────────────────────────────────────────
+  # Explorer context menu, confirmed with the MOUSE. Every right-click
+  # step above confirms its menu item from the keyboard (Enter / k), so
+  # none of them would notice that a left-click on a painted item closed
+  # the menu and did nothing — which is what "New File...", "New
+  # Folder..." and "Delete" did (`App::apply_context_menu_route`
+  # confirmed the item but discarded the action string, so every action
+  # the engine leaves to `render::apply_explorer_context_action` was
+  # dropped on a click). This section right-clicks the root row (always a
+  # folder — see `right-click-explorer-root-row-1703`) and left-clicks the
+  # painted item. The folder menu paints its first item on the
+  # right-clicked row itself (row 2) and "Delete" ten rows below it (two
+  # separators), with item text from col 11, so col 20 is inside every
+  # item.
+  #
+  # The typed names use only characters the Explorer's own single-key
+  # bindings ignore (no j/k/l/h/q/a/A/D/r/M): on a binary with the bug the
+  # inline edit never starts, so these keystrokes reach the focused tree
+  # instead, and a name containing `r` renamed the launch directory itself
+  # in a real pre-fix run. Commit oracles: a created file opens in a tab
+  # (row 0), which assumes the launch `cwd` holds no `zz_ctx_new.txt` yet;
+  # the folder commit reports its name on the message row (row 29) as
+  # either "Created folder" or "already exists", so it also holds on a
+  # re-run in the same `cwd`.
+  - type: click
+    id: right-click-root-row-for-mouse-new-file-ctxmenu
+    row: 2
+    col: 10
+    button: right
+  - type: expect_within
+    id: context-menu-opens-for-mouse-new-file-ctxmenu
+    text: "New File"
+    ms: 1500
+  - type: click
+    id: mouse-click-new-file-item-ctxmenu
+    row: 2
+    col: 20
+  - type: expect_within
+    id: mouse-click-new-file-starts-inline-edit-ctxmenu
+    text: "file name"
+    ms: 1500
+  - type: type_text
+    id: type-new-file-name-ctxmenu
+    text: "zz_ctx_new.txt"
+  - type: key
+    id: commit-new-file-ctxmenu
+    key: enter
+  - type: expect_within
+    id: new-file-commit-opens-tab-ctxmenu
+    region: {row: 0, col: 22, height: 1, width: 78}
+    text: "zz_ctx_new.txt"
+    ms: 1500
+  - type: wait_idle
+    id: settle-after-new-file-ctxmenu
+    ms: 1000
+    timeout_ms: 4000
+
+  - type: click
+    id: right-click-root-row-for-mouse-new-folder-ctxmenu
+    row: 2
+    col: 10
+    button: right
+  - type: expect_within
+    id: context-menu-opens-for-mouse-new-folder-ctxmenu
+    text: "New Folder"
+    ms: 1500
+  - type: click
+    id: mouse-click-new-folder-item-ctxmenu
+    row: 3
+    col: 20
+  - type: expect_within
+    id: mouse-click-new-folder-starts-inline-edit-ctxmenu
+    text: "older nam"
+    ms: 1500
+  - type: type_text
+    id: type-new-folder-name-ctxmenu
+    text: "zz_ctx_box"
+  - type: key
+    id: commit-new-folder-ctxmenu
+    key: enter
+  - type: expect_within
+    id: new-folder-commit-reports-name-ctxmenu
+    region: {row: 29, col: 0, height: 1, width: 100}
+    text: "zz_ctx_box"
+    ms: 1500
+  - type: wait_idle
+    id: settle-after-new-folder-ctxmenu
+    ms: 1000
+    timeout_ms: 4000
+
+  - type: click
+    id: right-click-root-row-for-mouse-delete-ctxmenu
+    row: 2
+    col: 10
+    button: right
+  - type: expect_within
+    id: context-menu-opens-for-mouse-delete-ctxmenu
+    text: "Delete"
+    ms: 1500
+  - type: click
+    id: mouse-click-delete-item-ctxmenu
+    row: 12
+    col: 20
+  - type: expect_within
+    id: mouse-click-delete-opens-confirm-dialog-ctxmenu
+    text: "Confirm Delete"
+    ms: 1500
+  - type: key
+    id: cancel-delete-dialog-ctxmenu
+    key: esc
+  - type: wait_idle
+    id: settle-after-cancel-delete-ctxmenu
+    ms: 1000
+    timeout_ms: 4000
+
+  # ─────────────────────────────────────────────────────────────────────
   # vimcode#1970 -- Ctrl-W h from a focused sidebar panel (Explorer is the
   # active panel here, re-selected by click-explorer-icon-again above) must
   # move keyboard focus onto the activity-bar toolbar and leave it

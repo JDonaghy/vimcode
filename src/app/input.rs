@@ -1,6 +1,23 @@
 use super::*;
 
 impl App {
+    /// The `(line_height, char_width)` every context menu is painted and
+    /// anchored with — the metrics the last frame painted the editor band
+    /// with. Every pointer-opened menu converts its click position with these
+    /// ([`Self::context_menu_anchor_cell`]) so the menu lands at the pointer,
+    /// whichever surface (editor, tab bar, explorer, extension panel) was
+    /// clicked.
+    pub(crate) fn context_menu_anchor_metrics(&self) -> (f64, f64) {
+        (self.painted_line_height(), self.painted_char_width())
+    }
+
+    /// The `(col, row)` cell a context menu opened by a press at pixel
+    /// `(x, y)` is anchored to — see [`render::context_menu_anchor_cell`].
+    pub(crate) fn context_menu_anchor_cell(&self, x: f64, y: f64) -> (u16, u16) {
+        let (lh, cw) = self.context_menu_anchor_metrics();
+        render::context_menu_anchor_cell(quadraui::Point::new(x as f32, y as f32), cw, lh)
+    }
+
     /// Open the tab context menu for `tab_idx` in `group_id`, anchored at the
     /// click's pixel position.
     pub(crate) fn handle_tab_right_click(
@@ -10,10 +27,7 @@ impl App {
         x: f64,
         y: f64,
     ) {
-        let cw = self.cached_char_width.max(1.0);
-        let lh = self.cached_line_height.max(1.0);
-        let cx = (x / cw) as u16;
-        let cy = (y / lh) as u16;
+        let (cx, cy) = self.context_menu_anchor_cell(x, y);
         self.engine
             .borrow_mut()
             .open_tab_context_menu(group_id, tab_idx, cx, cy);
@@ -41,10 +55,7 @@ impl App {
         if in_modal {
             return;
         }
-        let cw = self.cached_char_width.max(1.0);
-        let lh = self.cached_line_height.max(1.0);
-        let cx = (x / cw) as u16;
-        let cy = (y / lh) as u16;
+        let (cx, cy) = self.context_menu_anchor_cell(x, y);
         self.engine.borrow_mut().open_editor_context_menu(cx, cy);
         self.draw_needed.set(true);
     }
@@ -84,8 +95,7 @@ impl App {
         if panel.items.is_empty() {
             return;
         }
-        let cw = self.cached_char_width.max(1.0);
-        let lh = self.cached_line_height.max(1.0);
+        let (lh, cw) = self.context_menu_anchor_metrics();
         render::show_context_menu_now(backend, &panel, cw, lh);
     }
 

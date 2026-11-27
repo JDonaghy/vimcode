@@ -1066,6 +1066,175 @@ mod mac_driver_tests {
         );
     }
 
+    /// Right-click the painted [`crate::harness::DEEP_EXPLORER_TARGET`] row
+    /// of a tree long enough to put it far down the sidebar, at the pixel
+    /// position `MacDriver` painted it. Returns that position.
+    ///
+    /// The row sits in the lower half of the window, so a per-row anchor
+    /// drift accumulates past one row, yet high enough that the whole menu
+    /// fits below it — a menu clamped against the window's bottom edge would
+    /// paint in the same place whether or not its anchor drifted.
+    fn mac_right_click_deep_target(
+        driver: &mut quadraui::macos::testing::MacDriver<impl quadraui::AppLogic>,
+    ) -> (f32, f32) {
+        let (rx, ry) = driver
+            .find(crate::harness::DEEP_EXPLORER_TARGET)
+            .unwrap_or_else(|| {
+                panic!(
+                    "target row must be painted; painted: {:?}",
+                    driver.painted_texts()
+                )
+            });
+        assert!(
+            ry > H as f32 / 2.0 && ry < H as f32 - 350.0,
+            "fixture must put the target row in the lower half of the window \
+             with room for the menu below it (y={ry})"
+        );
+        mac_right_click_at(driver, rx, ry);
+        (rx, ry)
+    }
+
+    fn mac_right_click_at(
+        driver: &mut quadraui::macos::testing::MacDriver<impl quadraui::AppLogic>,
+        rx: f32,
+        ry: f32,
+    ) {
+        driver.dispatch(quadraui::UiEvent::MouseDown {
+            widget: None,
+            button: quadraui::MouseButton::Right,
+            position: quadraui::Point::new(rx, ry),
+            modifiers: quadraui::Modifiers::default(),
+        });
+        driver.render();
+    }
+
+    /// `menu_style = Custom`: the in-window menu must paint at the
+    /// right-clicked row of a deep tree, and clicking its painted
+    /// "New File..." item must start the inline edit and create the file in
+    /// the right-clicked folder. The sidebar paints at the font's natural
+    /// line height while the menu is placed with the editor's VS Code row
+    /// pitch, so a press converted to a cell with the sidebar's pitch and
+    /// back with the editor's lands the menu `row × (pitch difference)`
+    /// below the pointer.
+    #[test]
+    fn custom_explorer_context_menu_paints_at_deep_row_and_click_new_file_creates_file() {
+        let (mut engine, target) = crate::harness::engine_with_deep_explorer_tree("mac_custom", 18);
+        engine.settings.menu_style = crate::core::settings::MenuStyle::Custom;
+        let (_guards, _engine, mut driver) = driver_with_engine(engine);
+        let (_, ry) = mac_right_click_deep_target(&mut driver);
+
+        let lh = quadraui::Backend::line_height(driver.backend());
+        let first = driver.find_bounds("New File...");
+        let last = driver.find_bounds("Delete");
+        let (Some(first), Some(last)) = (first, last) else {
+            panic!(
+                "right-clicking a folder row must paint its context menu; \
+                 painted: {:?}",
+                driver.painted_texts()
+            );
+        };
+        // The fixture leaves room below the row, so the menu's top item sits
+        // within a row or two of the click; the bottom-item term covers a
+        // menu placed above the pointer instead.
+        let gap = (first.y - ry).abs().min((last.y + last.height - ry).abs());
+        assert!(
+            gap <= 2.0 * lh,
+            "the context menu must paint at the right-clicked row (y={ry}), \
+             not first item {first:?} / last item {last:?} ({gap}px away, \
+             line height {lh})"
+        );
+
+        driver.click(first.x + first.width / 2.0, first.y + first.height / 2.0);
+        driver.render();
+        assert!(
+            driver.screen_contains("New file name"),
+            "clicking the painted 'New File...' must start the tree's inline \
+             edit; painted: {:?}",
+            driver.painted_texts()
+        );
+        for c in "made.txt".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        assert!(
+            target.join("made.txt").is_file(),
+            "typing a name and Enter must create the file in the right-clicked \
+             folder"
+        );
+    }
+
+    /// Default (`Auto` -> native) menu style: the native popup must be
+    /// anchored at the right-clicked row of a deep tree, and the item AppKit
+    /// reports picked must perform its explorer action. The anchor is
+    /// checked through the same cell -> pixel conversion
+    /// `render::show_context_menu_now` hands `Backend::show_context_menu`
+    /// (`render::context_menu_anchor_point` at the painted editor metrics);
+    /// the pick is the `ContextMenuItemActivated` event AppKit's modal loop
+    /// pushes, since `MacBackend::show_context_menu` is a no-op off the main
+    /// thread.
+    #[test]
+    fn native_explorer_context_menu_anchors_at_deep_row_and_picks_perform_actions() {
+        let (engine, target) = crate::harness::engine_with_deep_explorer_tree("mac_native", 18);
+        let (_guards, engine, mut driver) = driver_with_engine(engine);
+        let (rx, ry) = mac_right_click_deep_target(&mut driver);
+
+        let lh = quadraui::Backend::line_height(driver.backend()) as f64;
+        let cw = quadraui::Backend::char_width(driver.backend()) as f64;
+        let anchor = {
+            let eng = engine.borrow();
+            let cm = eng
+                .context_menu
+                .as_ref()
+                .expect("right-clicking a folder row must open its context menu");
+            crate::render::context_menu_anchor_point(
+                &crate::render::context_menu_state_to_panel(cm),
+                cw,
+                lh,
+            )
+        };
+        assert!(
+            (anchor.y - ry).abs() <= lh as f32,
+            "the native context menu must be anchored at the right-clicked \
+             row (y={ry}), not y={} (line height {lh})",
+            anchor.y
+        );
+
+        // Item 0 is "New File..." — see `Engine::open_explorer_context_menu`.
+        driver.dispatch(quadraui::UiEvent::ContextMenuItemActivated(
+            quadraui::WidgetId::new("context:0"),
+        ));
+        assert!(
+            engine.borrow().explorer_tree.borrow().is_editing(),
+            "picking 'New File...' must start the tree's inline edit"
+        );
+        for c in "made.txt".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        assert!(
+            target.join("made.txt").is_file(),
+            "typing a name and Enter must create the file in the right-clicked \
+             folder"
+        );
+
+        // Same row as before: the new file's breadcrumb now paints the target
+        // folder's name too, so a fresh text lookup could land on it. Moved
+        // along the row so the backend's double-click folding does not read
+        // two right-clicks at one point inside its time window as a
+        // double-click.
+        mac_right_click_at(&mut driver, rx + 20.0, ry);
+        // Item 8 is "Delete".
+        driver.dispatch(quadraui::UiEvent::ContextMenuItemActivated(
+            quadraui::WidgetId::new("context:8"),
+        ));
+        assert_eq!(
+            engine.borrow().pending_delete.as_deref(),
+            Some(target.as_path()),
+            "picking 'Delete' must open the delete confirmation for the \
+             right-clicked folder"
+        );
+    }
+
     /// A plain engine with nerd fonts explicitly **on**. Every fixture above
     /// (`plain_engine`, `engine_with_minimap`) deliberately sets it `false`
     /// to dodge the tab-icon `debug_assert!`, an already-documented, unrelated
