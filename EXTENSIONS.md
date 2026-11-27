@@ -2088,6 +2088,93 @@ Or set in `~/.config/vimcode/settings.json`:
 
 ---
 
+## Testing Extensions Headlessly (`vimcode --test-extension`)
+
+```
+vimcode --test-extension <ext-dir> <spec.lua>
+```
+
+Loads `<ext-dir>` exactly as if it were installed (its `manifest.toml` + scripts, under
+a scratch `$HOME` — never your real `~/.config/vimcode`), starts a headless TUI
+session at a fixed 100×30 size, and runs `<spec.lua>` against it. Exits `0` on a
+passing spec, `1` on a failing assertion (printing the rendered screen) or a setup
+error (missing `manifest.toml`, unreadable spec file, …).
+
+Put spec files under `<ext-dir>/tests/*_spec.lua` — that is the convention the
+[vimcode-ext](https://github.com/JDonaghy/vimcode-ext) registry's own CI uses to run
+every extension's specs against a downloaded release binary.
+
+### The spec API
+
+A spec file is a plain Lua chunk with one global table, `t`, and nothing else from
+`vimcode.*` — it drives the *running editor* from outside, the way a human would, not
+the extension's own internals. Use Lua's built-in `assert(cond, message)` for
+assertions; a failed `assert` fails the spec and prints the message plus the screen.
+
+```lua
+t.keys(seq)              -- Inject keystrokes (Neovim notation: "ihello<Esc>", "dw", "<C-a>")
+t.command(cmd)           -- Run an ex command; the leading ":" is optional
+t.wait_for(fn, timeout)  -- Poll fn() (and the engine's idle work) until it returns
+                          -- truthy or timeout seconds elapse (default 5); errors on timeout
+t.screen()               -- The full rendered frame as a string, one line per row
+t.contains(text)         -- True if `text` appears anywhere on screen
+t.cell(x, y)             -- { char=, fg=, bg=, bold=, italic=, underline= } at one cell, or nil
+t.click(x, y)            -- A left click at cell (x, y)
+t.click_text(text)       -- Locate the first painted run containing `text` and click its
+                          -- center; errors (does not guess coordinates) if not painted
+t.view(id)               -- The widget tree a `vimcode.ui.register_view(id, ...)` view is
+                          -- currently showing, freshly re-rendered — e.g.
+                          -- `t.view("my_view").fields[1].kind.value`; nil if unregistered
+t.stub_command(name, path) -- See "Process stubbing" below
+```
+
+A minimal spec for an extension that registers a `:MyCommand`:
+
+```lua
+t.command(":MyCommand")
+assert(t.contains("expected output"), "MyCommand should have printed something")
+```
+
+### Process stubbing
+
+An extension that wraps an external CLI (a `kubectl`/`psql`-style tool) can be tested
+without that tool installed: `t.stub_command(name, path)` puts a fake executable named
+`name` first on `PATH`, so any `vimcode.loop.spawn`/`vimcode.async_shell`/
+`vimcode.terminal.open` call that spawns `name` finds the fake instead.
+
+`path` is either:
+
+- **A `.lua` file** — run standalone (not via `vimcode.*`) each time the fake is
+  invoked. It sees a Lua CLI-style `arg` table (`arg[1]`, `arg[2]`, … are the forwarded
+  command-line arguments) and the ordinary Lua `io`/`os` library — `io.write`/`print`
+  for stdout, `os.exit(code)` to set the exit code, `os.getenv` to read its environment.
+- **A directory** — copied verbatim onto the stub `PATH`, so a hand-written fake
+  executable travels together with any data files it reads.
+
+A relative `path` resolves against the spec file's own directory, not wherever
+`vimcode --test-extension` was invoked from, so a spec can keep its fixtures alongside
+itself:
+
+```lua
+-- tests/basic_spec.lua
+t.stub_command("kubectl", "fixtures/fake_kubectl.lua")
+t.command(":K8sGetPods")
+t.wait_for(function() return t.contains("Running") end, 3)
+assert(t.contains("pod-a"), "expected the stubbed kubectl output on screen")
+```
+
+```lua
+-- tests/fixtures/fake_kubectl.lua
+io.write("pod-a   Running\n")
+os.exit(0)
+```
+
+Two worked examples (one using the View API, one stubbing a command) live under
+`tests/fixtures/extensions/view_demo` and `tests/fixtures/extensions/stub_demo` in the
+vimcode repo itself — `tests/test_extension_harness.rs` runs both in CI.
+
+---
+
 ## Tips for AI-Assisted Development
 
 When asking an AI to write a VimCode extension:
@@ -2101,3 +2188,5 @@ When asking an AI to write a VimCode extension:
 7. **Buffer modifications** via `vimcode.buf.*` (`set_line`/`insert_line`/`delete_line`/`set_lines`) are applied after the callback returns; `vimcode.buffer.*` applies them immediately
 8. **Immediate APIs** (`vimcode.buffer`, `window`, `decor`, `picker`, `loop`, `http`, …) only work inside callbacks, not at script load time
 9. **Test with** `:Plugin reload` to reload scripts without restarting the editor
+10. **Write a headless spec** under `tests/*_spec.lua` and run it with `vimcode
+    --test-extension <ext-dir> <spec.lua>` — see "Testing Extensions Headlessly" above

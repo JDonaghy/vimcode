@@ -30,7 +30,7 @@
 //! non-Windows stub, which `todo!()`s rather than degrading gracefully the
 //! way the GTK/TUI paths do.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 /// Which GUI backend this binary was compiled with.
@@ -204,7 +204,9 @@ fn usage_text() -> String {
 for one extension, no GUI/TUI\n\
          \x20\x20    --json          With --ext-install, print the result as JSON\n\
          \x20\x20    --skin <FILE>   Load chrome proportions and visual tokens from a \
-TOML skin file\n\n\
+TOML skin file\n\
+         \x20\x20    --test-extension <DIR> <SPEC.lua>  Run a headless extension test \
+spec against the extension in DIR (see EXTENSIONS.md)\n\n\
          Arguments:\n\
          \x20\x20[FILE]              File to open on startup\n",
         env!("CARGO_PKG_VERSION"),
@@ -460,8 +462,41 @@ fn run_shell_command(cmd: &str) -> i32 {
         .unwrap_or(1)
 }
 
+/// Convert a plain `i32` process exit code (what
+/// `vimcode_core::test_extension::run`/`run_lua_stub` return) into an
+/// [`ExitCode`]. `ExitCode::from` takes a `u8`, so anything outside that
+/// range is clamped rather than silently truncated.
+fn exit_code_from(code: i32) -> ExitCode {
+    ExitCode::from(code.clamp(0, 255) as u8)
+}
+
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().collect();
+
+    // `--test-extension <ext-dir> <spec.lua>` and the hidden
+    // `--run-lua-stub <file> [args...]` (used only by the shim scripts
+    // `vimcode_core::test_extension::stub_command` writes) are handled
+    // before `Args::parse` rather than folded into its single-positional-
+    // file-argument shape: both take a different, fixed number of
+    // positional arguments of their own, and neither ever touches a GUI/
+    // TUI backend. See `vimcode_core::test_extension`'s module doc.
+    if argv.get(1).map(String::as_str) == Some("--test-extension") {
+        let (Some(ext_dir), Some(spec)) = (argv.get(2), argv.get(3)) else {
+            eprintln!("Usage: vimcode --test-extension <ext-dir> <spec.lua>");
+            return ExitCode::FAILURE;
+        };
+        let code = vimcode_core::test_extension::run(Path::new(ext_dir), Path::new(spec));
+        return exit_code_from(code);
+    }
+    if argv.get(1).map(String::as_str) == Some("--run-lua-stub") {
+        let Some(file) = argv.get(2) else {
+            eprintln!("Usage: vimcode --run-lua-stub <file> [args...]");
+            return ExitCode::FAILURE;
+        };
+        let code = vimcode_core::test_extension::run_lua_stub(Path::new(file), &argv[3..]);
+        return exit_code_from(code);
+    }
+
     let args = Args::parse(&argv);
 
     if args.help {
@@ -614,6 +649,14 @@ mod arg_parsing_tests {
     #[test]
     fn usage_text_documents_the_skin_flag() {
         assert!(usage_text().contains("--skin <FILE>"));
+    }
+
+    /// `--test-extension` is advertised in the usage text — the hidden
+    /// `--run-lua-stub` is deliberately not (see
+    /// `vimcode_core::test_extension`'s module doc for why).
+    #[test]
+    fn usage_text_documents_the_test_extension_flag() {
+        assert!(usage_text().contains("--test-extension <DIR> <SPEC.lua>"));
     }
 }
 

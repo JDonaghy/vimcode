@@ -92,6 +92,13 @@ pub use quadraui;
 
 pub mod quadraui_pin;
 
+/// `vimcode --test-extension <ext-dir> <spec.lua>` — the headless extension
+/// test harness. Compiled into every build (unlike `harness`/`test_cwd`/
+/// `test_paint` above): `vimcode-ext`'s own CI drives it against a
+/// downloaded release binary, not a `cargo test` build of this crate. See
+/// the module's own doc for the full design.
+pub mod test_extension;
+
 // Convenience re-exports so integration tests can write `use vimcode_core::Engine` etc.
 pub use core::buffer::Buffer;
 pub use core::cursor::Cursor;
