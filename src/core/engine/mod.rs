@@ -1912,6 +1912,16 @@ pub enum PendingPlatformAction {
     /// A file/save/folder picker dialog requested through the plugin API,
     /// resolved by `callback_id` once the user picks or cancels.
     PluginDialog(PluginDialogRequest),
+    /// Move a file or folder to the platform trash/recycle bin
+    /// (`PlatformServices::move_to_trash`) rather than hard-deleting it.
+    /// Queued by the Explorer delete confirm flow once the user confirms —
+    /// any buffers open under the path are already closed by the time this
+    /// is queued, so the runner only needs to carry out the filesystem move
+    /// and report success/failure back through `Engine::message`. `is_dir`
+    /// is captured at confirm time (before the move) so the runner doesn't
+    /// need to stat a path whose existence is about to change once this
+    /// queue drains.
+    MoveToTrash { path: PathBuf, is_dir: bool },
 }
 
 /// Which `quadraui::PlatformServices` dialog method a [`PluginDialogRequest`]

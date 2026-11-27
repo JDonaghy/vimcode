@@ -276,17 +276,18 @@ impl Engine {
                     Ok(_) => self.message = format!("Created folder: {}", new_text),
                     Err(e) => self.message = format!("Error creating folder: {}", e),
                 }
+            } else if let Err(e) = target
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|_| std::fs::File::create(&target).map(|_| ()))
+            {
+                self.message = format!("Error creating file: {}", e);
             } else {
-                match std::fs::File::create(&target) {
-                    Ok(_) => {
-                        self.message = format!("Created: {}", new_text);
-                        self.explorer_rebuild_rows();
-                        self.open_file_in_tab(&target);
-                        self.explorer_has_focus = false;
-                        return;
-                    }
-                    Err(e) => self.message = format!("Error creating file: {}", e),
-                }
+                self.message = format!("Created: {}", new_text);
+                self.explorer_rebuild_rows();
+                self.open_file_in_tab(&target);
+                self.explorer_has_focus = false;
+                return;
             }
             self.explorer_rebuild_rows();
         } else {
@@ -1191,6 +1192,45 @@ mod explorer_exclude_tests {
         assert!(
             walk_entry_is_excluded(nested_entry, &exclude),
             "a nested '.git' entry (depth > 0) must still be excluded"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod new_file_nested_path_tests {
+    use super::*;
+
+    /// New File with a name containing a path separator (typed as
+    /// `nested/made.txt` into the tree's inline edit) must create the
+    /// intermediate directory rather than failing with "No such file or
+    /// directory" — `File::create` alone never creates parent
+    /// directories.
+    ///
+    /// Drives `handle_explorer_edit_confirmed` directly (private to this
+    /// module) rather than through a `TreeController` event, the same
+    /// way `explorer_exclude_tests` above reaches other private helpers
+    /// in this file.
+    #[test]
+    fn new_file_with_nested_path_creates_parent_dirs() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_2207_new_file_nested_path_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut engine = Engine::new_for_test();
+        engine.explorer_new_entry_pending = Some((dir.clone(), false));
+        engine.handle_explorer_edit_confirmed(&[], "nested/made.txt");
+
+        assert!(
+            dir.join("nested").join("made.txt").exists(),
+            "the nested file must be created, with its parent directory, \
+             not fail silently; message was {:?}",
+            engine.message
         );
 
         let _ = std::fs::remove_dir_all(&dir);

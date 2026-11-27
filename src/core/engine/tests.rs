@@ -22814,9 +22814,18 @@ fn test_confirm_delete_file_confirm() {
     e.handle_key("", Some('d'), false);
     assert!(e.dialog.is_none());
     assert!(e.pending_delete.is_none());
-    // File should be deleted
-    assert!(!file.exists());
-    assert!(e.message.contains("Deleted"));
+    // The actual move needs the runner's `PlatformServices`
+    // (`PendingPlatformAction::MoveToTrash`) — confirming only queues it,
+    // so the file must still exist right after this call, not be
+    // hard-deleted inline.
+    assert!(file.exists());
+    assert_eq!(
+        e.pending_platform_actions,
+        vec![PendingPlatformAction::MoveToTrash {
+            path: file.clone(),
+            is_dir: false,
+        }]
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -22838,8 +22847,100 @@ fn test_confirm_delete_folder() {
 
     // Confirm delete
     e.handle_key("", Some('d'), false);
-    assert!(!subdir.exists());
-    assert!(e.message.contains("Deleted folder"));
+    // Same as the file case: the move itself is deferred to the runner.
+    assert!(subdir.exists());
+    assert_eq!(
+        e.pending_platform_actions,
+        vec![PendingPlatformAction::MoveToTrash {
+            path: subdir.clone(),
+            is_dir: true,
+        }]
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A folder delete must close every open buffer under it — not just
+/// the single exact-path match the file-delete case uses — so none is
+/// left pointing at a path about to be moved to the trash.
+///
+/// **Verified RED against unfixed `develop`:** before this fix, the
+/// `confirm_delete` dialog action only closed a buffer when `!is_dir`;
+/// a folder delete left every buffer under it open (and, if dirty,
+/// orphaned with no warning at all).
+#[test]
+fn test_confirm_delete_folder_closes_open_buffers_under_it() {
+    let dir = test_temp_path("vimcode_test_confirm_delete_folder_closes_buffers");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let subdir = dir.join("mydir");
+    std::fs::create_dir_all(&subdir).unwrap();
+    let inner = subdir.join("inner.txt");
+    std::fs::write(&inner, "hello").unwrap();
+
+    let mut e = Engine::new();
+    e.open_file_in_tab(&inner);
+    let buffer_id = e.active_buffer_id();
+    assert!(e.buffer_manager.get(buffer_id).is_some());
+
+    e.confirm_delete_file(&subdir);
+    // The dialog must call out the buffer it's about to close.
+    let dlg = e.dialog.as_ref().unwrap();
+    assert!(
+        dlg.body.iter().any(|line| line.contains("inner.txt")),
+        "confirm dialog must list the open buffer under the folder; body: {:?}",
+        dlg.body
+    );
+
+    e.handle_key("", Some('d'), false);
+    assert!(
+        e.buffer_manager.get(buffer_id).is_none(),
+        "the buffer under the deleted folder must be closed once the \
+         delete is confirmed, so it never points at a trashed path"
+    );
+    assert_eq!(
+        e.pending_platform_actions,
+        vec![PendingPlatformAction::MoveToTrash {
+            path: subdir.clone(),
+            is_dir: true,
+        }]
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The confirm dialog must flag a *dirty* buffer under the folder
+/// distinctly from a clean one, so the user knows unsaved changes are
+/// about to be discarded along with the delete.
+#[test]
+fn test_confirm_delete_folder_dialog_flags_dirty_buffer() {
+    let dir = test_temp_path("vimcode_test_confirm_delete_folder_dirty_flag");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let subdir = dir.join("mydir");
+    std::fs::create_dir_all(&subdir).unwrap();
+    let inner = subdir.join("dirty.txt");
+    std::fs::write(&inner, "hello").unwrap();
+
+    let mut e = Engine::new();
+    e.open_file_in_tab(&inner);
+    let buffer_id = e.active_buffer_id();
+    e.buffer_manager.get_mut(buffer_id).unwrap().dirty = true;
+
+    e.confirm_delete_file(&subdir);
+    let dlg = e.dialog.as_ref().unwrap();
+    assert!(
+        dlg.body
+            .iter()
+            .any(|line| line.contains("dirty.txt") && line.contains("modified")),
+        "confirm dialog must flag the dirty buffer as modified; body: {:?}",
+        dlg.body
+    );
+    assert!(
+        dlg.body.iter().any(|line| line.contains("unsaved changes")),
+        "confirm dialog must warn about unsaved changes; body: {:?}",
+        dlg.body
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
