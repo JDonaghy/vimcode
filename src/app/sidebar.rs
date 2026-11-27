@@ -175,7 +175,7 @@ impl App {
     /// `render::explorer_toolbar_hit_at` does the engine-only hit-test (button
     /// index); this wrapper converts `pos` to character-cell coordinates that
     /// `Engine::open_explorer_overflow_menu` needs to anchor the popup,
-    /// using `self.cached_explorer_metrics`.
+    /// using [`Self::context_menu_anchor_cell`].
     ///
     /// Returns `false` (and does nothing) when `pos` doesn't land on a toolbar
     /// segment, so the caller falls through to the tree's own click routing.
@@ -187,12 +187,10 @@ impl App {
         let Some(idx) = idx else {
             return false;
         };
+        let anchor = self.context_menu_anchor_cell(pos.x as f64, pos.y as f64);
         let mut engine = self.engine.borrow_mut();
         if idx == 4 {
-            let (line_height, char_width) = self.cached_explorer_metrics.get();
-            let col = (pos.x as f64 / char_width.max(1.0)) as u16;
-            let row = (pos.y as f64 / line_height.max(1.0)) as u16;
-            engine.open_explorer_overflow_menu(col, row, 1.0);
+            engine.open_explorer_overflow_menu(anchor.0, anchor.1, 1.0);
         } else {
             engine.explorer_activate_toolbar_action(idx);
         }
@@ -256,11 +254,19 @@ impl App {
         // methods on `dyn Backend`, so they must be set from here rather
         // than inside the shared function.
         let metrics = self.cached_explorer_metrics.get();
+        let anchor_metrics = self.context_menu_anchor_metrics();
         quadraui::Backend::set_current_line_height(backend, metrics.0 as f32);
         quadraui::Backend::set_current_char_width(backend, metrics.1 as f32);
         let tree_event = {
             let mut engine = self.engine.borrow_mut();
-            render::route_explorer_tree_event(&mut engine, &ev, rect, metrics, &theme, backend)
+            render::route_explorer_tree_event(
+                &mut engine,
+                &ev,
+                rect,
+                anchor_metrics,
+                &theme,
+                backend,
+            )
         };
 
         // `None` means either the event was fully resolved inside the tree routing
@@ -282,6 +288,7 @@ impl App {
                 &mut self.engine.borrow_mut(),
                 rect,
                 metrics,
+                anchor_metrics,
                 position,
             );
         }
@@ -620,10 +627,7 @@ impl App {
                         ..
                     } if is_view => {
                         let name = engine.ext_panel_active.clone().unwrap_or_default();
-                        let cw = self.cached_char_width.max(1.0);
-                        let lh = self.cached_line_height.max(1.0);
-                        let cx = (pos.x as f64 / cw) as u16;
-                        let cy = (pos.y as f64 / lh) as u16;
+                        let (cx, cy) = self.context_menu_anchor_cell(pos.x as f64, pos.y as f64);
                         engine.open_plugin_view_context_menu(&name, cx, cy);
                     }
                     // A `ViewBody`-kind view routes through its own
@@ -687,10 +691,8 @@ impl App {
                         // `vimcode.panel.set_context_menu`.
                         if let Some(flat_idx) = render::ext_panel_right_click_index(&engine, pos) {
                             engine.ext_panel_selected = flat_idx;
-                            let cw = self.cached_char_width.max(1.0);
-                            let lh = self.cached_line_height.max(1.0);
-                            let cx = (pos.x as f64 / cw) as u16;
-                            let cy = (pos.y as f64 / lh) as u16;
+                            let (cx, cy) =
+                                self.context_menu_anchor_cell(pos.x as f64, pos.y as f64);
                             engine.open_ext_panel_context_menu(cx, cy);
                         }
                     }
@@ -810,10 +812,7 @@ impl App {
                 ..
             } => {
                 if let Some(card_id) = render::board_right_click_card(&engine, pos) {
-                    let cw = self.cached_char_width.max(1.0);
-                    let lh = self.cached_line_height.max(1.0);
-                    let cx = (pos.x as f64 / cw) as u16;
-                    let cy = (pos.y as f64 / lh) as u16;
+                    let (cx, cy) = self.context_menu_anchor_cell(pos.x as f64, pos.y as f64);
                     engine.open_board_context_menu(card_id, cx, cy);
                 }
             }
@@ -1036,6 +1035,25 @@ impl App {
             let (_consumed, action) = engine.handle_context_menu_key(&effective_key);
             action
         };
+        self.apply_confirmed_context_menu_action(action, target);
+        self.queue_explorer_draw();
+        self.draw_needed.set(true);
+    }
+
+    /// Apply the action a confirmed context-menu item returned
+    /// (`Engine::context_menu_confirm`), for the explorer-targeted actions
+    /// the engine leaves to the caller (`new_file`, `new_folder`, `rename`,
+    /// `delete`, `open_terminal`, `find_in_folder`, ...) — see
+    /// [`render::apply_explorer_context_action`]. `target` is
+    /// `Engine::context_menu_target_path`, captured *before* confirming,
+    /// since confirming closes the menu. Shared by the keyboard
+    /// (`dispatch_context_menu_key`) and pointer (`apply_context_menu_route`)
+    /// confirm paths so a clicked item does exactly what Enter on it does.
+    pub(crate) fn apply_confirmed_context_menu_action(
+        &mut self,
+        action: Option<String>,
+        target: Option<(std::path::PathBuf, bool)>,
+    ) {
         if let (Some(ref act), Some((ref path, is_dir))) = (action, target) {
             let engine_rc = self.engine.clone();
             // Was the `"open_terminal"` arm of the deleted
@@ -1067,7 +1085,5 @@ impl App {
         if needs_refresh {
             self.refresh_file_tree();
         }
-        self.queue_explorer_draw();
-        self.draw_needed.set(true);
     }
 }
