@@ -308,11 +308,10 @@ impl App {
         let drag_rc = backend.drag_state_handle();
         let target = pixel_to_click_target(
             &mut engine,
-            backend,
             x,
             y,
             self.cached_line_height,
-            self.cached_char_width,
+            self.painted_char_width(),
             layout,
             &self.cached_group_tab_bar_layouts.borrow(),
             self.cached_editor_band_hits.borrow().as_ref(),
@@ -555,10 +554,9 @@ impl App {
         };
         let lh = self.cached_line_height;
         let cw = self.cached_char_width;
-        // Hit-testing must use the backend's own scrollbar-width override
-        // (GTK/macOS/Win's 14px, `None` on TUI) so it agrees with whatever
-        // width paint actually drew.
-        let v_scrollbar_w = backend.editor_v_scrollbar_width();
+        // Hit-testing must use the scrollbar width the painted editors
+        // carry (`None` on TUI) so it agrees with whatever width paint drew.
+        let v_scrollbar_w = self.units.editor_v_scrollbar_w;
         let engine = self.engine.borrow();
         let (rects, _dividers) = engine.calculate_group_window_rects(content_bounds, tab_bar_h);
         let Some((win_id, scroll_at_click)) =
@@ -1149,12 +1147,11 @@ impl App {
                             let mut drag = drag_rc.borrow_mut();
                             handle_mouse_click(
                                 &mut engine,
-                                backend,
                                 x,
                                 y,
                                 alt,
                                 self.cached_line_height,
-                                self.cached_char_width,
+                                self.painted_char_width(),
                                 layout,
                                 &self.cached_group_tab_bar_layouts.borrow(),
                                 self.cached_editor_band_hits.borrow().as_ref(),
@@ -1737,7 +1734,6 @@ impl App {
                     let drag_rc = backend.drag_state_handle();
                     handle_mouse_drag(
                         &mut engine,
-                        backend,
                         x,
                         y,
                         // Use the real painted metrics: `painted_line_height()` and

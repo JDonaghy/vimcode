@@ -8,9 +8,7 @@
 //! `quadraui::gtk`'s rasterisers into an in-memory Cairo `ImageSurface`, and
 //! a handful of smaller test modules (`gtk::click`'s
 //! `emoji_click_column_tests`, `gtk::mod`'s `chrome_paint_tests`) build their
-//! own headless `pango::Layout` directly. Production code reached from a
-//! harness click does the same — `gtk::click::build_editor_click_context`
-//! measures a probe glyph through Pango.
+//! own headless `pango::Layout` directly.
 //!
 //! Two of those running at once is not safe. libpango/libcairo hand glyph
 //! measurement and rasterisation down to a **shared, process-global**

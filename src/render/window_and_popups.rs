@@ -120,7 +120,7 @@ pub struct RenderedWindow {
     /// as an editor-area tab, naming the view. `lines`/`cursor`/every other
     /// buffer-content field is left at its `build_rendered_window`-`empty()`
     /// default when this is `Some` — the window's content is a `Form`,
-    /// painted by `App::paint_editor_windows_rung` instead of `Surface::Editor`,
+    /// painted by `App::paint_editor_windows_rung` instead of the editor widget,
     /// not buffer text.
     pub plugin_view: Option<String>,
 }
@@ -831,10 +831,6 @@ pub fn paint_editor_popups(
     }
 
     // ── Hover popup (rendered on top of editor) ──────────────────────────────
-    // TODO(#2185): every `Tooltip` in this function paints without its drop
-    // shadow on pixel backends: `Tooltip` reports no `paint_bleed`, so
-    // `draw_dyn` clips the shadow to the box. Nothing to change here once
-    // quadraui's `Tooltip::paint_bleed` covers `style.shadow_elevation`.
     if let (Some(hv), Some(anchor)) = (&screen.hover, hover) {
         let (tooltip, layout) = hover_popup_to_quadraui_tooltip(
             hv,

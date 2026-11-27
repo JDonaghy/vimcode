@@ -5781,9 +5781,13 @@ impl Engine {
             terminal_maximized: false,
             menu_bar_visible: false,
             menu_bar_toggleable: false,
-            menu_system: std::rc::Rc::new(std::cell::RefCell::new(quadraui::MenuSystem::new(
-                Vec::new(),
-            ))),
+            // A printable key in an open dropdown reaches the editor (the
+            // dropdown closes on it) rather than jumping the highlight.
+            menu_system: {
+                let mut menus = quadraui::MenuSystem::new(Vec::new());
+                menus.set_typeahead(false);
+                std::rc::Rc::new(std::cell::RefCell::new(menus))
+            },
             menu_bar_rect: std::cell::Cell::new(quadraui::Rect::default()),
             hamburger_stale_click_guard: false,
             global_status_rect: std::cell::Cell::new(quadraui::Rect::default()),

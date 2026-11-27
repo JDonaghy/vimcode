@@ -125,50 +125,14 @@ impl App {
                 self.menu_items_rect.get(),
                 backend.viewport().width,
             );
-            // An open dropdown resolves a plain printable key as type-ahead
-            // and consumes it; this host closes the dropdown on such a key
-            // and lets it reach the editor instead (the `Ignored` arm below).
-            // TODO(#2185): drop this bypass once quadraui's menu system lets
-            // a host opt out of dropdown type-ahead.
-            let plain_char_in_open_menu = menu_open
-                && matches!(
-                    event,
-                    UiEvent::KeyPressed { key: quadraui::Key::Char(_), modifiers, .. }
-                        if !modifiers.alt && !modifiers.ctrl && !modifiers.cmd
-                );
-            // With no dropdown open, the menu system claims every pointer
-            // event over `bar_rect`, the empty stretch past the last label
-            // included, where the Command Center and the window controls
-            // sit. Only a pointer over a label belongs to it here.
-            // TODO(#2177): drop this once the title bar routes through a
-            // `FrameTree` that hit-tests those widgets first.
-            let pointer_off_menu_labels = !menu_open
-                && render::pointer_position(&event).is_some_and(|p| {
-                    let bar = menu_system.borrow().menu_bar();
-                    !matches!(
-                        quadraui::DrawsPrimitives::layout_primitive(&*backend, bar_rect, &bar)
-                            .layout
-                            .hit_test(p.x, p.y),
-                        quadraui::MenuBarHit::Item(_)
-                    )
-                });
-            let menu_event = if plain_char_in_open_menu || pointer_off_menu_labels {
-                // A move off the labels still clears the closed bar's hover
-                // highlight; the move itself goes on to whatever sits under
-                // the pointer.
-                let hover_to_clear = pointer_off_menu_labels
-                    && matches!(event, UiEvent::MouseMoved { .. })
-                    && menu_system.borrow().menu_bar().focused_item.is_some();
-                if hover_to_clear
-                    && menu_system.borrow_mut().handle(&event, backend, bar_rect)
-                        != quadraui::MenuEvent::Ignored
-                {
-                    self.draw_needed.set(true);
-                }
-                quadraui::MenuEvent::Ignored
-            } else {
-                menu_system.borrow_mut().handle(&event, backend, bar_rect)
-            };
+            // With no dropdown open, a pointer past the last label is
+            // `Ignored` so the Command Center and window controls receive
+            // it; a hover leaving the labels is still cleared, and
+            // `view_changed` asks for the repaint that shows it.
+            let menu_event = menu_system.borrow_mut().handle(&event, backend, bar_rect);
+            if menu_event == quadraui::MenuEvent::Ignored && menu_system.borrow().view_changed() {
+                self.draw_needed.set(true);
+            }
             match menu_event {
                 quadraui::MenuEvent::Activated(id) => {
                     self.handle_menu_action(id.as_str().to_string());
@@ -182,8 +146,8 @@ impl App {
                 // A dropdown that was genuinely open (`menu_open`, not just the bar revealed)
                 // and a `KeyPressed` it doesn't recognise (anything but Escape/arrows/Enter/
                 // a matching Alt+<letter>, all handled above) falls all the way through to
-                // `Ignored` — `quadraui::MenuSystem::handle` has no type-ahead/dismiss-on-
-                // any-key behaviour of its own. Left alone, the dropdown stays `is_open()`
+                // `Ignored` — type-ahead is off, so `quadraui::MenuSystem::handle` reports the
+                // key unhandled and does not dismiss itself. Left alone, the dropdown stays `is_open()`
                 // and keeps painting every subsequent frame while this same event keeps
                 // flowing to the Vim/editor dispatch below and is applied there as normal —
                 // so a key sequence that happens to open a menu leaves every following
@@ -421,11 +385,10 @@ impl App {
                     let mut engine = self.engine.borrow_mut();
                     let target = pixel_to_click_target(
                         &mut engine,
-                        backend,
                         position.x as f64,
                         position.y as f64,
                         self.cached_line_height,
-                        self.cached_char_width,
+                        self.painted_char_width(),
                         layout,
                         &self.cached_group_tab_bar_layouts.borrow(),
                         self.cached_editor_band_hits.borrow().as_ref(),

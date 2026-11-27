@@ -368,6 +368,8 @@ fn minimap_press_returns_none_outside_the_strip() {
 fn fine_geometry_fixture() -> (quadraui::Rect, quadraui::Minimap, usize, usize, f32) {
     let bounds = quadraui::Rect::new(0.0, 10.0, 5.0, 20.0); // S0 = 10, Sh = 20
     let minimap = quadraui::Minimap {
+        scale: quadraui::MinimapScale::default(),
+        sizing: None,
         id: quadraui::WidgetId::new("mm"),
         lines: vec![
             quadraui::MinimapLine {

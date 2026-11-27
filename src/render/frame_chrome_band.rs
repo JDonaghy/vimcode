@@ -658,17 +658,13 @@ pub fn paint_context_menu_rung(
 
 /// The [`FrameOp::Dialog`] rung's whole body on both backends.
 ///
-/// `char_width`/`line_height` are [`dialog_generic_layout`]'s — GTK passes
-/// its measured pixel metrics, TUI passes `1.0`/`1.0` for one cell.
 pub fn paint_dialog_rung(
     b: &mut dyn quadraui::Backend,
     panel: &DialogPanel,
     viewport: quadraui::Rect,
-    char_width: f64,
-    line_height: f64,
 ) -> quadraui::DialogLayout {
-    let (dialog, layout) = dialog_generic_layout(panel, viewport, char_width, line_height);
-    crate::render::draw_dialog(b, viewport, dialog, layout)
+    let dialog = dialog_panel_to_quadraui_dialog(panel);
+    crate::render::draw_dialog(b, viewport, &dialog)
 }
 
 /// The [`FrameOp::ToastStack`] rung's whole body on both backends.

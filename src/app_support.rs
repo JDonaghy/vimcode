@@ -209,15 +209,13 @@ fn scrollbar_probe_editor(engine: &Engine, window_id: core::WindowId) -> Option<
 
 /// This window's [`quadraui::Editor`] + [`quadraui::EditorLayout`], laid
 /// out against `rect` at `char_width`/`line_height` — the same
-/// [`quadraui::Editor::layout_with_options_and_v_scrollbar_w`] call paint
-/// makes (via `backend.set_editor_v_scrollbar_width`/
-/// `backend.editor_v_scrollbar_width`), so `.h_scrollbar_bounds`/
-/// `.v_scrollbar_bounds` are never independently re-derived.
+/// layout paint resolves from the editor's `paint_options`, so
+/// `.h_scrollbar_bounds`/`.v_scrollbar_bounds` are never independently
+/// re-derived.
 ///
-/// `v_scrollbar_w` must be the same value the backend painted with.
-/// Callers with a `&dyn quadraui::Backend` in scope pass
-/// `backend.editor_v_scrollbar_width()` through unchanged. Passing `None`
-/// when the real backend has an override set would reintroduce paint↔hit-test
+/// `v_scrollbar_w` must be the same value the editor painted with:
+/// `UnitProfile::editor_v_scrollbar_w`. Passing `None`
+/// when paint used a wider strip would reintroduce paint↔hit-test
 /// divergence: quadraui defaults an unset `v_scrollbar_w` to `cell_width`
 /// (~7-9px), narrower than the 14px column paint actually draws on GTK/
 /// macOS/Win, so hit-testing would miss clicks on the outer pixels. The

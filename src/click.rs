@@ -3,9 +3,7 @@
 //! These functions touch only `quadraui::Backend`, `Engine` and pure
 //! geometry — never GTK-specific types. `src/gtk/click.rs` re-exports
 //! everything below so GTK tests and code keep resolving these names
-//! unchanged; the one function that genuinely needs GTK
-//! (`build_editor_click_context`, which builds a `pango::Context`)
-//! stays in `src/gtk/click.rs`.
+//! unchanged.
 //!
 //! Tab-bar hit-testing uses `quadraui::TabBarLayout::hit_test` — see
 //! [`GroupTabBarLayoutMap`].
@@ -89,9 +87,8 @@ pub(crate) fn tab_bar_available_cols(
 /// it uses the pixel slot positions in the `TabBarLayout` that
 /// `render::paint_tab_bars` gets back from `draw_dyn`.
 ///
-/// The text-area column is resolved via `backend.editor_col_at_x` (quadraui)
-/// — the same Pango layout + attributes `draw_editor` painted with — so
-/// paint and click never drift.
+/// The text-area column is resolved via `quadraui::EditorLayout::col_at_x`,
+/// the editor widget's own monospace column inverse.
 ///
 /// `mutate_focus` gates every side effect this function performs: flipping
 /// `active_group`/the active tab, and executing a gutter action (e.g.
@@ -102,7 +99,6 @@ pub(crate) fn tab_bar_available_cols(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn pixel_to_click_target(
     engine: &mut Engine,
-    backend: &dyn quadraui::Backend,
     x: f64,
     y: f64,
     line_height: f64,
@@ -260,21 +256,15 @@ pub(crate) fn pixel_to_click_target(
                 WindowZone::TextArea {
                     view_row, buf_line, ..
                 } => {
-                    // Resolve the exact column via the shared
-                    // quadraui text-layout inverse instead of a
-                    // separately-built, attribute-less Pango layout —
-                    // `editor_col_at_x` re-runs `xy_to_index` against the
-                    // same per-span-attributed layout `draw_editor`
-                    // painted with (or the cached last-painted clone when
-                    // called outside a frame scope), so it can't drift
-                    // from the glyphs actually drawn on screen. `x`/`y`
+                    // Resolve the column through the editor widget's own
+                    // layout inverse. `x`/`y`
                     // are absolute surface coordinates, matching
                     // `editor.rect`'s coordinate space (`rw.rect` here),
                     // so the original click `x` is passed straight
                     // through — no gutter/scroll reconstruction needed.
                     let (editor, editor_layout) =
                         render_mod::editor_text_layout(rw, char_width, line_height);
-                    let col = backend.editor_col_at_x(&editor_layout, &editor, view_row, x as f32);
+                    let col = editor_layout.col_at_x(&editor, view_row, x as f32);
                     ClickTarget::BufferPos(window_id, buf_line, col)
                 }
                 _ => ClickTarget::None,
@@ -519,7 +509,6 @@ fn execute_gutter_action(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_mouse_click(
     engine: &mut Engine,
-    backend: &dyn quadraui::Backend,
     x: f64,
     y: f64,
     alt: bool,
@@ -532,7 +521,6 @@ pub(crate) fn handle_mouse_click(
 ) -> (Option<bool>, Option<EngineAction>) {
     match pixel_to_click_target(
         engine,
-        backend,
         x,
         y,
         line_height,
@@ -603,7 +591,6 @@ pub(crate) fn handle_mouse_click(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_mouse_double_click(
     engine: &mut Engine,
-    backend: &dyn quadraui::Backend,
     x: f64,
     y: f64,
     line_height: f64,
@@ -615,7 +602,6 @@ pub(crate) fn handle_mouse_double_click(
 ) {
     if let ClickTarget::BufferPos(wid, line, col) = pixel_to_click_target(
         engine,
-        backend,
         x,
         y,
         line_height,
@@ -641,7 +627,6 @@ pub(crate) fn handle_mouse_double_click(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_mouse_drag(
     engine: &mut Engine,
-    backend: &dyn quadraui::Backend,
     x: f64,
     y: f64,
     line_height: f64,
@@ -653,7 +638,6 @@ pub(crate) fn handle_mouse_drag(
 ) {
     if let ClickTarget::BufferPos(wid, line, col) = pixel_to_click_target(
         engine,
-        backend,
         x,
         y,
         line_height,

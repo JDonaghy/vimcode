@@ -340,11 +340,9 @@ impl App {
     /// divider lines *within* each group.
     ///
     /// `window_editors` collects each window's owned `quadraui::Editor` for
-    /// the caller's click surfaces. `Surface::Editor` owns its `Editor` by
-    /// value, so the one pushed onto the frame is a clone taken immediately
-    /// before `window_editors` takes the original — same content, so clicks
-    /// hit-test against the rect that was painted rather than a second,
-    /// independently-built copy that could drift.
+    /// the caller's click surfaces: the same `Editor` that was painted, so
+    /// clicks hit-test against the rect that was painted rather than a
+    /// second, independently-built copy that could drift.
     ///
     /// TUI's twin is `render_impl::render_all_windows`, which also paints its
     /// within-group separators (`render_separators`) from the same rung.
@@ -355,7 +353,6 @@ impl App {
         lh: f64,
         window_editors: &mut Vec<quadraui::Editor>,
     ) {
-        use quadraui::{ScreenLayout as QSL, Surface};
         for rw in &screen.windows {
             let editor = render::to_q_editor(rw);
             let rect = editor.rect;
@@ -475,17 +472,21 @@ impl App {
                 continue;
             }
 
-            let mut frame = QSL::new();
-            frame.push(Surface::Editor {
-                // Narrowed by `rw.minimap_reserved_w` — see
-                // `render::tui_editor_paint_rect`'s doc for why this is safe
-                // for GTK/Win-GUI (they ignore this `rect` and paint against
-                // `editor.rect`, left untouched above) and only takes effect
-                // on TUI, which is the backend that actually consults it.
-                rect: render::tui_editor_paint_rect(rect, rw.minimap_reserved_w),
-                editor: editor.clone(),
-            });
-            frame.draw(backend);
+            // The pixel backends paint across the full pane, the minimap
+            // strip painting over its right edge; the cell grid narrows the
+            // pane by `rw.minimap_reserved_w` — see
+            // `render::tui_editor_paint_rect`'s doc.
+            let paint_options = quadraui::EditorPaintOptions {
+                v_scrollbar_w: self.units.editor_v_scrollbar_w,
+                ..editor.paint_options
+            };
+            let editor = editor.with_paint_options(paint_options);
+            let paint_rect = if self.units.is_gui_backend {
+                rect
+            } else {
+                render::tui_editor_paint_rect(rect, rw.minimap_reserved_w)
+            };
+            let _ = render::draw_widget_plain(backend, paint_rect, &editor);
             window_editors.push(editor);
 
             // Per-window status bar (when `window_status_line` is true, which
@@ -792,9 +793,8 @@ impl App {
 
                         if sc.help_open {
                             let viewport = q_sb;
-                            let (dialog, dlayout) =
-                                render::sc_help_dialog_layout(viewport, cw as f32, lh as f32);
-                            let _ = render::draw_dialog(backend, viewport, dialog, dlayout);
+                            let _ =
+                                render::draw_dialog(backend, viewport, &render::sc_help_dialog());
                         }
                     } else {
                         // Git panel is the active tab but there's no repo open
@@ -1403,7 +1403,7 @@ impl App {
         // just at startup).
         //
         // Review round 1: this override is deliberately global for the
-        // whole frame, not scoped to only the `Surface::Editor` paint call
+        // whole frame, not scoped to only the editor paint call
         // — everything downstream of it (tab bars, scrollbars, completion/
         // hover/dialog/picker popups) is anchored and hit-tested in the
         // *same* `lh` units (`App::painted_line_height`), so suspending the
@@ -1485,7 +1485,7 @@ impl App {
         // pair (minus the rendered text) so the axis-parameterised geometry helpers
         // can never resolve a hover/drag rect paint didn't actually draw.
         // That agreement also depends on both sides reading the same `v_scrollbar_w`.
-        // Paint reads it from `backend.editor_v_scrollbar_width()`, so
+        // Paint reads it from `UnitProfile::editor_v_scrollbar_w`, so
         // `editor_scrollbar_layout`'s callers must pass that same value through.
         let mut window_editors = Vec::with_capacity(screen.windows.len());
         let mut hit_bars = Vec::new();
@@ -1600,7 +1600,8 @@ impl App {
                 // `app_icon_image_for_paint` (this file) — see its doc
                 // comment for why every backend can now share the same
                 // [`crate::render::app_icon_image`] builder here.
-                let _ = backend.draw_image(app_icon_rect, &app_icon_image_for_paint());
+                let _ =
+                    render::draw_widget_plain(backend, app_icon_rect, &app_icon_image_for_paint());
             }
         }
 

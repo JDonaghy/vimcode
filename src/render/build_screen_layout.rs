@@ -111,7 +111,7 @@ pub fn build_screen_layout_with_breadcrumb_row(
     // `draw_editor` always reserves one inline column at `area.right - 1`
     // when the window overflows; a future GTK native scrollbar would do the
     // same at its own widget's right edge, per the doc comment on the
-    // `Surface::Editor` push in `app.rs`). The only way to make that edge
+    // editor paint in `app/paint.rs`). The only way to make that edge
     // land past the strip rather than immediately before it is for the rect
     // this module hands to the paint path (`RenderedWindow.rect`, below) to
     // reach the pane's *true* right edge — not a copy narrowed by the

@@ -922,9 +922,8 @@ pub struct Settings {
     /// Render VS Code-parity miniature characters in the minimap instead of
     /// density dots/blocks, on backends where quadraui's
     /// `MinimapRenderMode::Characters` is reachable. Default on, matching VS
-    /// Code. TUI's braille rasteriser has no font to scale and never overrides
-    /// `Backend::minimap_scale`/`set_minimap_scale`, so this setting is a
-    /// no-op there — see [`Settings::resolved_minimap_scale`] for how the
+    /// Code. TUI's braille rasteriser has no font to scale and ignores
+    /// `Minimap::scale`, so this setting is a no-op there — see [`Settings::resolved_minimap_scale`] for how the
     /// shared code tells GUI and TUI apart without a per-backend branch.
     #[serde(default = "default_minimap_render_characters")]
     pub minimap_render_characters: bool,
@@ -2457,9 +2456,8 @@ impl Settings {
     /// Resolve `minimap_scale`/`minimap_render_characters` to the quadraui
     /// [`quadraui::primitives::minimap::MinimapScale`] a backend should
     /// paint the minimap strip at right now. TUI's braille rasteriser has
-    /// no font to scale, so this resolves to `MinimapScale::One` — the
-    /// default that every backend that never calls `Backend::set_minimap_scale`
-    /// already paints at — unconditionally there. `minimap_scale == 1` or
+    /// no font to scale, so this resolves to `MinimapScale::One`, the
+    /// default scale, unconditionally there. `minimap_scale == 1` or
     /// `minimap_render_characters == false` also resolve to `One`; any other
     /// stored `minimap_scale` (`2`, or the accepted-but-clamped `3`) resolves
     /// to `MinimapScale::Two`.

@@ -397,13 +397,10 @@ mod win_minimap_scrollbar_1869 {
     fn minimap_probe(width_px: f64) -> MinimapProbe {
         use quadraui::Backend as _;
 
-        let mut backend = super::backend::WinBackend::new();
-        // Mirror `App::setup`'s real production wiring
-        // (`backend.set_editor_v_scrollbar_width(Some(14.0))`) rather than
-        // leaving this probe's backend at the trait's own `None` default —
-        // otherwise this probe would keep exercising a code path paint no
-        // longer takes.
-        backend.set_editor_v_scrollbar_width(Some(14.0));
+        let backend = super::backend::WinBackend::new();
+        // The scrollbar width the painted editor carries on its
+        // `paint_options`, rather than the editor's own `None` default.
+        let v_scrollbar_w = Some(14.0);
         let char_width = backend.char_width() as f64;
         let line_height = backend.line_height() as f64;
         let scrollbar_reserve = backend.scrollbar_reserve() as f64;
@@ -446,18 +443,14 @@ mod win_minimap_scrollbar_1869 {
         );
 
         let editor = render::to_q_editor(rw);
-        // Honour the override just set above, the same way
-        // `app_support::editor_scrollbar_layout` does for hit-testing and
-        // `quadraui::win::editor::draw_editor` does for paint — the bare
-        // `.layout()` call this replaced always passed `v_scrollbar_w =
-        // None`, which silently reverted to `cell_width` regardless of the
-        // backend's own override.
+        // Honour the width set above, the same way
+        // `app_support::editor_scrollbar_layout` does for hit-testing.
         let el = editor.layout_with_options_and_v_scrollbar_w(
             editor.rect,
             char_width as f32,
             line_height as f32,
             quadraui::EditorPaintOptions::default(),
-            backend.editor_v_scrollbar_width(),
+            v_scrollbar_w,
         );
 
         MinimapProbe {
@@ -536,9 +529,8 @@ mod win_minimap_scrollbar_1869 {
             .expect("a 2000-line buffer in a 900px-tall window must overflow and reserve a vertical scrollbar");
         assert_eq!(
             got, 14.0,
-            "WinBackend's `set_editor_v_scrollbar_width(Some(14.0))` override \
-             (wired by `App::setup`, #1891) must make the vertical scrollbar \
-             paint — and, via `editor_v_scrollbar_width()`, hit-test — at \
+            "a `v_scrollbar_w: Some(14.0)` paint option must make the vertical \
+             scrollbar paint and hit-test at \
              exactly VS Code's fixed 14px rather than the editor's own font- \
              sized cell width (got {got}, char_width={})",
             p.char_width

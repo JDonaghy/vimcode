@@ -19,9 +19,6 @@ impl quadraui::ShellApp for App {
         // running backend's convention (`⌘S` on macOS, `Ctrl+S` elsewhere) —
         // see `format_shortcut_for_platform`.
         self.engine.borrow_mut().platform_name = backend.services().platform_name();
-        // VS Code's editor scrollbar is 14px wide; a
-        // no-op on TUI, whose scrollbar is one cell.
-        backend.set_editor_v_scrollbar_width(Some(16.0));
         // `shell_config`'s `with_editor_font` seed covers family/size only.
         // The runner's `set_editor_font` call resets `current_line_height` to
         // this backend's natural font metric every time. Re-apply the VS Code
@@ -248,8 +245,8 @@ impl quadraui::ShellApp for App {
             cw,
             false,
             (self.units.breadcrumb_row_h)(lh),
-            backend
-                .editor_v_scrollbar_width()
+            self.units
+                .editor_v_scrollbar_w
                 .unwrap_or(0.0)
                 .max(backend.scrollbar_reserve()) as f64,
             self.units.minimap,
@@ -260,9 +257,6 @@ impl quadraui::ShellApp for App {
         let screen_ref = self.cached_screen_layout.borrow();
         let screen = screen_ref.as_ref().unwrap();
 
-        // Mouse clicks resolve editor columns via the per-glyph Pango inverse
-        // (`Backend::editor_col_at_x`), not a naive uniform-cell division — see
-        // `pixel_to_click_target`'s call site for the emoji/CJK drift it fixed.
         // Before #1104, click-time hit-testing ran against a second `GtkBackend`
         // kept in sync every frame. #1104 threaded the live `backend` through the
         // click/drag/modal-stack call chain instead. `self.backend` still exists
@@ -954,8 +948,7 @@ impl quadraui::ShellApp for App {
                 // `DialogTable` or a text input (e.g. the SSH-passphrase prompt).
                 render::FrameOp::Dialog => {
                     if let Some(panel) = screen.dialog.as_ref() {
-                        let dlayout =
-                            render::paint_dialog_rung(backend, panel, popup_viewport, cw, lh);
+                        let dlayout = render::paint_dialog_rung(backend, panel, popup_viewport);
                         *self.dialog_layout.borrow_mut() = Some(dlayout);
                         composed.push(render::FrameOp::Dialog);
                     }

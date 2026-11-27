@@ -84,9 +84,8 @@ enum GuiBackend {
 ///
 /// Every multi-backend combination here is untested and not a supported
 /// configuration — `App::render_content` still has a few `#[cfg(feature =
-/// "gui")]` blocks that reach for Pango (`click::build_editor_click_context`),
-/// and with `gui` compiled in they would run against a `MacBackend`/
-/// `WinBackend` instead.
+/// "gui")]` blocks that reach for Pango, and with `gui` compiled in they
+/// would run against a `MacBackend`/`WinBackend` instead.
 #[cfg(all(feature = "macos", target_os = "macos"))]
 const COMPILED_GUI_BACKEND: GuiBackend = GuiBackend::MacOs;
 #[cfg(all(feature = "win", target_os = "windows"))]

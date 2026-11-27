@@ -1806,6 +1806,6 @@ pub(crate) fn paint_plugin_view_image(
         return false;
     };
     let image = plugin_view_to_image(name, source, *intrinsic_size, *fit, fallback_text);
-    backend.draw_image(rect, &image);
+    let _ = crate::render::draw_widget_plain(backend, rect, &image);
     true
 }

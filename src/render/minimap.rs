@@ -265,7 +265,7 @@ fn minimap_line_content_byte_len(slice: ropey::RopeSlice) -> usize {
 
 /// The active window's minimap: a quadraui `Minimap` primitive plus the strip
 /// it occupies. Both backends consume this verbatim — `rect` goes straight to
-/// `draw_minimap`, and the returned `MinimapLayout` answers clicks.
+/// the minimap widget's paint, and the returned `MinimapLayout` answers clicks.
 #[derive(Debug, Clone)]
 pub struct RenderedMinimap {
     /// The editor window this strip belongs to.
@@ -298,10 +298,9 @@ pub struct RenderedMinimap {
     /// the recompute, never a dropped or misrouted click.
     pub resolved_layout: std::cell::RefCell<Option<quadraui::MinimapLayout>>,
     /// The [`quadraui::MinimapScale`] this strip's `lines`/`window_len`
-    /// were sized against — [`draw_minimap_strip`] pushes this onto the
-    /// backend via `Backend::set_minimap_scale` immediately before painting,
-    /// so the row pitch actually rasterised can never drift from the one
-    /// this strip's sampling math assumed.
+    /// were sized against — the same value the strip's `Minimap::scale`
+    /// carries, so the row pitch actually rasterised can never drift from
+    /// the one this strip's sampling math assumed.
     pub minimap_scale: quadraui::MinimapScale,
 }
 
@@ -383,27 +382,14 @@ pub(crate) fn scroll_gutter_width(scrollbar_reserve: f64, char_width: f64) -> f6
     scrollbar_reserve.max(char_width)
 }
 
-/// The `rect` [`crate::app::App::paint_editor_windows_rung`] hands to
-/// `Surface::Editor` for a buffer-text window, narrowed by
-/// `minimap_reserved_w` (in the caller's own unit — character cells on
-/// TUI, pixels on GTK/Win-GUI) on the right.
-///
-/// `quadraui::Editor::rect`'s own doc comment says it's "used by GTK /
-/// Win-GUI; TUI ignores" — and that asymmetry runs both ways. GTK's and
-/// Win-GUI's `Backend::draw_editor` impls discard the `rect` argument
-/// `Surface::Editor` carries (`let _ = rect;`) and paint against
-/// `editor.rect` instead; TUI's does the opposite, painting against exactly
-/// this argument (`q_rect_to_ratatui(rect)`) and never reading `editor.rect`
-/// at all. Narrowing only the value this function returns therefore reserves
-/// TUI's minimap gutter — so the strip and buffer text occupy disjoint
-/// columns instead of the strip overprinting the rightmost text — with zero
-/// effect on GTK/Win-GUI, which keep painting (and anchoring their
-/// scrollbar) against the full, unmodified `editor.rect` either way.
+/// The `rect` [`crate::app::App::paint_editor_windows_rung`] paints a
+/// buffer-text window's editor into on the cell grid, narrowed by
+/// `minimap_reserved_w` cells on the right, so the strip and buffer text
+/// occupy disjoint columns instead of the strip overprinting the rightmost
+/// text. The pixel backends paint the editor across the full pane instead.
 ///
 /// TUI's own vertical/horizontal scrollbars **are** affected, though:
-/// `quadraui::tui::editor::draw_editor` computes their bounds directly from
-/// this narrowed `area` (its own `area.x + area.width - 1`, no call to
-/// `Editor::layout` at all), so they move one column left, flush against
+/// the editor lays them out against this narrowed rect, so they move one column left, flush against
 /// the text, immediately before the strip — the TUI rasteriser has no
 /// paint-side "reserve" parameter to decouple "how much width text gets"
 /// from "where the scrollbar anchors". Click/drag geometry
@@ -434,7 +420,12 @@ pub(crate) fn tui_editor_paint_rect(
     quadraui::Rect::new(
         rect.x,
         rect.y,
-        (rect.width - minimap_reserved_w.max(0.0) as f32).max(0.0),
+        // Whole cells: the strip starts at the rounded edge, and a
+        // fractional width would clip the editor's last column (its
+        // scrollbar) out of the widget's paint rect.
+        (rect.width - minimap_reserved_w.max(0.0) as f32)
+            .round()
+            .max(0.0),
         rect.height,
     )
 }
@@ -741,6 +732,8 @@ pub fn build_minimap_data(
             visible_row_start,
             visible_row_count: visible_row_end.saturating_sub(visible_row_start).max(1),
             total_buffer_lines,
+            scale: minimap_scale,
+            sizing: None,
         },
         raw_syntax_spans,
         resolved_layout: std::cell::RefCell::new(None),
@@ -757,24 +750,26 @@ pub fn build_minimap_data(
 /// sampling, dot packing or colour aggregation exists in vimcode — only
 /// the *timing* of the one `quadraui::aggregate_spans` call.
 pub fn draw_minimap_strip(backend: &mut dyn quadraui::Backend, screen: &ScreenLayout) {
+    let cell_grid = backend.cell_surface().is_some();
     for mm in &screen.minimap {
-        // Keep the live backend's `MinimapScale` in sync with the
-        // one `build_minimap_data` already sized this strip's `lines`/
-        // `window_len` against (`mm.minimap_scale`) — a backend that never
-        // overrides `Backend::minimap_scale`/`set_minimap_scale` (TUI) no-ops
-        // here, per that trait method's own doc comment, so this stays
-        // exactly as safe to call unconditionally as every other
-        // `Backend::draw_*` call in this file.
-        backend.set_minimap_scale(mm.minimap_scale);
-        let rect = minimap_strip_rect(mm);
+        let mut rect = minimap_strip_rect(mm);
+        // On a cell grid the strip starts at its rounded edge, the column
+        // the narrowed editor (`tui_editor_paint_rect`) stops short of.
+        if cell_grid {
+            rect = quadraui::Rect::new(
+                rect.x.round(),
+                rect.y.round(),
+                rect.width.round(),
+                rect.height.round(),
+            );
+        }
         // No-paint probe: `mm.minimap.syntax_spans` is still empty
-        // here, which is fine — `minimap_layout` (both backends' own
-        // `Backend` impls) only ever reads `.lines` to resolve its
-        // scale.
-        let cols_per_cell = backend
-            .minimap_layout(rect, &mm.minimap)
-            .cols_per_cell
-            .max(1);
+        // here, which is fine — the minimap's layout only reads `.lines`
+        // (and its own `scale`) to resolve `cols_per_cell`.
+        let cols_per_cell =
+            quadraui::DrawsPrimitives::layout_primitive(&*backend, rect, &mm.minimap)
+                .cols_per_cell
+                .max(1);
         let grid = quadraui::MinimapGrid {
             rows: mm
                 .minimap
@@ -788,7 +783,7 @@ pub fn draw_minimap_strip(backend: &mut dyn quadraui::Backend, screen: &ScreenLa
         };
         let mut minimap = mm.minimap.clone();
         minimap.syntax_spans = quadraui::aggregate_spans(&mm.raw_syntax_spans, grid);
-        let layout = backend.draw_minimap(rect, &minimap).layout;
+        let layout = crate::render::draw_widget_plain(backend, rect, &minimap);
         *mm.resolved_layout.borrow_mut() = Some(layout);
     }
 }
@@ -1376,100 +1371,6 @@ pub fn dialog_panel_to_quadraui_dialog(panel: &DialogPanel) -> quadraui::Dialog 
 pub struct DialogInputPanel {
     /// Display text (masked for passwords).
     pub display: String,
-}
-
-/// Compute a backend-agnostic [`quadraui::DialogLayout`] for a `DialogPanel`
-/// from just `char_width`/`line_height` — no text-measurement backend access
-/// required. Uses a char-cell approximation formula scaled by real pixel metrics.
-///
-/// Both backends call this at render time so a dialog's clickable geometry is
-/// always derived from the exact same math the renderer used to paint it.
-pub fn dialog_generic_layout(
-    panel: &DialogPanel,
-    viewport: quadraui::Rect,
-    char_width: f64,
-    line_height: f64,
-) -> (quadraui::Dialog, quadraui::DialogLayout) {
-    let dialog = dialog_panel_to_quadraui_dialog(panel);
-
-    let body_max = panel
-        .body
-        .iter()
-        .map(|l| l.chars().count())
-        .max()
-        .unwrap_or(0);
-    let btn_max_label = panel
-        .buttons
-        .iter()
-        .map(|(lbl, _, _)| lbl.chars().count() + 4)
-        .max()
-        .unwrap_or(0);
-    let btn_row_len: usize = if panel.vertical_buttons {
-        btn_max_label + 2
-    } else {
-        panel
-            .buttons
-            .iter()
-            .map(|(lbl, _, _)| lbl.chars().count() + 4)
-            .sum::<usize>()
-            + 2
-    };
-    let content_width = body_max
-        .max(panel.title.chars().count() + 4)
-        .max(btn_row_len);
-    let min_w = 40.0 * char_width;
-    let max_w = (viewport.width as f64 - 4.0 * char_width).max(min_w);
-    let width = ((content_width as f64 + 4.0) * char_width).clamp(min_w, max_w);
-
-    let n_buttons = panel.buttons.len().max(1) as f64;
-    let inner = width - 2.0 * char_width;
-    let capped_btn_w = if panel.vertical_buttons {
-        btn_max_label as f64 * char_width
-    } else {
-        (btn_max_label as f64 * char_width).min(inner / n_buttons)
-    };
-
-    let measure = quadraui::DialogMeasure {
-        width: width as f32,
-        title_height: line_height as f32,
-        body_height: (panel.body.len() as f64 * line_height) as f32,
-        input_height: if panel.input.is_some() {
-            (2.0 * line_height) as f32
-        } else {
-            0.0
-        },
-        button_row_height: (if panel.vertical_buttons {
-            panel.buttons.len() as f64
-        } else {
-            1.0
-        } * line_height) as f32,
-        button_width: capped_btn_w as f32,
-        button_gap: 0.0,
-        padding: line_height as f32,
-        table_height: 0.0,
-    };
-    let layout = dialog.layout(viewport, measure, |_| {
-        quadraui::ToolbarItemMeasure::new(0.0)
-    });
-    // On a cell grid the painter puts the box on whole cells, so centring
-    // that leaves the box on a half cell is shifted to the cell it paints
-    // on, keeping hit regions on the painted rows and columns.
-    if char_width == 1.0 && line_height == 1.0 {
-        let dx = layout.bounds.x.round() - layout.bounds.x;
-        let dy = layout.bounds.y.round() - layout.bounds.y;
-        if dx != 0.0 || dy != 0.0 {
-            let shifted = quadraui::Rect::new(
-                viewport.x + dx,
-                viewport.y + dy,
-                viewport.width,
-                viewport.height,
-            );
-            let layout =
-                dialog.layout(shifted, measure, |_| quadraui::ToolbarItemMeasure::new(0.0));
-            return (dialog, layout);
-        }
-    }
-    (dialog, layout)
 }
 
 // Re-export hit-test types and functions from engine so backends can use `render::*`.

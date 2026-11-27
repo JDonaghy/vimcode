@@ -114,11 +114,10 @@ impl App {
                 let mut drag = drag_rc.borrow_mut();
                 if let ClickTarget::BufferPos(_, line, col) = pixel_to_click_target(
                     &mut engine,
-                    backend,
                     x,
                     y,
                     self.cached_line_height,
-                    self.cached_char_width,
+                    self.painted_char_width(),
                     layout,
                     &self.cached_group_tab_bar_layouts.borrow(),
                     self.cached_editor_band_hits.borrow().as_ref(),
@@ -230,11 +229,10 @@ impl App {
                     let drag_rc = backend.drag_state_handle();
                     handle_mouse_double_click(
                         &mut engine,
-                        backend,
                         x,
                         y,
                         self.cached_line_height,
-                        self.cached_char_width,
+                        self.painted_char_width(),
                         layout,
                         &self.cached_group_tab_bar_layouts.borrow(),
                         self.cached_editor_band_hits.borrow().as_ref(),

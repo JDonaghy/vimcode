@@ -1118,6 +1118,10 @@ pub struct UnitProfile {
     /// override so vimcode's own `ScrollSurface` hit region covers it, and
     /// clamps the `TerminalSplitDivider` drag.
     pub terminal_scrollbar_gutter: f64,
+    /// The editor's vertical scrollbar width, carried on each
+    /// `quadraui::Editor`'s `paint_options`: VS Code's wide pixel strip on
+    /// GTK/macOS/Win, `None` on TUI, whose scrollbar is always one cell.
+    pub editor_v_scrollbar_w: Option<f32>,
 }
 
 impl UnitProfile {
@@ -1147,6 +1151,7 @@ impl UnitProfile {
             explorer_row_h: |lh| (lh * 1.4).round(),
             hover_popup_pad: (4.0, 4.0),
             terminal_scrollbar_gutter: 6.0,
+            editor_v_scrollbar_w: Some(16.0),
         }
     }
 
@@ -1186,6 +1191,7 @@ impl UnitProfile {
             explorer_row_h: |lh| lh,
             hover_popup_pad: (2.0, 1.0),
             terminal_scrollbar_gutter: 1.0,
+            editor_v_scrollbar_w: None,
         }
     }
 }

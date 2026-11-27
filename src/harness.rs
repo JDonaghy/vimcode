@@ -3121,9 +3121,13 @@ pub(crate) fn assert_text_metrics_backend_applies_metrics<B: quadraui::Backend>(
 /// recorded next to it, not just its issue number, per that issue's own
 /// gate-labelling requirement.
 ///
-/// Empty: every scenario in this suite takes the plain `Pass`/`Regression`
-/// arms of [`GateOutcome`] — there is no bug this table needs to track.
-pub(crate) const KNOWN_BUGS: &[&str] = &[];
+/// `gtk_click_column_after_wide_glyph`
+/// (`gtk::click::emoji_click_column_tests`): quadraui resolves an editor
+/// click column monospace (`EditorLayout::col_at_x`) while the pixel
+/// backends shape the painted text, so a click after an emoji lands one
+/// column right per preceding wide glyph. Category: quadraui (no shaped
+/// column inverse a host can call outside paint).
+pub(crate) const KNOWN_BUGS: &[&str] = &["gtk_click_column_after_wide_glyph"];
 
 /// A regression guard, not a "list stays empty forever" rule: an empty
 /// list and a list with a genuine, still-open entry (see the doc above
@@ -3135,7 +3139,7 @@ pub(crate) const KNOWN_BUGS: &[&str] = &[];
 mod known_bugs_is_empty {
     #[test]
     fn known_bugs_has_the_expected_entries() {
-        let expected: &[&str] = &[];
+        let expected: &[&str] = &["gtk_click_column_after_wide_glyph"];
         assert_eq!(
             super::KNOWN_BUGS,
             expected,

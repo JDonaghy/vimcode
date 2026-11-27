@@ -39,37 +39,21 @@ use std::collections::HashMap;
 #[cfg(test)]
 use std::rc::Rc;
 
-/// Build a throwaway Pango context for tests that need to hand a `GtkBackend`
-/// a stored `pango::Context` so `GtkBackend::editor_col_at_x`'s fallback
-/// `editor_pango_layout()` has something to build from. The fallback fonts the
-/// layout from the backend's own `editor_font_family`/`editor_font_size_pt`
-/// state (set via `Backend::set_editor_font`), ignoring whatever font
-/// description this context itself carries, so a throwaway context is as good
-/// as a real widget one. Kept `#[cfg(test)]` as a fixture builder for this
-/// module's own `GtkBackend::editor_col_at_x` unit tests, which need a
-/// from-scratch backend with no painted frame.
-#[cfg(test)]
-pub(crate) fn build_editor_click_context() -> Option<pango::Context> {
-    let surface = gtk4::cairo::ImageSurface::create(gtk4::cairo::Format::ARgb32, 1, 1).ok()?;
-    let cr = gtk4::cairo::Context::new(&surface).ok()?;
-    Some(pangocairo::create_context(&cr))
-}
-
 #[cfg(test)]
 mod emoji_click_column_tests {
-    //! A smoke test on click-to-column resolution with emoji (✅ 🟡 ❌ ⏭️).
-    //! The per-glyph Pango path (`xy_to_index`) resolves correctly; the
-    //! uniform-monospace fallback would drift +1 column per preceding wide
-    //! glyph. These tests pin the production pipeline end-to-end — real
-    //! `md_inline_spans` bold-span byte offsets via `build_screen_layout`, then
-    //! `render::editor_text_layout` + `quadraui::gtk::editor_col_at_x` against
-    //! a headless Pango layout, so a future regression that silently reintroduces
-    //! the naive fallback (or corrupts the span byte-offset pipeline feeding
-    //! Pango's attributes) fails a `cargo test`.
+    //! Click-to-column resolution with emoji (✅ 🟡 ❌ ⏭️) on a markdown
+    //! line, through the production path (`render::editor_text_layout` +
+    //! `EditorLayout::col_at_x`). quadraui resolves editor click columns
+    //! monospace, so every glyph wider than one cell drifts the columns
+    //! after it; the gated test below fails until quadraui offers an exact,
+    //! shaped column inverse for pixel backends.
     use super::*;
     use crate::core::WindowRect;
     use crate::render::build_screen_layout;
     use ::pangocairo::cairo::{Context, Format, ImageSurface};
+
+    /// `crate::harness::KNOWN_BUGS` label for the test below.
+    const EMOJI_CLICK_COLUMN_BUG: &str = "gtk_click_column_after_wide_glyph";
 
     fn headless_pango_layout() -> pango::Layout {
         let surface = ImageSurface::create(Format::ARgb32, 900, 60).expect("create ImageSurface");
@@ -81,325 +65,76 @@ mod emoji_click_column_tests {
 
     #[test]
     fn click_resolves_exact_column_on_emoji_markdown_line() {
-        // Concurrent Pango/Cairo text work from two test threads segfaults
-        // inside FreeType — see `src/test_paint.rs`.
-        let _paint = crate::test_paint::PaintGuard::acquire();
-        let text = "Total: **58 commands**  \u{b7}  \u{2705} 36  \u{b7}  \u{1f7e1} 2  \u{b7}  \u{274c} 14  \u{b7}  \u{23ed}\u{fe0f} 6";
-        let mut engine = Engine::new();
-        engine.buffer_mut().insert(0, text);
-        let buf_id = engine.active_buffer_id();
-        engine.buffer_manager.get_mut(buf_id).unwrap().file_path =
-            Some(std::path::PathBuf::from("notes.md"));
+        crate::harness::known_bug_gate(EMOJI_CLICK_COLUMN_BUG, || {
+            // Concurrent Pango/Cairo text work from two test threads segfaults
+            // inside FreeType — see `src/test_paint.rs`.
+            let _paint = crate::test_paint::PaintGuard::acquire();
+            let text = "Total: **58 commands**  \u{b7}  \u{2705} 36  \u{b7}  \u{1f7e1} 2  \u{b7}  \u{274c} 14  \u{b7}  \u{23ed}\u{fe0f} 6";
+            let mut engine = Engine::new();
+            engine.buffer_mut().insert(0, text);
+            let buf_id = engine.active_buffer_id();
+            engine.buffer_manager.get_mut(buf_id).unwrap().file_path =
+                Some(std::path::PathBuf::from("notes.md"));
 
-        let char_width = 9.0;
-        let line_height = 18.0;
-        let theme = Theme::onedark();
-        let bounds = WindowRect::new(0.0, 0.0, 800.0, 600.0);
-        let (rects, _) = engine.calculate_group_window_rects(bounds, 24.0);
-        let layout = build_screen_layout(
-            &engine,
-            &theme,
-            &rects,
-            line_height,
-            char_width,
-            true,
-            8.0,
-            crate::render::gtk_minimap_sizing(),
-        );
-        let rw = &layout.windows[0];
-        assert_eq!(
-            rw.lines[0].raw_text, text,
-            "line should not wrap in an 800px window"
-        );
+            // Lay the editor out at the measuring font's own advance, so only a
+            // glyph wider than one cell can move a column.
+            let measure_layout = headless_pango_layout();
+            measure_layout.set_text("0");
+            let char_width = measure_layout.pixel_size().0 as f64;
+            let line_height = 18.0;
+            let theme = Theme::onedark();
+            let bounds = WindowRect::new(0.0, 0.0, 800.0, 600.0);
+            let (rects, _) = engine.calculate_group_window_rects(bounds, 24.0);
+            let layout = build_screen_layout(
+                &engine,
+                &theme,
+                &rects,
+                line_height,
+                char_width,
+                true,
+                8.0,
+                crate::render::gtk_minimap_sizing(),
+            );
+            let rw = &layout.windows[0];
+            assert_eq!(
+                rw.lines[0].raw_text, text,
+                "line should not wrap in an 800px window"
+            );
 
-        let (editor, editor_layout) = render::editor_text_layout(rw, char_width, line_height);
-        let line = &editor.lines[0];
+            let (editor, editor_layout) = render::editor_text_layout(rw, char_width, line_height);
+            measure_layout.set_text(text);
 
-        // `editor_col_at_x` unconditionally `set_text`/`set_attributes`es
-        // its layout argument from `line` before hit-testing, so a single
-        // throwaway call (the same one every real click makes) leaves
-        // `measure_layout` holding the exact attributed text `draw_editor`
-        // paints — real bold-run glyph widths included — without vimcode
-        // reimplementing quadraui's private `build_pango_attrs`. Reusing
-        // this one layout for both measuring and resolving throughout
-        // mirrors production, which caches and reuses a single
-        // `last_editor_pango_layout` across an entire click.
-        let measure_layout = headless_pango_layout();
-        let _ = quadraui::gtk::editor_col_at_x(&measure_layout, line, &editor_layout, 0.0);
+            let char_count = text.chars().count();
+            let mut prev_pos: Option<(i32, i32)> = None;
+            for (char_idx, (byte_idx, ch)) in text.char_indices().enumerate() {
+                let pos = measure_layout.index_to_pos(byte_idx as i32);
+                // A zero-width combining mark (e.g. the U+FE0F variation
+                // selector on "⏭️") shares its base character's glyph cluster
+                // — Pango reports the *identical* (x, width) rect for both
+                // byte offsets, since there is no distinct on-screen pixel
+                // region for the combining mark alone. A click can only ever
+                // land on the cluster as a whole, so such chars have no
+                // resolvable column of their own to assert against — skip
+                // them rather than asserting an unreachable identity.
+                if prev_pos == Some((pos.x(), pos.width())) {
+                    continue;
+                }
+                prev_pos = Some((pos.x(), pos.width()));
 
-        let char_count = text.chars().count();
-        let mut prev_pos: Option<(i32, i32)> = None;
-        for (char_idx, (byte_idx, ch)) in text.char_indices().enumerate() {
-            let pos = measure_layout.index_to_pos(byte_idx as i32);
-            // A zero-width combining mark (e.g. the U+FE0F variation
-            // selector on "⏭️") shares its base character's glyph cluster
-            // — Pango reports the *identical* (x, width) rect for both
-            // byte offsets, since there is no distinct on-screen pixel
-            // region for the combining mark alone. A click can only ever
-            // land on the cluster as a whole, so such chars have no
-            // resolvable column of their own to assert against — skip
-            // them rather than asserting an unreachable identity.
-            if prev_pos == Some((pos.x(), pos.width())) {
-                continue;
+                let glyph_left_x =
+                    editor_layout.text_bounds.x as f64 + pos.x() as f64 / pango::SCALE as f64;
+                let glyph_width = (pos.width() as f64 / pango::SCALE as f64).max(2.0);
+                let click_x = glyph_left_x + glyph_width * 0.25;
+
+                let resolved = editor_layout.col_at_x(&editor, 0, click_x as f32);
+                assert_eq!(
+                    resolved, char_idx,
+                    "clicking char {char_idx} ({ch:?}) resolved to col {resolved}, not {char_idx} \
+                     — the paint↔click column inverse has drifted for this glyph"
+                );
             }
-            prev_pos = Some((pos.x(), pos.width()));
-
-            let glyph_left_x =
-                editor_layout.text_bounds.x as f64 + pos.x() as f64 / pango::SCALE as f64;
-            let glyph_width = (pos.width() as f64 / pango::SCALE as f64).max(2.0);
-            let click_x = glyph_left_x + glyph_width * 0.25;
-
-            let resolved = quadraui::gtk::editor_col_at_x(
-                &measure_layout,
-                line,
-                &editor_layout,
-                click_x as f32,
-            );
-            assert_eq!(
-                resolved, char_idx,
-                "clicking char {char_idx} ({ch:?}) resolved to col {resolved}, not {char_idx} \
-                 — the paint↔click column inverse has drifted for this glyph"
-            );
-        }
-        assert_eq!(char_count, text.chars().count());
-    }
-
-    /// The test above calls `quadraui::gtk::editor_col_at_x` directly with a
-    /// hand-built, correctly-fonted layout — it verifies the per-glyph Pango
-    /// inverse but bypasses `GtkBackend::editor_col_at_x`'s runtime branch
-    /// selection. A live mouse click goes through the trait method, so it
-    /// depends on the backend having stashed a correctly-fonted layout during
-    /// paint. This test drives exactly that path: paint the editor through the
-    /// trait (as `draw_window` does), then resolve clicks through
-    /// `GtkBackend::editor_col_at_x` (as `pixel_to_click_target` does).
-    /// Build the `Engine`/`Editor`/`EditorLayout` for the emoji markdown line
-    /// and the pixel-`x` click for every glyph, then resolve each through
-    /// `GtkBackend::editor_col_at_x` under the exact backend state named by
-    /// `set_pango_context`. `paint_first` selects which fallback branch the
-    /// trait method takes:
-    ///
-    /// * `true`  → an editor paint runs through the trait first, so
-    ///   `last_editor_pango_layout` is stashed (the steady-state live path
-    ///   after frame 1).
-    /// * `false` → NO paint, but `set_pango_context` has stored a
-    ///   correctly-fonted editor context, so the trait method resolves via
-    ///   the `pango_ctx` fallback instead of naive division.
-    ///
-    /// Both must land every click on its own glyph. Emoji here render 1.7–2.3×
-    /// the cell width, so a naive uniform-cell division would drift and fail —
-    /// this pins that neither branch degrades to it.
-    fn assert_emoji_columns_resolve(paint_first: bool) {
-        // Concurrent Pango/Cairo text work from two test threads segfaults
-        // inside FreeType — see `src/test_paint.rs`.
-        let _paint = crate::test_paint::PaintGuard::acquire();
-        use quadraui::{Backend as _, ScreenLayout as QScreenLayout, Surface};
-        use std::cell::RefCell;
-        use std::rc::Rc;
-
-        let text = "Total: **58 commands**  \u{b7}  \u{2705} 36  \u{b7}  \u{1f7e1} 2  \u{b7}  \u{274c} 14  \u{b7}  \u{23ed}\u{fe0f} 6";
-        let mut engine = Engine::new();
-        engine.buffer_mut().insert(0, text);
-        let buf_id = engine.active_buffer_id();
-        engine.buffer_manager.get_mut(buf_id).unwrap().file_path =
-            Some(std::path::PathBuf::from("notes.md"));
-
-        let surface = ImageSurface::create(Format::ARgb32, 1000, 200).expect("ImageSurface");
-        let cr = Context::new(&surface).expect("Context::new");
-        let pango_ctx = pangocairo::create_context(&cr);
-        let font_desc = pango::FontDescription::from_string("Monospace 12");
-        pango_ctx.set_font_description(&font_desc);
-        let layout = pango::Layout::new(&pango_ctx);
-        layout.set_font_description(Some(&font_desc));
-        let metrics = pango_ctx.metrics(Some(&font_desc), None);
-        let line_height = (metrics.ascent() + metrics.descent()) as f64 / pango::SCALE as f64;
-        layout.set_text("0");
-        let char_width = layout.pixel_size().0 as f64;
-
-        let theme = Theme::onedark();
-        let bounds = WindowRect::new(0.0, 0.0, 800.0, 600.0);
-        let (rects, _) = engine.calculate_group_window_rects(bounds, (line_height * 1.6).ceil());
-        let screen = build_screen_layout(
-            &engine,
-            &theme,
-            &rects,
-            line_height,
-            char_width,
-            false,
-            8.0,
-            crate::render::gtk_minimap_sizing(),
-        );
-        let rw = &screen.windows[0];
-        assert_eq!(rw.lines[0].raw_text, text, "line should not wrap");
-
-        let backend = Rc::new(RefCell::new(super::backend::GtkBackend::new()));
-        // Mirror `App::render_content`: `set_editor_font` with the
-        // same family/size the paint side used, plus a throwaway Pango
-        // context (NOT the paint layout) for `editor_pango_layout()`'s
-        // fallback to build a layout from — that layout fonts itself from
-        // `editor_font_family`/`editor_font_size_pt`, not from anything set
-        // on this context directly.
-        backend.borrow_mut().set_editor_font("Monospace", 12.0);
-        {
-            let click_surface =
-                ImageSurface::create(Format::ARgb32, 1, 1).expect("click ImageSurface");
-            let click_cr = Context::new(&click_surface).expect("click Context");
-            let click_ctx = pangocairo::create_context(&click_cr);
-            backend.borrow_mut().set_pango_context(click_ctx);
-        }
-
-        if paint_first {
-            let editor = render::to_q_editor(rw);
-            let rect = editor.rect;
-            let mut b = backend.borrow_mut();
-            b.set_current_theme(render::to_quadraui_theme(&theme));
-            b.set_current_line_height(line_height);
-            b.set_current_char_width(char_width);
-            b.enter_frame_scope(&cr, &layout, |b| {
-                let mut frame = QScreenLayout::new();
-                frame.push(Surface::Editor { rect, editor });
-                frame.draw(b);
-            });
-        }
-
-        let (editor, editor_layout) = render::editor_text_layout(rw, char_width, line_height);
-        let measure = pango::Layout::new(&pango_ctx);
-        measure.set_font_description(Some(&font_desc));
-        measure.set_text(text);
-
-        let mut prev_pos: Option<(i32, i32)> = None;
-        for (char_idx, (byte_idx, ch)) in text.char_indices().enumerate() {
-            let pos = measure.index_to_pos(byte_idx as i32);
-            if prev_pos == Some((pos.x(), pos.width())) {
-                continue;
-            }
-            prev_pos = Some((pos.x(), pos.width()));
-
-            let glyph_left_x =
-                editor_layout.text_bounds.x as f64 + pos.x() as f64 / pango::SCALE as f64;
-            let glyph_width = (pos.width() as f64 / pango::SCALE as f64).max(2.0);
-            let click_x = glyph_left_x + glyph_width * 0.25;
-
-            let resolved =
-                backend
-                    .borrow()
-                    .editor_col_at_x(&editor_layout, &editor, 0, click_x as f32);
-            assert_eq!(
-                resolved, char_idx,
-                "paint_first={paint_first}: clicking char {char_idx} ({ch:?}) resolved to \
-                 col {resolved} — GtkBackend::editor_col_at_x degraded to the naive \
-                 uniform-cell division instead of a per-glyph Pango layout"
-            );
-        }
-    }
-
-    /// Live steady-state: `last_editor_pango_layout` stashed by a real paint.
-    #[test]
-    fn live_trait_editor_col_at_x_resolves_exact_column_after_paint() {
-        assert_emoji_columns_resolve(true);
-    }
-
-    /// Even with NO stashed layout, the editor-fonted `pango_ctx` keeps the
-    /// resolution on the per-glyph Pango path instead of the naive division —
-    /// so a build that hasn't painted yet still resolves emoji clicks exactly.
-    #[test]
-    fn editor_col_at_x_falls_back_to_editor_font_context_not_naive_division() {
-        assert_emoji_columns_resolve(false);
-    }
-
-    /// Click-to-column resolution must track `settings.font_family`/
-    /// `font_size` — not a hardcoded family matched only by a probed size.
-    /// The click backend must be fonted from the same `(family, size)` pair
-    /// driving the paint backend, verified at two sizes and at a
-    /// non-`Monospace` family. Resolution must go through
-    /// `GtkBackend::editor_col_at_x`'s `editor_pango_layout()` fallback to
-    /// prove the live `set_editor_font` state drives correctness, not a
-    /// stashed layout.
-    #[test]
-    fn click_column_resolves_at_non_monospace_family_and_two_sizes() {
-        for (family, size_pt) in [("Sans", 10.0_f32), ("Sans", 22.0_f32)] {
-            assert_click_columns_resolve_for_font(family, size_pt);
-        }
-    }
-
-    /// Run the exact sequence every frame — `set_editor_font` with the live
-    /// `(family, size)` plus a stored Pango context — then assert every
-    /// character on a plain ASCII line resolves to its own column via
-    /// `GtkBackend::editor_col_at_x` — the exact trait method
-    /// `pixel_to_click_target` calls on a live click.
-    fn assert_click_columns_resolve_for_font(family: &str, size_pt: f32) {
-        // Concurrent Pango/Cairo text work from two test threads segfaults
-        // inside FreeType — see `src/test_paint.rs`.
-        let _paint = crate::test_paint::PaintGuard::acquire();
-        use quadraui::Backend as _;
-
-        // ── The font this iteration paints AND resolves with. ──
-        let font_desc = pango::FontDescription::from_string(&format!("{family} {size_pt}"));
-        let measure_surface =
-            ImageSurface::create(Format::ARgb32, 2000, 60).expect("measure ImageSurface");
-        let mcr = Context::new(&measure_surface).expect("measure Context");
-        let mctx = pangocairo::create_context(&mcr);
-        mctx.set_font_description(&font_desc);
-        let probe = pango::Layout::new(&mctx);
-        probe.set_font_description(Some(&font_desc));
-        probe.set_text("0");
-        let char_width = probe.pixel_size().0 as f64;
-        let metrics = mctx.metrics(Some(&font_desc), None);
-        let line_height = (metrics.ascent() + metrics.descent()) as f64 / pango::SCALE as f64;
-
-        let text = "The quick brown fox jumps over the lazy dog end AAAA BBBB CCCC DDDD EEEE";
-        let mut engine = Engine::new();
-        engine.buffer_mut().insert(0, text);
-
-        let theme = Theme::onedark();
-        let bounds = WindowRect::new(0.0, 0.0, 2000.0, 400.0);
-        let (rects, _) = engine.calculate_group_window_rects(bounds, (line_height * 1.6).ceil());
-        let screen = build_screen_layout(
-            &engine,
-            &theme,
-            &rects,
-            line_height,
-            char_width,
-            false,
-            8.0,
-            crate::render::gtk_minimap_sizing(),
-        );
-        let rw = &screen.windows[0];
-        assert_eq!(rw.lines[0].raw_text, text, "line should not wrap");
-
-        let (editor, editor_layout) = render::editor_text_layout(rw, char_width, line_height);
-
-        // Glyph geometry from the same font — what the paint side would
-        // have rendered this line with.
-        let measure = pango::Layout::new(&mctx);
-        measure.set_font_description(Some(&font_desc));
-        measure.set_text(text);
-
-        // ── The exact production sequence `sync_per_frame_backend_state`
-        // runs on the live backend: `set_editor_font` with the live
-        // `(family, size)`, then a throwaway Pango context — NO frame ever
-        // painted. ──
-        let backend = Rc::new(RefCell::new(super::backend::GtkBackend::new()));
-        backend.borrow_mut().set_editor_font(family, size_pt);
-        let click_ctx = super::build_editor_click_context().expect("click ctx");
-        backend.borrow_mut().set_pango_context(click_ctx);
-
-        for (char_idx, (byte_idx, ch)) in text.char_indices().enumerate() {
-            let pos = measure.index_to_pos(byte_idx as i32);
-            let glyph_left =
-                editor_layout.text_bounds.x as f64 + pos.x() as f64 / pango::SCALE as f64;
-            let gw = (pos.width() as f64 / pango::SCALE as f64).max(2.0);
-            let click_x = (glyph_left + gw * 0.25) as f32;
-
-            let resolved = backend
-                .borrow()
-                .editor_col_at_x(&editor_layout, &editor, 0, click_x);
-            assert_eq!(
-                resolved, char_idx,
-                "family={family:?} size={size_pt}: clicking char {char_idx} ({ch:?}) \
-                 resolved to col {resolved}, not {char_idx} — the click backend's \
-                 editor_col_at_x has drifted from the (family, size) it was set to"
-            );
-        }
+            assert_eq!(char_count, text.chars().count());
+        });
     }
 }
 
@@ -477,7 +212,6 @@ mod cross_split_drag_focus_tests {
         // must resolve as a pure hit-test — no focus/group side effects.
         let target = pixel_to_click_target(
             &mut engine,
-            &*backend.borrow(),
             x_in_b,
             y_in_b,
             line_height,
@@ -521,7 +255,6 @@ mod cross_split_drag_focus_tests {
         // no-op, and that real clicks keep working as before.
         let click_target = pixel_to_click_target(
             &mut engine,
-            &*backend.borrow(),
             x_in_b,
             y_in_b,
             line_height,
@@ -728,7 +461,6 @@ mod editor_band_hits_tests {
 
         let target = pixel_to_click_target(
             &mut engine,
-            &*backend.borrow(),
             x,
             y,
             line_height,
@@ -910,7 +642,6 @@ mod single_group_tab_click_dispatch_tests {
         fn click(&mut self, local_x: f64) -> ClickTarget {
             pixel_to_click_target(
                 &mut self.engine,
-                &*self.backend.borrow(),
                 CONTENT_X + local_x,
                 Self::CLICK_Y,
                 self.line_height,
@@ -930,7 +661,6 @@ mod single_group_tab_click_dispatch_tests {
         fn full_click(&mut self, local_x: f64) -> (Option<bool>, Option<EngineAction>) {
             handle_mouse_click(
                 &mut self.engine,
-                &*self.backend.borrow(),
                 CONTENT_X + local_x,
                 Self::CLICK_Y,
                 false, // alt

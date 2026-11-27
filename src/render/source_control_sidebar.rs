@@ -595,49 +595,6 @@ pub fn sc_help_dialog() -> quadraui::Dialog {
     }
 }
 
-/// Compute the `DialogLayout` for [`sc_help_dialog`] from generic
-/// char-cell/pixel metrics (TUI: `1.0, 1.0`; GTK: real `char_width`/
-/// `line_height`). Mirrors `dialog_generic_layout`'s char-cell approximation
-/// formula, but sized from the table's own `tui_total_width`/`tui_total_height`
-/// helpers since this dialog has no body text driving its width.
-pub fn sc_help_dialog_layout(
-    viewport: quadraui::Rect,
-    char_width: f32,
-    line_height: f32,
-) -> (quadraui::Dialog, quadraui::DialogLayout) {
-    let dialog = sc_help_dialog();
-    let table = dialog
-        .table
-        .as_ref()
-        .expect("sc_help_dialog always sets `table`");
-
-    let table_h = table.tui_total_height() as f32 * line_height;
-    let table_w = table.tui_total_width() as f32 * char_width + char_width * 2.0;
-
-    let min_w = char_width * 30.0;
-    let max_w = char_width * 60.0;
-    let default_w = (viewport.width * 0.5).clamp(min_w, max_w);
-    let width = default_w
-        .max(table_w)
-        .min(viewport.width - char_width * 4.0);
-
-    let measure = quadraui::DialogMeasure {
-        width,
-        title_height: line_height,
-        body_height: 0.0,
-        table_height: table_h,
-        input_height: 0.0,
-        button_row_height: line_height,
-        button_width: char_width * 8.0,
-        button_gap: char_width * 2.0,
-        padding: line_height,
-    };
-    let layout = dialog.layout(viewport, measure, |_| {
-        quadraui::ToolbarItemMeasure::new(0.0)
-    });
-    (dialog, layout)
-}
-
 /// Build the `(Tooltip, TooltipLayout, TooltipChrome)` for a plugin
 /// ext-panel's own `?`-triggered keybindings help popup with a full border
 /// and embedded title.
@@ -645,8 +602,8 @@ pub fn sc_help_dialog_layout(
 /// `panel_name` namespaces the tooltip's `WidgetId` so two different
 /// plugin panels' help popups don't collide; `bindings` is the plugin-registered
 /// `(key, description)` list (`Engine::ext_panel_help_bindings`).
-/// `char_width`/`line_height` follow the same generic char-cell/pixel
-/// convention [`sc_help_dialog_layout`] uses (TUI: `1.0, 1.0`; GTK: real metrics).
+/// `char_width`/`line_height` follow the generic char-cell/pixel
+/// convention (TUI: `1.0, 1.0`; GTK: real metrics).
 pub fn ext_panel_help_tooltip_layout(
     panel_name: &str,
     bindings: &[(String, String)],
