@@ -2864,18 +2864,68 @@ impl Engine {
     /// Show a confirmation dialog before deleting a file/folder.
     ///
     /// Stores the pending delete path and displays a Yes/No dialog.  The actual
-    /// deletion happens when the user confirms via the dialog.
+    /// deletion happens when the user confirms via the dialog
+    /// (`Engine::process_dialog_action`'s `"confirm_delete"` arm), which
+    /// moves the path to the platform trash and closes every buffer open
+    /// under it.
+    ///
+    /// For a folder, the dialog body also lists every buffer open under
+    /// `path` that would be closed, flagging the dirty ones — so a folder
+    /// delete can never silently orphan an unsaved buffer. Confirming here
+    /// is still a single Delete/Cancel choice (no separate "are you sure
+    /// about the unsaved changes" step): the listing itself is the warning.
     pub fn confirm_delete_file(&mut self, path: &Path) {
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| path.to_string_lossy().to_string());
-        let item_type = if path.is_dir() { "folder" } else { "file" };
+        let is_dir = path.is_dir();
+        let item_type = if is_dir { "folder" } else { "file" };
         self.pending_delete = Some(path.to_path_buf());
+        let mut body = vec![format!("Delete {} '{}'?", item_type, name)];
+        if is_dir {
+            let affected: Vec<(String, bool)> = self
+                .buffer_manager
+                .list()
+                .into_iter()
+                .filter_map(|id| {
+                    let state = self.buffer_manager.get(id)?;
+                    let p = state.file_path.as_ref()?;
+                    if !p.starts_with(path) {
+                        return None;
+                    }
+                    let fname = p
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| p.to_string_lossy().to_string());
+                    Some((fname, state.dirty))
+                })
+                .collect();
+            if !affected.is_empty() {
+                let dirty_count = affected.iter().filter(|(_, dirty)| *dirty).count();
+                body.push(format!(
+                    "{} open buffer{} under this folder will be closed{}:",
+                    affected.len(),
+                    if affected.len() == 1 { "" } else { "s" },
+                    if dirty_count > 0 {
+                        format!(" ({} with unsaved changes)", dirty_count)
+                    } else {
+                        String::new()
+                    }
+                ));
+                for (fname, dirty) in &affected {
+                    body.push(if *dirty {
+                        format!("  {} (modified)", fname)
+                    } else {
+                        format!("  {}", fname)
+                    });
+                }
+            }
+        }
         self.show_dialog(
             "confirm_delete",
             "Confirm Delete",
-            vec![format!("Delete {} '{}'?", item_type, name)],
+            body,
             vec![
                 DialogButton {
                     label: "Delete".into(),

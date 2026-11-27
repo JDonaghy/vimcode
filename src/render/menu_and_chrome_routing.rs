@@ -683,6 +683,22 @@ pub fn run_pending_platform_action(
         PendingPlatformAction::PluginDialog(req) => {
             run_pending_plugin_dialog(engine, req, backend);
         }
+        PendingPlatformAction::MoveToTrash { path, is_dir } => {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.to_string_lossy().to_string());
+            let item_type = if is_dir { "folder" } else { "file" };
+            match backend.services().move_to_trash(&path) {
+                Ok(()) => {
+                    engine.message = format!("Moved {} to trash: '{}'", item_type, name);
+                }
+                Err(e) => {
+                    engine.message = format!("Could not move {} to trash: {e:?}", item_type);
+                }
+            }
+            engine.explorer_needs_refresh = true;
+        }
     }
 }
 

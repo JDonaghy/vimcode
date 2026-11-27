@@ -8503,6 +8503,104 @@ mod tests {
             );
         }
 
+        /// Confirming "Delete" on a folder with a dirty buffer open
+        /// underneath it must warn about the unsaved buffer in the
+        /// confirm dialog, then — once confirmed — close that buffer and
+        /// queue the folder for the trash rather than hard-deleting it
+        /// with the buffer left open and pointing at a vanished path.
+        ///
+        /// **Verified RED against unfixed `develop`:** before this fix,
+        /// the confirm dialog never mentioned the open buffer, confirming
+        /// called `std::fs::remove_dir_all` inline (so `dir.exists()`
+        /// below would be `false` instead of `true`), and the dirty
+        /// buffer was left open on a path whose file had just vanished.
+        #[test]
+        fn context_menu_delete_on_folder_with_dirty_buffer_warns_then_closes_it() {
+            let dir = std::env::temp_dir().join(format!(
+                "vimcode_test_2207_delete_dirty_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let inner = dir.join("note.txt");
+            std::fs::write(&inner, "hello\n").unwrap();
+
+            let mut engine = plain_engine();
+            engine.cwd = dir.clone();
+            engine.explorer_rebuild_rows();
+            engine.session.explorer_visible = true;
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_EXPLORER,
+            ));
+
+            engine.open_file_in_tab(&inner);
+            let buffer_id = engine.active_buffer_id();
+            engine.buffer_manager.get_mut(buffer_id).unwrap().dirty = true;
+
+            // Same fixed folder-menu order as `engine_with_folder_ctx_menu`
+            // above (index 8 == Delete).
+            engine.open_explorer_context_menu(dir.clone(), true, 5, 5);
+            engine.context_menu.as_mut().unwrap().selected = 8;
+
+            let mut h = harness(engine);
+            let driver = &mut h.driver;
+
+            assert!(
+                !driver.screen_has("Confirm Delete"),
+                "precondition: no dialog is open yet"
+            );
+            driver.press_named(quadraui::NamedKey::Enter);
+            assert!(
+                driver.screen_has("Confirm Delete"),
+                "confirming 'Delete' must open the delete-confirmation \
+                 dialog; screen:\n{}",
+                driver.screen()
+            );
+            assert!(
+                driver.screen_has("note.txt") && driver.screen_has("modified"),
+                "the confirm dialog must flag the dirty buffer under this \
+                 folder; screen:\n{}",
+                driver.screen()
+            );
+
+            // Confirm the dialog itself (default button == "Delete").
+            driver.press_named(quadraui::NamedKey::Enter);
+            assert!(
+                !driver.screen_has("Confirm Delete"),
+                "confirming the delete dialog must close it; screen:\n{}",
+                driver.screen()
+            );
+            assert!(
+                dir.exists(),
+                "the folder must still exist on disk right after \
+                 confirming — the move happens via a queued \
+                 MoveToTrash action on the next tick, not inline"
+            );
+            assert!(
+                h.engine
+                    .borrow()
+                    .buffer_manager
+                    .find_by_path(&inner.to_string_lossy())
+                    .is_none(),
+                "the dirty buffer under the deleted folder must be closed \
+                 once the delete is confirmed, not left pointing at a \
+                 path about to be trashed"
+            );
+            let actions = h.engine.borrow().pending_platform_actions.clone();
+            assert!(
+                actions.iter().any(|a| matches!(
+                    a,
+                    crate::core::engine::PendingPlatformAction::MoveToTrash { path, is_dir }
+                        if path == &dir && *is_dir
+                )),
+                "confirming must queue a MoveToTrash action for the \
+                 folder; got {actions:?}"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
         /// `App::dispatch_context_menu_key` is the exact code path
         /// `crate::harness::issue_1418_explorer_context_menu`'s own doc names
         /// as shared between `gtk` and this "tui" control arm — so, unlike the
@@ -8754,10 +8852,25 @@ mod tests {
                 "confirming the delete dialog must close it; screen:\n{}",
                 driver.screen()
             );
+            // The actual move needs the runner's `PlatformServices`
+            // (`PendingPlatformAction::MoveToTrash`, drained on the next
+            // tick) — confirming the dialog only queues it, so the
+            // target must still exist on disk right here, not be
+            // hard-deleted inline.
             assert!(
-                !target_dir.exists(),
-                "confirming the delete dialog must actually delete the \
-                 target on disk"
+                target_dir.exists(),
+                "confirming the delete dialog must not hard-delete the \
+                 target synchronously"
+            );
+            let actions = h.engine.borrow().pending_platform_actions.clone();
+            assert!(
+                actions.iter().any(|a| matches!(
+                    a,
+                    crate::core::engine::PendingPlatformAction::MoveToTrash { path, is_dir }
+                        if path == &target_dir && *is_dir
+                )),
+                "confirming the delete dialog must queue a MoveToTrash \
+                 action for the target folder; got {actions:?}"
             );
         }
 

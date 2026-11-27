@@ -391,34 +391,41 @@ impl Engine {
                             .file_name()
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_default();
-                        let is_dir = path.is_dir();
-                        let item_type = if is_dir { "folder" } else { "file" };
                         if !path.exists() {
                             self.message = format!("'{}' does not exist", name);
                         } else {
-                            let result = if is_dir {
-                                std::fs::remove_dir_all(&path)
-                            } else {
-                                std::fs::remove_file(&path)
-                            };
-                            match result {
-                                Ok(()) => {
-                                    self.message = format!("Deleted {}: '{}'", item_type, name);
-                                    // If deleted file was open, close its buffer
-                                    if !is_dir {
-                                        let path_str = path.to_string_lossy();
-                                        if let Some(buffer_id) =
-                                            self.buffer_manager.find_by_path(&path_str)
-                                        {
-                                            let _ = self.delete_buffer(buffer_id, true);
-                                        }
-                                    }
-                                    self.explorer_needs_refresh = true;
-                                }
-                                Err(e) => {
-                                    self.message = format!("Error deleting: {}", e);
-                                }
+                            let is_dir = path.is_dir();
+                            // Close every open buffer under `path` *before*
+                            // queuing the trash move, so none is left
+                            // pointing at a path that's about to vanish.
+                            // `confirm_delete_file` already listed any dirty
+                            // ones in the dialog the user just confirmed, so
+                            // `force: true` here is safe.
+                            let affected: Vec<BufferId> = self
+                                .buffer_manager
+                                .list()
+                                .into_iter()
+                                .filter(|&id| {
+                                    self.buffer_manager
+                                        .get(id)
+                                        .and_then(|s| s.file_path.as_ref())
+                                        .is_some_and(|p| {
+                                            if is_dir {
+                                                p.starts_with(&path)
+                                            } else {
+                                                p == &path
+                                            }
+                                        })
+                                })
+                                .collect();
+                            for buffer_id in affected {
+                                let _ = self.delete_buffer(buffer_id, true);
                             }
+                            // The actual filesystem move needs the
+                            // runner-owned `backend`'s `PlatformServices` —
+                            // see `PendingPlatformAction`'s doc.
+                            self.pending_platform_actions
+                                .push(PendingPlatformAction::MoveToTrash { path, is_dir });
                         }
                     }
                 } else {
@@ -904,9 +911,56 @@ impl Engine {
             }
             // The file from this stale swap isn't open — open it and offer recovery.
             if !header.file_path.exists() {
-                // Original file was deleted — clean up the orphaned swap.
-                crate::core::swap::delete_swap(&swap_path);
-                continue;
+                // Original file is gone — the swap is the only remaining
+                // copy of its last saved content. Open an empty buffer at
+                // the missing path and offer the same Recover/Delete/Abort
+                // choice `swap_check_on_open` offers when the file still
+                // exists, instead of silently discarding that content.
+                let Some((_, content)) = crate::core::swap::read_swap(&swap_path) else {
+                    // Malformed swap file — nothing left to recover.
+                    crate::core::swap::delete_swap(&swap_path);
+                    continue;
+                };
+                self.open_file_in_tab(&header.file_path);
+                let buffer_id = self.active_buffer_id();
+                let fname = header
+                    .file_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                self.pending_swap_recovery = Some(SwapRecovery {
+                    swap_path: swap_path.clone(),
+                    recovered_content: content,
+                    buffer_id,
+                });
+                self.show_dialog(
+                    "swap_recovery",
+                    "Swap File Found",
+                    vec![
+                        format!("\"{}\" no longer exists on disk,", fname),
+                        "but a swap file with its last saved content was found.".to_string(),
+                        format!("Original PID: {} (no longer running)", header.pid),
+                    ],
+                    vec![
+                        DialogButton {
+                            label: "Recover".into(),
+                            hotkey: 'r',
+                            action: "recover".into(),
+                        },
+                        DialogButton {
+                            label: "Delete swap".into(),
+                            hotkey: 'd',
+                            action: "delete".into(),
+                        },
+                        DialogButton {
+                            label: "Abort".into(),
+                            hotkey: 'a',
+                            action: "abort".into(),
+                        },
+                    ],
+                );
+                return;
             }
             // Open the file in a new tab.  `open_file_in_tab` calls
             // `swap_check_on_open` internally, which will detect the
@@ -2581,5 +2635,123 @@ mod diagnostics_json_for_line_tests {
         assert_eq!(arr[0]["message"], "non-canonical code-action diagnostic");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod swap_scan_stale_orphan_tests {
+    use super::*;
+    use std::io::Write as _;
+
+    /// An orphaned swap — the swap file exists but its original file no
+    /// longer does, e.g. a restart after the containing folder was
+    /// deleted — must offer recovery into a new buffer at the missing
+    /// path, never be silently discarded.
+    ///
+    /// **Verified RED against unfixed `develop`:** before this fix,
+    /// `swap_scan_stale`'s `!header.file_path.exists()` branch called
+    /// `crate::core::swap::delete_swap` and `continue`d with no dialog at
+    /// all — `pending_swap_recovery` stayed `None` and the swap file (the
+    /// only remaining copy of the content) was gone before this assertion
+    /// could even run.
+    #[test]
+    fn orphaned_swap_offers_recovery_instead_of_silent_delete() {
+        let home = std::env::temp_dir().join(format!(
+            "vimcode_test_orphan_swap_recovery_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let _guard = crate::core::paths::set_test_home(&home);
+
+        let missing_file = home.join("deleted_project").join("gone.txt");
+        let swap_path = crate::core::swap::swap_path_for(&missing_file);
+        std::fs::create_dir_all(swap_path.parent().unwrap()).unwrap();
+
+        // Write the swap file directly — `crate::core::swap::write_swap`
+        // is a no-op under `cfg(test)`, same reasoning as
+        // `swap::tests::test_swap_roundtrip`.
+        let mut f = std::fs::File::create(&swap_path).unwrap();
+        writeln!(f, "VIMCODE_SWAP_V1").unwrap();
+        writeln!(f, "path: {}", missing_file.display()).unwrap();
+        writeln!(f, "pid: 999999999").unwrap(); // a definitely-dead PID
+        writeln!(f, "modified: 2026-01-01T00:00:00Z").unwrap();
+        writeln!(f, "---").unwrap();
+        f.write_all(b"recovered content\n").unwrap();
+        drop(f);
+
+        let mut e = Engine::new_for_test();
+        e.settings.swap_file = true;
+        e.swap_scan_stale();
+
+        assert!(
+            e.pending_swap_recovery.is_some(),
+            "an orphaned swap (original file missing) must open a \
+             recovery dialog, not be silently discarded"
+        );
+        assert!(
+            swap_path.exists(),
+            "the swap file itself must not be deleted before the user \
+             chooses Recover/Delete/Abort"
+        );
+        let dlg = e.dialog.as_ref().expect("recovery dialog must be shown");
+        assert_eq!(dlg.tag, "swap_recovery");
+        assert!(
+            dlg.body.iter().any(|l| l.contains("gone.txt")),
+            "dialog must name the missing file; body: {:?}",
+            dlg.body
+        );
+
+        let recovery = e.pending_swap_recovery.as_ref().unwrap();
+        assert_eq!(recovery.recovered_content, "recovered content\n");
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Choosing "Recover" on an orphaned swap must populate the new
+    /// buffer with the swap's content and mark it dirty, so the user can
+    /// save it back to the path it was recovered from.
+    #[test]
+    fn recovering_an_orphaned_swap_populates_the_new_buffer() {
+        let home = std::env::temp_dir().join(format!(
+            "vimcode_test_orphan_swap_recover_action_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let _guard = crate::core::paths::set_test_home(&home);
+
+        let missing_file = home.join("recovered.txt");
+        let swap_path = crate::core::swap::swap_path_for(&missing_file);
+        std::fs::create_dir_all(swap_path.parent().unwrap()).unwrap();
+
+        let mut f = std::fs::File::create(&swap_path).unwrap();
+        writeln!(f, "VIMCODE_SWAP_V1").unwrap();
+        writeln!(f, "path: {}", missing_file.display()).unwrap();
+        writeln!(f, "pid: 999999999").unwrap();
+        writeln!(f, "modified: 2026-01-01T00:00:00Z").unwrap();
+        writeln!(f, "---").unwrap();
+        f.write_all(b"the last saved content\n").unwrap();
+        drop(f);
+
+        let mut e = Engine::new_for_test();
+        e.settings.swap_file = true;
+        e.swap_scan_stale();
+        assert!(e.pending_swap_recovery.is_some());
+
+        let result = e.process_swap_dialog_action("recover");
+        assert!(matches!(result, EngineAction::None));
+        assert!(e.pending_swap_recovery.is_none());
+
+        let buffer_id = e.active_buffer_id();
+        let state = e.buffer_manager.get(buffer_id).unwrap();
+        assert_eq!(state.buffer.to_string(), "the last saved content\n");
+        assert!(
+            state.dirty,
+            "a recovered buffer must be marked dirty so the user is \
+             prompted to save it back to the missing path"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
