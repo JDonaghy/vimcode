@@ -721,10 +721,10 @@ vimcode.defer(5000, function() p:kill() end)
 
 `vimcode.loop.spawn` runs a plain child process with no pty attached — fine for
 tools that just read stdin/write stdout, but not for an interactive one that
-needs a real terminal (a shell, `kubectl exec -it`, a REPL, `ssh`). `vimcode.
-terminal.open` runs a command in a real pty and shows it in the editor's own
-integrated terminal panel — the same panel the `` ` `` key opens, not a separate
-hidden surface.
+needs a real terminal (a shell, `kubectl exec -it`, a REPL, `ssh`).
+`vimcode.terminal.open` runs a command in a real pty and shows it in the
+editor's own integrated terminal panel — the same panel the `` ` `` key opens,
+not a separate hidden surface.
 
 ```lua
 local h = vimcode.terminal.open({
@@ -756,6 +756,9 @@ h:close()                          -- close the pane outright
 - `placement = "split"` opens the pane into split view alongside whatever else
   is open; `"panel"` and `"tab"` are equivalent today (there is one terminal
   panel with tabs, not separate placement surfaces).
+- Every call opens the terminal panel and switches it to the new pane,
+  including a background/scraping-only open — use `h:focus()` to make that
+  intent explicit in your own code, but don't rely on `open` *not* doing it.
 - `title` is stored for your own use; no backend currently paints it into the
   terminal tab strip.
 - `open` raises an error if the pty could not be started.

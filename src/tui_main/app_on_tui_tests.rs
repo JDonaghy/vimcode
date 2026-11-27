@@ -18661,6 +18661,67 @@ mod tests {
             );
         }
 
+        /// `vimcode.terminal.open` reuses `Engine::terminal_panes`, the same
+        /// pane vector the built-in terminal panel paints from — this test
+        /// proves that by asserting on `driver.screen()`, not on an engine
+        /// field, that the spawned command's own output actually reaches the
+        /// screen through the normal terminal-panel render path.
+        ///
+        /// The command is `printf '%s\n' hello_2180` rather than a Lua
+        /// string containing a literal newline byte: `vimcode.terminal.open`
+        /// types its wrapped script straight into the pty, and a real
+        /// newline *byte* there would submit the (still-unterminated,
+        /// still-quoted) line early under canonical tty line discipline.
+        /// `\n` as the two-character escape is interpreted by `printf`
+        /// itself, well after the line has been submitted whole.
+        #[test]
+        #[cfg(unix)]
+        fn terminal_open_output_paints_into_the_terminal_panel_via_shell_app_2180() {
+            use std::time::{Duration, Instant};
+
+            let engine = engine_with_plugin(
+                "terminal_open_2180",
+                r#"
+                vimcode.command("OpenTerm2180", function(_)
+                    _G.exit_code_2180 = nil
+                    vimcode.terminal.open({
+                        cmd = { "printf", "%s\\n", "hello_2180" },
+                        on_exit = function(code) _G.exit_code_2180 = code end,
+                    })
+                end)
+                "#,
+            );
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            let before = driver.screen();
+            assert!(
+                !before.contains("hello_2180"),
+                "precondition: nothing is painted before the command runs; \
+                 screen:\n{before}"
+            );
+
+            driver.type_char(':');
+            for c in "OpenTerm2180".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.render();
+
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut screen = driver.screen();
+            while !screen.contains("hello_2180") && Instant::now() < deadline {
+                driver.tick();
+                std::thread::sleep(Duration::from_millis(10));
+                screen = driver.screen();
+            }
+            assert!(
+                screen.contains("hello_2180"),
+                "vimcode.terminal.open's command output must paint into the \
+                 integrated terminal panel within 10s; screen:\n{screen}"
+            );
+        }
+
         /// `vimcode.ui.progress` must paint a progress bar + percentage
         /// onto the toast overlay; `vimcode.ui.progress_update` must
         /// repaint the same toast's body in place (not spawn a second
