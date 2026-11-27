@@ -1,0 +1,5 @@
+name = "view-demo"
+display_name = "View Demo"
+description = "Fixture extension exercising vimcode.ui.register_view, for tests/test_extension_harness.rs."
+version = "0.1.0"
+scripts = ["init.lua"]
