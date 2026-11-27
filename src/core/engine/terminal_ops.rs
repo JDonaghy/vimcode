@@ -60,7 +60,7 @@
 //! unaffected by this note.
 
 use super::*;
-use crate::core::terminal::TermSelection;
+use crate::core::terminal::{ExtTerminalState, TermSelection};
 
 impl Engine {
     // ── Integrated Terminal ────────────────────────────────────────────────
@@ -108,6 +108,7 @@ impl Engine {
                     install_ctx: None,
                     acp_auth_pending: false,
                     install_finalized: false,
+                    ext_terminal: None,
                 });
                 self.terminal_active = self.terminal_panes.len() - 1;
                 self.terminal_open = true;
@@ -188,6 +189,7 @@ impl Engine {
                     install_ctx: ctx,
                     acp_auth_pending: false,
                     install_finalized: false,
+                    ext_terminal: None,
                 });
                 self.terminal_active = self.terminal_panes.len() - 1;
                 self.terminal_open = true;
@@ -271,6 +273,7 @@ impl Engine {
                     install_ctx: None,
                     acp_auth_pending: true,
                     install_finalized: false,
+                    ext_terminal: None,
                 });
                 self.terminal_active = self.terminal_panes.len() - 1;
                 self.terminal_open = true;
@@ -299,9 +302,23 @@ impl Engine {
             .terminal_panes
             .get(self.terminal_active)
             .is_some_and(|s| s.acp_auth_pending);
+        let ext_handle_id = self
+            .terminal_panes
+            .get(self.terminal_active)
+            .and_then(|s| s.ext_terminal.as_ref())
+            .map(|e| e.handle_id);
         // Exiting split mode before removing the pane keeps tab indices sane.
         self.terminal_split = false;
         self.terminal_panes.remove(self.terminal_active);
+        // The user closed this tab directly (not through `handle:close()` or
+        // the exited-session sweep above) — drop the `plugin_terminals`
+        // liveness entry here too so it can't outlive the pane it describes.
+        if let Some(handle_id) = ext_handle_id {
+            self.plugin_terminals.remove(&handle_id);
+            if let Some(pm) = self.plugin_manager.clone() {
+                pm.remove_terminal_callbacks(handle_id);
+            }
+        }
         if was_acp_auth {
             self.acp_finish_terminal_login(None);
         }
@@ -331,6 +348,7 @@ impl Engine {
                             install_ctx: None,
                             acp_auth_pending: false,
                             install_finalized: false,
+                            ext_terminal: None,
                         });
                     }
                     Err(e) => {
@@ -353,6 +371,7 @@ impl Engine {
                         install_ctx: None,
                         acp_auth_pending: false,
                         install_finalized: false,
+                        ext_terminal: None,
                     });
                 }
                 Err(e) => {
@@ -855,6 +874,9 @@ impl Engine {
         for slot in &mut self.terminal_panes {
             got_data |= slot.session.poll();
         }
+        // Deliver output/exit for any `vimcode.terminal.open` pane before the
+        // exit-removal pass below can prune it — see `poll_ext_terminals`'s doc.
+        got_data |= self.poll_ext_terminals();
         // Finalize any install pane whose command has already recorded its exit
         // status, ahead of the shell-exit loop below. Collected into a separate
         // Vec first because `finalize_install_from_terminal` takes `&mut self`
@@ -895,12 +917,28 @@ impl Engine {
                 let already_finalized = self.terminal_panes[i].install_finalized;
                 let was_acp_auth = self.terminal_panes[i].acp_auth_pending;
                 let exit_code = self.terminal_panes[i].session.exit_code();
+                let ext_handle_id = self.terminal_panes[i]
+                    .ext_terminal
+                    .as_ref()
+                    .map(|e| e.handle_id);
                 if let Some(ctx) = ctx {
                     if !already_finalized {
                         self.finalize_install_from_terminal(&ctx);
                     }
                 }
                 self.terminal_panes.remove(i);
+                // The pane is gone (the shell itself exited, e.g. the user
+                // typed `exit`), not just the wrapped command — drop its
+                // `plugin_terminals` liveness entry here too, mirroring
+                // `ext_terminal_close`, so a stale entry can never outlive
+                // the pane it describes and collide with a re-minted handle
+                // id after a `set_plugin_manager` reload.
+                if let Some(handle_id) = ext_handle_id {
+                    self.plugin_terminals.remove(&handle_id);
+                    if let Some(pm) = self.plugin_manager.clone() {
+                        pm.remove_terminal_callbacks(handle_id);
+                    }
+                }
                 // Call after `remove` so `acp_finish_terminal_login`
                 // (which may itself touch `terminal_panes` indirectly via
                 // `acp_launch_terminal_login` on a later retry) never sees
@@ -1730,6 +1768,62 @@ pub fn build_acp_terminal_wrapper(
     }
 }
 
+/// Build the PTY-injected wrapper for `vimcode.terminal.open`.
+///
+/// Same quoting/marker conventions as [`build_acp_terminal_wrapper`], with
+/// one deliberate difference: the exit-code-capture and end-marker steps
+/// are joined onto the **same line** as the command itself with `;`,
+/// instead of each being its own `\n`-terminated line.
+///
+/// This matters because this API wraps commands that read from stdin —
+/// shells, `kubectl exec -it`, REPLs, `ssh` — unlike `terminal/create`'s
+/// fire-and-forget ACP commands. A PTY's canonical-mode line discipline
+/// queues every `\n`-terminated line written to the master as soon as
+/// it's written, regardless of which process is currently reading: if the
+/// exit-code/end-marker lines were separate lines after the command's own
+/// (as [`build_acp_terminal_wrapper`] does), a command that reads its own
+/// stdin would consume them as input instead of the shell ever seeing
+/// them. Joining with `;` keeps it all on one line, so the shell parses
+/// "run the command, then capture `$?` and print the end marker" before
+/// handing control to the command at all — the same reason a human typing
+/// `cat; echo done<Enter>` never gets `echo done` fed to `cat`.
+fn build_ext_terminal_wrapper(
+    command: &str,
+    args: &[String],
+    env: &[(String, String)],
+    is_powershell: bool,
+    begin_marker: &str,
+    end_marker_prefix: &str,
+) -> String {
+    let quoted_command = quote_shell_arg(command, is_powershell);
+    let quoted_args: String = args
+        .iter()
+        .map(|a| format!(" {}", quote_shell_arg(a, is_powershell)))
+        .collect();
+    let safe_env: Vec<(&String, String)> = env
+        .iter()
+        .filter(|(k, _)| is_valid_env_var_name(k))
+        .map(|(k, v)| (k, quote_shell_arg(v, is_powershell)))
+        .collect();
+    if is_powershell {
+        let env_lines: String = safe_env
+            .iter()
+            .map(|(k, quoted_v)| format!("$env:{k} = {quoted_v}\n"))
+            .collect();
+        format!(
+            "{env_lines}Write-Host '{begin_marker}'\n{quoted_command}{quoted_args}; $__ec = $LASTEXITCODE; if ($null -eq $__ec) {{ $__ec = 0 }}; Write-Host \"{end_marker_prefix}$__ec\"\n"
+        )
+    } else {
+        let env_lines: String = safe_env
+            .iter()
+            .map(|(k, quoted_v)| format!("export {k}={quoted_v}\n"))
+            .collect();
+        format!(
+            "{env_lines}printf '%s\\n' '{begin_marker}'\n{quoted_command}{quoted_args}; __ec=$?; printf '%s\\n' \"{end_marker_prefix}$__ec\"\n"
+        )
+    }
+}
+
 /// Whether `name` is safe to splice unquoted into `export NAME=...` /
 /// `$env:NAME = ...` — i.e. a bare `[A-Za-z_][A-Za-z0-9_]*` identifier,
 /// nothing else. Used by [`build_acp_terminal_wrapper`] to drop
@@ -1743,6 +1837,28 @@ fn is_valid_env_var_name(name: &str) -> bool {
         _ => return false,
     }
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Text after `marker` on a terminal grid line printed by the marker
+/// wrapper, or `None` when the line does not carry it.
+///
+/// The marker may follow a shell prompt on the same line (a shell that does
+/// not echo the typed command leaves its prompt in front of the first output
+/// line), so the marker can start anywhere on the line. An occurrence right
+/// after a quote is the echoed command text (`printf '%s\n' '<marker>'`),
+/// not the printed marker, and is ignored.
+fn marker_line_tail<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
+    let line = line.trim_end();
+    let mut from = 0;
+    while let Some(off) = line[from..].find(marker) {
+        let at = from + off;
+        let quoted = matches!(line[..at].chars().last(), Some('\'' | '"'));
+        if !quoted {
+            return Some(&line[at + marker.len()..]);
+        }
+        from = at + marker.len();
+    }
+    None
 }
 
 /// Extract the command output produced between the injected
@@ -1768,18 +1884,19 @@ pub fn extract_acp_terminal_output(
     end_marker_prefix: &str,
 ) -> (String, Option<i64>) {
     let lines: Vec<&str> = full_text.split('\n').collect();
-    let Some(begin_idx) = lines.iter().rposition(|l| l.trim_end() == begin_marker) else {
+    let Some(begin_idx) = lines
+        .iter()
+        .rposition(|l| marker_line_tail(l, begin_marker).is_some_and(str::is_empty))
+    else {
         return (String::new(), None);
     };
     let after_begin = &lines[begin_idx + 1..];
-    let end_idx = after_begin
-        .iter()
-        .position(|l| l.trim_end().starts_with(end_marker_prefix));
+    let end_idx = after_begin.iter().position(|l| {
+        marker_line_tail(l, end_marker_prefix).is_some_and(|code| code.parse::<i64>().is_ok())
+    });
     match end_idx {
         Some(end_idx) => {
-            let code = after_begin[end_idx]
-                .trim_end()
-                .strip_prefix(end_marker_prefix)
+            let code = marker_line_tail(after_begin[end_idx], end_marker_prefix)
                 .and_then(|s| s.parse::<i64>().ok())
                 .unwrap_or(0);
             (after_begin[..end_idx].join("\n"), Some(code))
@@ -1957,6 +2074,296 @@ impl Engine {
     }
 }
 
+// ── `vimcode.terminal.open` ─────────────────────────────────────
+
+impl Engine {
+    /// Serve `vimcode.terminal.open`: spawn `command`/`args` in a new,
+    /// *visible* terminal pane — unlike `acp_terminal_create`'s hidden one,
+    /// this is `terminal_run_command`'s "open a real pane the user can see
+    /// and type into" shape, reused for an extension's command instead of
+    /// an install script. Uses the same injected-marker *technique* as
+    /// `acp_terminal_create` (`extract_acp_terminal_output` reads the
+    /// result back the same way), but its own wrapper builder
+    /// ([`build_ext_terminal_wrapper`] — see its doc for why a shared one
+    /// won't do) so [`Self::poll_ext_terminals`] can recover the command's
+    /// own output and exit code from the pane's shell even when the
+    /// command itself reads from stdin.
+    ///
+    /// Unlike an install pane, the wrapper does not exit the shell once the
+    /// command finishes — the shell underneath stays interactive, matching
+    /// the issue's "shells, `kubectl exec -it`, REPLs, `ssh`" use case: the
+    /// extension can keep calling `handle:send` after the wrapped command
+    /// has already printed its end marker and `on_exit` has fired.
+    ///
+    /// `placement == "split"` puts the new pane into split view alongside
+    /// whatever else is open; any other value (including `"panel"`/`"tab"`,
+    /// or an unrecognised typo) falls back to the plain single/tabbed view
+    /// — `"panel"` and `"tab"` mean the same thing here since there is only
+    /// one terminal panel with tabs, not a separate per-placement surface.
+    ///
+    /// Reuses an already-open pane's dimensions if one exists (same
+    /// fallback [`Self::acp_launch_terminal_login`] uses), since there is
+    /// no viewport context available from a Lua call site the way there is
+    /// from a backend's own resize/layout path.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn ext_terminal_open(
+        &mut self,
+        command: &str,
+        args: &[String],
+        env: &[(String, String)],
+        cwd: Option<&Path>,
+        title: Option<String>,
+        placement: &str,
+        handle_id: u64,
+    ) -> Result<(), String> {
+        let shell = default_shell();
+        let is_powershell =
+            shell.to_lowercase().contains("powershell") || shell.to_lowercase().contains("pwsh");
+        let history_cap = self.settings.terminal_scrollback_lines;
+        let resolved_cwd = cwd
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.cwd.clone());
+        let begin_marker = format!("__ext_term_begin_{handle_id}__");
+        let end_marker_prefix = format!("__ext_term_end_{handle_id}__:");
+        let wrapped = build_ext_terminal_wrapper(
+            command,
+            args,
+            env,
+            is_powershell,
+            &begin_marker,
+            &end_marker_prefix,
+        );
+        let (cols, rows) = self
+            .terminal_panes
+            .first()
+            .map(|slot| (slot.session.cols(), slot.session.rows()))
+            .unwrap_or((80, 24));
+        match TerminalSession::spawn(cols, rows, &shell, &resolved_cwd, history_cap) {
+            Ok(mut sess) => {
+                sess.write_input(wrapped.as_bytes());
+                self.terminal_panes.push(TerminalSlot {
+                    session: sess,
+                    install_ctx: None,
+                    acp_auth_pending: false,
+                    install_finalized: false,
+                    ext_terminal: Some(ExtTerminalState {
+                        handle_id,
+                        title,
+                        begin_marker,
+                        end_marker_prefix,
+                        delivered_len: 0,
+                        exit_delivered: false,
+                    }),
+                });
+                self.terminal_active = self.terminal_panes.len() - 1;
+                self.terminal_open = true;
+                if placement == "split" && self.terminal_panes.len() >= 2 {
+                    self.terminal_split = true;
+                }
+                Ok(())
+            }
+            Err(e) => Err(format!("failed to open terminal: {e}")),
+        }
+    }
+
+    /// Find the pane index of the live `vimcode.terminal.open` handle `id`,
+    /// if its pane hasn't already been removed (naturally, by
+    /// `handle:close()`, or by the reap-on-unload sweep).
+    fn ext_terminal_index(&self, id: u64) -> Option<usize> {
+        self.terminal_panes.iter().position(|slot| {
+            slot.ext_terminal
+                .as_ref()
+                .is_some_and(|e| e.handle_id == id)
+        })
+    }
+
+    /// `handle:send(text)` — write `text` to the pane's PTY, exactly as if
+    /// typed (no implicit trailing newline; a caller that wants to submit a
+    /// line appends `"\n"` itself). Returns `false` if the pane is already
+    /// gone.
+    pub(crate) fn ext_terminal_send(&mut self, id: u64, text: &str) -> bool {
+        let Some(idx) = self.ext_terminal_index(id) else {
+            return false;
+        };
+        self.terminal_panes[idx]
+            .session
+            .write_input(text.as_bytes());
+        true
+    }
+
+    /// `handle:focus()` — show the terminal panel and give this pane
+    /// keyboard focus. Returns `false` if the pane is already gone.
+    pub(crate) fn ext_terminal_focus(&mut self, id: u64) -> bool {
+        let Some(idx) = self.ext_terminal_index(id) else {
+            return false;
+        };
+        self.terminal_active = idx;
+        self.terminal_open = true;
+        self.terminal_has_focus = true;
+        true
+    }
+
+    /// `handle:close()` — remove the pane outright (dropping its
+    /// `TerminalSession`, like every other terminal-close path in this
+    /// file; the PTY master going away sends the child a HUP). Pure
+    /// teardown: does *not* fire `on_exit` — mirrors the "cancel a handle,
+    /// don't call into Lua for it" convention `plugin_api_spawn_kill`/the
+    /// `vimcode.fs.*` handles' `:cancel()` already use. Returns `false` if
+    /// the pane is already gone.
+    pub(crate) fn ext_terminal_close(&mut self, id: u64) -> bool {
+        let Some(idx) = self.ext_terminal_index(id) else {
+            return false;
+        };
+        self.terminal_panes.remove(idx);
+        // The pane is gone; drop its liveness entry too so a later
+        // `set_plugin_manager` reload's eager reap doesn't try to close an
+        // already-closed pane, and so the handle id is free for the next
+        // manager to re-mint without colliding with a still-tracked one.
+        self.plugin_terminals.remove(&id);
+        if self.terminal_panes.is_empty() {
+            self.terminal_open = false;
+            self.terminal_has_focus = false;
+            self.terminal_active = 0;
+            self.terminal_split = false;
+        } else {
+            if self.terminal_active > idx {
+                self.terminal_active -= 1;
+            }
+            self.terminal_active = self.terminal_active.min(self.terminal_panes.len() - 1);
+            if self.terminal_split && self.terminal_panes.len() < 2 {
+                self.terminal_split = false;
+            }
+        }
+        true
+    }
+
+    /// Deliver newly captured output and exit status for every live
+    /// `vimcode.terminal.open` pane to its registered `on_output`/`on_exit`
+    /// callbacks. Called from [`Self::poll_terminal`], right after that
+    /// function's own `TerminalSession::poll()` loop has drained each
+    /// pane's PTY — so the marker-delimited snapshot
+    /// `extract_acp_terminal_output` reads from `full_text()` here is
+    /// already current for this tick — and *before* `poll_terminal`'s own
+    /// "remove exited sessions" pass, so a pane whose underlying shell has
+    /// already died still gets its final `on_exit` delivered before being
+    /// pruned.
+    ///
+    /// Returns `true` if any callback fired (caller should redraw).
+    fn poll_ext_terminals(&mut self) -> bool {
+        if self.plugin_terminals.is_empty() {
+            return false;
+        }
+        let mut redraw = false;
+        // Collect handle ids, not pane indices: an `on_output`/`on_exit`
+        // dispatch below may run Lua that calls back into the immediate API
+        // (e.g. `h:close()`), which can remove this or any other pane and
+        // shift every later index in `terminal_panes`. Every pane lookup
+        // after a dispatch therefore re-resolves by id via
+        // `ext_terminal_index`, the same convention `poll_plugin_spawns`
+        // uses for timer/spawn handles.
+        let handle_ids: Vec<u64> = self
+            .terminal_panes
+            .iter()
+            .filter_map(|slot| slot.ext_terminal.as_ref().map(|e| e.handle_id))
+            .collect();
+        for handle_id in handle_ids {
+            let Some(idx) = self.ext_terminal_index(handle_id) else {
+                continue;
+            };
+            let full_text = self.terminal_panes[idx].session.full_text();
+            let exited = self.terminal_panes[idx].session.is_exited();
+            let session_exit_code = self.terminal_panes[idx].session.exit_code();
+            let (chunk, marker_exit) = {
+                let ext = self.terminal_panes[idx]
+                    .ext_terminal
+                    .as_ref()
+                    .expect("filtered above");
+                let (output, marker_exit) = extract_acp_terminal_output(
+                    &full_text,
+                    &ext.begin_marker,
+                    &ext.end_marker_prefix,
+                );
+                // `output` is read from a live vt100 grid snapshot, not an
+                // append-only log: an in-place redraw (`\r`, cursor-up,
+                // `clear`, an alt-screen TUI) or a panel resize can rewrite
+                // bytes before `delivered_len`, which can leave that offset
+                // mid-character rather than on a boundary. `get` (rather
+                // than `[..]`) skips delivery for this tick instead of
+                // panicking; the next tick's snapshot has shifted again and
+                // will usually land on a boundary.
+                let chunk = if output.len() > ext.delivered_len {
+                    output.get(ext.delivered_len..).map(str::to_string)
+                } else {
+                    None
+                };
+                (chunk, marker_exit)
+            };
+            if let Some(chunk) = chunk {
+                if !chunk.is_empty() {
+                    if let Some(ext) = self.terminal_panes[idx].ext_terminal.as_mut() {
+                        ext.delivered_len += chunk.len();
+                    }
+                    let ctx = self.make_plugin_ctx(true);
+                    if let Some(ctx) = self.with_plugin_dispatch(move |pm| {
+                        pm.call_terminal_output(handle_id, &chunk, ctx)
+                    }) {
+                        self.apply_plugin_ctx(ctx);
+                        redraw = true;
+                    }
+                }
+            }
+            // Re-resolve: the `on_output` dispatch above may have closed
+            // this pane (or any other), invalidating `idx`.
+            let Some(idx) = self.ext_terminal_index(handle_id) else {
+                continue;
+            };
+            let already_delivered = self.terminal_panes[idx]
+                .ext_terminal
+                .as_ref()
+                .map(|e| e.exit_delivered)
+                .unwrap_or(true);
+            if !already_delivered {
+                // The wrapper's own end marker is authoritative; falling back
+                // to the PTY's exit code only covers the pane dying outright
+                // (killed, crashed) before the wrapper got to print it.
+                let code = marker_exit.or(if exited {
+                    session_exit_code.map(i64::from)
+                } else {
+                    None
+                });
+                if let Some(code) = code {
+                    if let Some(ext) = self.terminal_panes[idx].ext_terminal.as_mut() {
+                        ext.exit_delivered = true;
+                    }
+                    let ctx = self.make_plugin_ctx(true);
+                    if let Some(ctx) = self
+                        .with_plugin_dispatch(move |pm| pm.call_terminal_exit(handle_id, code, ctx))
+                    {
+                        self.apply_plugin_ctx(ctx);
+                        redraw = true;
+                    }
+                    // `plugin_terminals` tracks pane *liveness* for the
+                    // unload-reap sweep, not callback registration — the
+                    // pane's shell stays open after the wrapped command
+                    // exits (documented in EXTENSIONS.md: `h:send` still
+                    // works), so this entry must stay until the pane itself
+                    // is removed (`ext_terminal_close`/the exited-session
+                    // prune in `poll_terminal`/`terminal_close_active_tab`).
+                    // Removing it here would make a later `set_plugin_manager`
+                    // reload's eager reap unable to find and close this
+                    // still-open pane, and would free its handle id to be
+                    // re-minted by the next manager while the orphaned pane
+                    // is still sitting in `terminal_panes`.
+                    if let Some(pm) = self.plugin_manager.clone() {
+                        pm.remove_terminal_callbacks(handle_id);
+                    }
+                }
+            }
+        }
+        redraw
+    }
+}
+
 /// Translate a key event to PTY input bytes. Shared by both backends.
 pub fn key_to_pty_bytes(key_name: &str, unicode: Option<char>, ctrl: bool) -> Vec<u8> {
     if ctrl {
@@ -2021,10 +2428,10 @@ pub fn key_to_pty_bytes(key_name: &str, unicode: Option<char>, ctrl: bool) -> Ve
 mod tests {
     use super::{
         acp_terminal_command_display, build_acp_auth_wrapper, build_acp_terminal_wrapper,
-        build_terminal_install_launch_line, build_terminal_install_wrapper,
-        extract_acp_terminal_output, install_exit_code_path, install_exit_code_ready,
-        install_script_path, invalidate_install_exit_code, read_install_exit_code,
-        truncate_terminal_output,
+        build_ext_terminal_wrapper, build_terminal_install_launch_line,
+        build_terminal_install_wrapper, extract_acp_terminal_output, install_exit_code_path,
+        install_exit_code_ready, install_script_path, invalidate_install_exit_code,
+        read_install_exit_code, truncate_terminal_output,
     };
     use std::path::PathBuf;
 
@@ -2654,6 +3061,70 @@ mod tests {
         assert!(script.contains("Write-Host \"__end__:$__ec\"\n"));
     }
 
+    // ── `vimcode.terminal.open` wrapper ───────────────────────────
+
+    /// The defining difference from [`build_acp_terminal_wrapper`]: the
+    /// command, exit-code capture and end marker must all land on one
+    /// `\n`-terminated line (joined with `;`), not three separate lines —
+    /// see [`build_ext_terminal_wrapper`]'s doc for why a stdin-reading
+    /// command would otherwise consume the trailing lines as its own
+    /// input.
+    #[test]
+    fn build_ext_terminal_wrapper_posix_joins_command_and_epilogue_on_one_line() {
+        let script = build_ext_terminal_wrapper(
+            "cat",
+            &[],
+            &[("FOO".to_string(), "bar".to_string())],
+            false,
+            "__begin__",
+            "__end__:",
+        );
+        assert!(
+            script.contains("export FOO='bar'\n"),
+            "env must still be exported on its own preceding line; got:\n{script}"
+        );
+        assert!(
+            script.contains("printf '%s\\n' '__begin__'\n"),
+            "the begin marker must still be printed on its own preceding \
+             line (nothing queued yet for the command to steal); got:\n{script}"
+        );
+        assert!(
+            script.contains("'cat'; __ec=$?; printf '%s\\n' \"__end__:$__ec\"\n"),
+            "the command, exit-code capture and end marker must all be on \
+             one `;`-joined line; got:\n{script}"
+        );
+        assert_eq!(
+            script.matches('\n').count(),
+            3,
+            "exactly 3 lines total (env export, begin marker, the joined \
+             command+epilogue line) — any more means the epilogue split \
+             back onto its own line; got:\n{script}"
+        );
+    }
+
+    #[test]
+    fn build_ext_terminal_wrapper_powershell_joins_command_and_epilogue_on_one_line() {
+        let script = build_ext_terminal_wrapper(
+            "echo",
+            &["hi".to_string()],
+            &[],
+            true,
+            "__begin__",
+            "__end__:",
+        );
+        assert!(script.contains("Write-Host '__begin__'\n"));
+        assert!(script.contains(
+            "\"echo\" \"hi\"; $__ec = $LASTEXITCODE; if ($null -eq $__ec) { $__ec = 0 }; \
+             Write-Host \"__end__:$__ec\"\n"
+        ));
+        assert_eq!(
+            script.matches('\n').count(),
+            2,
+            "exactly 2 lines total (begin marker, the joined \
+             command+epilogue line); got:\n{script}"
+        );
+    }
+
     // ── ACP `terminal/create` env injection hardening ────────────────────
 
     #[test]
@@ -2744,6 +3215,22 @@ mod tests {
             "a malicious `env` *name* must be dropped entirely, not \
              spliced in unescaped; got:\n{script}"
         );
+    }
+
+    #[test]
+    fn extract_acp_terminal_output_accepts_markers_after_a_shell_prompt() {
+        let full_text = "printf '%s\\n' '__begin__'\n'/usr/bin/cat'; __ec=$?; printf '%s\\n' \"__end__:$__ec\"\n$ __begin__\n$ hello\n__end__:0\n$";
+        let (output, exit_code) = extract_acp_terminal_output(full_text, "__begin__", "__end__:");
+        assert_eq!(output, "$ hello");
+        assert_eq!(exit_code, Some(0));
+    }
+
+    #[test]
+    fn extract_acp_terminal_output_ignores_the_echoed_command_text() {
+        let full_text = "printf '%s\\n' '__begin__'\nprintf '%s\\n' \"__end__:$__ec\"\n";
+        let (output, exit_code) = extract_acp_terminal_output(full_text, "__begin__", "__end__:");
+        assert_eq!(output, "");
+        assert_eq!(exit_code, None);
     }
 
     #[test]

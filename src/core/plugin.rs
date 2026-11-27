@@ -1530,6 +1530,12 @@ pub struct PluginManager {
     /// are long-lived — a source stays registered for the plugin's whole
     /// lifetime, invoked fresh on every `Engine::trigger_completion`.
     completion_sources: RefCell<HashMap<u64, PluginCompletionSource>>,
+    /// `id -> callbacks` for every live `vimcode.terminal.open` handle.
+    /// The pane itself lives in `Engine::terminal_panes`
+    /// (`TerminalSlot::ext_terminal`), found back by matching this same id
+    /// — mirrors `spawn_callbacks` except there is no separate `Engine`-
+    /// side handle map, since the terminal pane already *is* one.
+    terminal_callbacks: RefCell<HashMap<u64, TerminalCallbacks>>,
     /// `id -> callbacks` for every in-flight `vimcode.fs.walk`/`vimcode.fs.
     /// grep` handle. The background thread/receiver live on
     /// `Engine::plugin_fs_ops`, keyed by the same id — mirrors
@@ -1553,6 +1559,14 @@ struct FsCallbacks {
 struct SpawnCallbacks {
     on_stdout: Option<LuaRegistryKey>,
     on_stderr: Option<LuaRegistryKey>,
+    on_exit: Option<LuaRegistryKey>,
+}
+
+/// A `vimcode.terminal.open` handle's registered callbacks. Both are
+/// optional — a plugin that only cares about the exit status need not pass
+/// `on_output`.
+struct TerminalCallbacks {
+    on_output: Option<LuaRegistryKey>,
     on_exit: Option<LuaRegistryKey>,
 }
 
@@ -2370,6 +2384,7 @@ impl PluginManager {
             pickers: RefCell::new(HashMap::new()),
             http_callbacks: RefCell::new(HashMap::new()),
             completion_sources: RefCell::new(HashMap::new()),
+            terminal_callbacks: RefCell::new(HashMap::new()),
             fs_callbacks: RefCell::new(HashMap::new()),
         })
     }
@@ -2959,6 +2974,73 @@ impl PluginManager {
                 code.map(i64::from),
                 signal.map(i64::from),
             ));
+        }
+        self.lua
+            .remove_app_data::<PluginCallContext>()
+            .unwrap_or_default()
+    }
+
+    // ─── `vimcode.terminal.open` ───────────────────────────────────
+
+    /// Register a `vimcode.terminal.open` handle's callbacks and return its id.
+    pub(crate) fn register_terminal_callbacks(
+        &self,
+        on_output: Option<LuaRegistryKey>,
+        on_exit: Option<LuaRegistryKey>,
+    ) -> u64 {
+        let id = self.next_handle_id();
+        self.terminal_callbacks
+            .borrow_mut()
+            .insert(id, TerminalCallbacks { on_output, on_exit });
+        id
+    }
+
+    /// Drop a terminal handle's stored callbacks (on exit, on `close()`, or
+    /// when the owning plugin is unloaded).
+    pub(crate) fn remove_terminal_callbacks(&self, id: u64) {
+        self.terminal_callbacks.borrow_mut().remove(&id);
+    }
+
+    /// Fire terminal `id`'s `on_output` callback with one captured chunk of
+    /// the command's own output (the slice between the wrapper's begin/end
+    /// markers — never the shell's prompt or echoed input).
+    pub(crate) fn call_terminal_output(
+        &self,
+        id: u64,
+        chunk: &str,
+        ctx: PluginCallContext,
+    ) -> PluginCallContext {
+        self.lua.set_app_data(ctx);
+        let f = {
+            let cbs = self.terminal_callbacks.borrow();
+            cbs.get(&id)
+                .and_then(|c| c.on_output.as_ref())
+                .and_then(|k| self.lua.registry_value::<LuaFunction>(k).ok())
+        };
+        if let Some(f) = f {
+            let _ = f.call::<String, ()>(chunk.to_string());
+        }
+        self.lua
+            .remove_app_data::<PluginCallContext>()
+            .unwrap_or_default()
+    }
+
+    /// Fire terminal `id`'s `on_exit` callback with the command's exit code.
+    pub(crate) fn call_terminal_exit(
+        &self,
+        id: u64,
+        code: i64,
+        ctx: PluginCallContext,
+    ) -> PluginCallContext {
+        self.lua.set_app_data(ctx);
+        let f = {
+            let cbs = self.terminal_callbacks.borrow();
+            cbs.get(&id)
+                .and_then(|c| c.on_exit.as_ref())
+                .and_then(|k| self.lua.registry_value::<LuaFunction>(k).ok())
+        };
+        if let Some(f) = f {
+            let _ = f.call::<i64, ()>(code);
         }
         self.lua
             .remove_app_data::<PluginCallContext>()
@@ -4370,6 +4452,101 @@ impl PluginManager {
         )?;
 
         vimcode.set("loop", loop_tbl)?;
+
+        // ── vimcode.terminal ────────────────────────────────────────
+        let terminal_tbl = lua.create_table()?;
+
+        // vimcode.terminal.open{cmd, cwd, env, title, placement, on_output, on_exit}
+        // → handle with :send(text), :close(), :focus()
+        //
+        // `cmd` is a table: `cmd[1]` is the program, the rest are its argv
+        // (the same "table of strings" shape `vimcode.loop.spawn`'s `args`
+        // uses, just with the program folded into the same list since the
+        // issue's own `{cmd = {...}}` shape has no separate `args` field).
+        // `on_output` is called with one captured chunk each time the
+        // command produces output (not necessarily line-buffered, same
+        // caveat as `vimcode.loop.spawn`'s `on_stdout`); `on_exit` is
+        // called once with the command's exit code.
+        terminal_tbl.set(
+            "open",
+            lua.create_function(|lua, opts: LuaTable| {
+                let cmd: Vec<String> = opts.get::<_, Vec<String>>("cmd").unwrap_or_default();
+                let Some((program, args)) = cmd.split_first() else {
+                    return Err(LuaError::RuntimeError(
+                        "vimcode.terminal.open: 'cmd' must be a non-empty table".to_string(),
+                    ));
+                };
+                let program = program.clone();
+                let args = args.to_vec();
+                let mut cwd = None;
+                let mut env: Vec<(String, String)> = Vec::new();
+                let mut title = None;
+                let mut placement = "panel".to_string();
+                let mut on_output = None;
+                let mut on_exit = None;
+                if let Ok(c) = opts.get::<_, String>("cwd") {
+                    if !c.is_empty() {
+                        cwd = Some(PathBuf::from(c));
+                    }
+                }
+                if let Ok(e) = opts.get::<_, LuaTable>("env") {
+                    for pair in e.pairs::<String, String>().flatten() {
+                        env.push(pair);
+                    }
+                }
+                if let Ok(t) = opts.get::<_, String>("title") {
+                    if !t.is_empty() {
+                        title = Some(t);
+                    }
+                }
+                if let Ok(p) = opts.get::<_, String>("placement") {
+                    if !p.is_empty() {
+                        placement = p;
+                    }
+                }
+                if let Ok(f) = opts.get::<_, LuaFunction>("on_output") {
+                    on_output = Some(lua.create_registry_value(f)?);
+                }
+                if let Ok(f) = opts.get::<_, LuaFunction>("on_exit") {
+                    on_exit = Some(lua.create_registry_value(f)?);
+                }
+                let result = live_engine("vimcode.terminal.open", move |e| {
+                    e.plugin_api_terminal_open(
+                        program, args, cwd, env, title, placement, on_output, on_exit,
+                    )
+                })?;
+                let id = result.map_err(LuaError::RuntimeError)?;
+                let handle = lua.create_table()?;
+                handle.set("id", id)?;
+                handle.set(
+                    "send",
+                    lua.create_function(move |_, (_self, text): (LuaValue, String)| {
+                        live_engine("vimcode.terminal.open:send", move |e| {
+                            e.plugin_api_terminal_send(id, &text)
+                        })
+                    })?,
+                )?;
+                handle.set(
+                    "close",
+                    lua.create_function(move |_, _self: LuaValue| {
+                        live_engine("vimcode.terminal.open:close", move |e| {
+                            e.plugin_api_terminal_close(id)
+                        })
+                    })?,
+                )?;
+                handle.set(
+                    "focus",
+                    lua.create_function(move |_, _self: LuaValue| {
+                        live_engine("vimcode.terminal.open:focus", move |e| {
+                            e.plugin_api_terminal_focus(id)
+                        })
+                    })?,
+                )?;
+                Ok(handle)
+            })?,
+        )?;
+
+        vimcode.set("terminal", terminal_tbl)?;
 
         // ── vimcode.http ─────────────────────────────────────────────────────
         let http_tbl = lua.create_table()?;

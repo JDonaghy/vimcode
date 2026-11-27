@@ -4154,9 +4154,10 @@ fn ext_install_with_acquire_runs_no_terminal_command_and_registers_lsp() {
     let _ = std::fs::remove_dir_all(&data_home);
     std::fs::create_dir_all(&data_home).unwrap();
     let _data_home_guard = EnvVarGuard::set("VIMCODE_TEST_DATA_HOME", data_home.as_os_str());
-    // `file://` download URLs are a test-build allowance only (second review round on
-    // #1345: a registry manifest must not turn `curl` into arbitrary-file-read). This
-    // integration test must opt in explicitly since library `cfg(test)` doesn't apply.
+    // `file://` download URLs are a test-build allowance only — a registry
+    // manifest must not turn `curl` into arbitrary-file-read in production.
+    // This integration test must opt in explicitly since library
+    // `cfg(test)` doesn't apply.
     let _file_url_guard = EnvVarGuard::set(
         vimcode_core::core::tool_acquire::ALLOW_FILE_URL_DOWNLOADS_ENV,
         std::ffi::OsStr::new("1"),
@@ -6045,6 +6046,264 @@ fn unloading_plugin_stops_its_timers_and_spawns_from_calling_back() {
         e.message, "SENTINEL_1624",
         "no timer/spawn callback belonging to the unloaded plugin may fire \
          after it is replaced"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Plugin API — `vimcode.terminal.open`: run a command in the
+// integrated terminal from Lua, with a `send`/`close`/`focus` handle and
+// `on_output`/`on_exit` callbacks.
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Same "real PTY on a background thread, poll-until-condition-or-timeout"
+// shape as the `loop.spawn` tests above — `vimcode.terminal.open` reuses the
+// exact same `TerminalSession` primitive the editor's own integrated
+// terminal panel uses (`Engine::terminal_panes`), just driven from Lua
+// instead of a keypress.
+
+/// Serializes the one test in this section that overrides the
+/// process-global `$SHELL` (`terminal_open_reuses_the_real_terminal_pane_
+/// and_delivers_output_and_exit`, below) against itself only — no other
+/// test in this file reads `$SHELL` — mirroring `new_vim_features.rs`'s
+/// `SHELL_ENV_LOCK` for the same reason: a bare `EnvVarGuard` restores the
+/// value on drop but does nothing to stop a second thread's `set` landing
+/// in the middle of this one's window.
+static TERMINAL_OPEN_SHELL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+#[cfg(unix)]
+fn terminal_open_reuses_the_real_terminal_pane_and_delivers_output_and_exit() {
+    let _lock = TERMINAL_OPEN_SHELL_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // `vimcode.terminal.open` spawns the user's own `$SHELL` (same as the
+    // editor's own terminal panel) and injects the wrapped command as PTY
+    // input. Pinning it to a plain `/bin/sh` keeps the marker-delimited
+    // output this test asserts on independent of the host's interactive
+    // shell config (a login banner, a slow prompt plugin, …) — same
+    // reasoning as `tests/terminal_wheel.rs`.
+    let _shell_guard = EnvVarGuard::set("SHELL", std::ffi::OsStr::new("/bin/sh"));
+    // Absolute `cat`, not a `PATH` lookup — see `posix_tool`'s doc.
+    let cat = posix_tool("cat");
+    let mut e = engine_with_plugin(
+        "",
+        "terminal_open_2180",
+        &format!(
+            r#"
+        _G.out = ""
+        _G.exit_code = nil
+        vimcode.command("OpenTerm", function(_)
+            _G.h = vimcode.terminal.open({{
+                cmd = {{ "{cat}" }},
+                on_output = function(chunk) _G.out = _G.out .. chunk end,
+                on_exit = function(code) _G.exit_code = code end,
+            }})
+        end)
+        vimcode.command("SendInput", function(_)
+            _G.h:send("hello_2180\n")
+            _G.h:send("\4")
+        end)
+        vimcode.command("ReadState", function(_)
+            vimcode.message(_G.out .. "|" .. tostring(_G.exit_code))
+        end)
+        "#
+        ),
+    );
+    exec(&mut e, "OpenTerm");
+
+    // The handle opened a *real* pane in the same `terminal_panes` the
+    // built-in terminal panel paints from — no separate, hidden process
+    // table of its own, and no new rendering surface for this issue to add.
+    assert_eq!(
+        e.terminal_panes.len(),
+        1,
+        "vimcode.terminal.open must spawn into Engine::terminal_panes, the \
+         same pane vector the integrated terminal panel renders"
+    );
+
+    // `cat` echoes stdin back to stdout; EOT (Ctrl-D, 0x04) closes its
+    // stdin so it exits cleanly once `hello_2180` has been echoed.
+    exec(&mut e, "SendInput");
+
+    let reached = poll_until(&mut e, std::time::Duration::from_secs(10), |e| {
+        exec(e, "ReadState");
+        e.message.contains("hello_2180") && e.message.ends_with("|0")
+    });
+    assert!(
+        reached,
+        "on_output must deliver the command's echoed input and on_exit must \
+         fire with exit code 0; last message: {:?}",
+        e.message
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn unloading_plugin_closes_its_terminal_open_panes() {
+    // Absolute `sleep`, not a `PATH` lookup; see `posix_tool`'s doc.
+    let sleep = posix_tool("sleep");
+    let mut e = engine_with_plugin(
+        "",
+        "terminal_open_unload_2180",
+        &format!(
+            r#"
+        vimcode.command("OpenTerm", function(_)
+            vimcode.terminal.open({{ cmd = {{ "{sleep}", "30" }} }})
+        end)
+        "#
+        ),
+    );
+    exec(&mut e, "OpenTerm");
+    assert_eq!(
+        e.terminal_panes.len(),
+        1,
+        "setup: the terminal pane must be open before unload"
+    );
+
+    // "Unload" = install a fresh `PluginManager`, exactly the mechanism
+    // `unloading_plugin_stops_its_timers_and_spawns_from_calling_back` above
+    // uses for `loop.timer`/`loop.spawn`.
+    let fresh = vimcode_core::core::plugin::PluginManager::new().unwrap();
+    e.set_plugin_manager(fresh);
+
+    assert!(
+        e.terminal_panes.is_empty(),
+        "closing the extension (replacing its PluginManager) must close \
+         every terminal pane it opened via vimcode.terminal.open; panes \
+         remaining: {}",
+        e.terminal_panes.len()
+    );
+}
+
+/// Unlike `unloading_plugin_closes_its_terminal_open_panes` above (whose
+/// wrapped command is still running when the plugin is unloaded), this
+/// covers the pane whose wrapped command has *already exited* and delivered
+/// `on_exit` — the pane's own shell stays open afterwards (documented in
+/// EXTENSIONS.md: `h:send(...)` still works), so `Engine::plugin_terminals`
+/// must keep tracking it until the pane itself is removed. Dropping that
+/// tracking as soon as `on_exit` fires would make this reload's reap unable
+/// to find and close the still-open pane, leaving it orphaned.
+#[test]
+#[cfg(unix)]
+fn unloading_plugin_closes_terminal_pane_whose_command_already_exited() {
+    let _lock = TERMINAL_OPEN_SHELL_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _shell_guard = EnvVarGuard::set("SHELL", std::ffi::OsStr::new("/bin/sh"));
+    // Absolute `true`, not a `PATH` lookup; see `posix_tool`'s doc.
+    let true_bin = posix_tool("true");
+    let mut e = engine_with_plugin(
+        "",
+        "terminal_open_unload_exited_2180",
+        &format!(
+            r#"
+        _G.exit_code = nil
+        vimcode.command("OpenTerm", function(_)
+            vimcode.terminal.open({{
+                cmd = {{ "{true_bin}" }},
+                on_exit = function(code) _G.exit_code = code end,
+            }})
+        end)
+        vimcode.command("ReadExit", function(_)
+            vimcode.message(tostring(_G.exit_code))
+        end)
+        "#
+        ),
+    );
+    exec(&mut e, "OpenTerm");
+
+    let reached = poll_until(&mut e, std::time::Duration::from_secs(10), |e| {
+        exec(e, "ReadExit");
+        e.message == "0"
+    });
+    assert!(
+        reached,
+        "on_exit must fire with code 0 once `true` exits; last message: {:?}",
+        e.message
+    );
+    assert_eq!(
+        e.terminal_panes.len(),
+        1,
+        "the pane's shell stays open after the wrapped command exits, so \
+         the pane must still be present here"
+    );
+
+    let fresh = vimcode_core::core::plugin::PluginManager::new().unwrap();
+    e.set_plugin_manager(fresh);
+
+    assert!(
+        e.terminal_panes.is_empty(),
+        "unloading the extension must close this pane even though its \
+         wrapped command had already exited before the reload; panes \
+         remaining: {}",
+        e.terminal_panes.len()
+    );
+}
+
+/// Regression test for a `poll_ext_terminals` dispatch loop that holds pane
+/// *indices* across a Lua callback: `h1`'s `on_output` closes `h1` itself
+/// from inside the loop, which removes a pane out from under the
+/// in-flight iteration and shifts every later pane's index down by one.
+/// The loop must re-resolve each pane by handle id after every dispatch
+/// instead of continuing to use a stale index — otherwise it either indexes
+/// past the end of the now-shorter `terminal_panes` (a panic, with only one
+/// pane open) or silently delivers `h1`'s state onto whatever pane shifted
+/// into its old slot (with a sibling pane open, as here).
+#[test]
+#[cfg(unix)]
+fn terminal_open_close_from_on_output_does_not_panic_or_corrupt_sibling_pane() {
+    let _lock = TERMINAL_OPEN_SHELL_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _shell_guard = EnvVarGuard::set("SHELL", std::ffi::OsStr::new("/bin/sh"));
+    let cat = posix_tool("cat");
+    let mut e = engine_with_plugin(
+        "",
+        "terminal_open_close_in_output_2180",
+        &format!(
+            r#"
+        _G.out2 = ""
+        _G.exit2 = nil
+        vimcode.command("OpenBoth", function(_)
+            _G.h1 = vimcode.terminal.open({{
+                cmd = {{ "{cat}" }},
+                on_output = function(_) _G.h1:close() end,
+            }})
+            _G.h2 = vimcode.terminal.open({{
+                cmd = {{ "{cat}" }},
+                on_output = function(chunk) _G.out2 = _G.out2 .. chunk end,
+                on_exit = function(code) _G.exit2 = code end,
+            }})
+        end)
+        vimcode.command("Poke", function(_)
+            _G.h1:send("x\n")
+            _G.h2:send("hello_2180\n")
+            _G.h2:send("\4")
+        end)
+        vimcode.command("ReadState", function(_)
+            vimcode.message(_G.out2 .. "|" .. tostring(_G.exit2))
+        end)
+        "#
+        ),
+    );
+    exec(&mut e, "OpenBoth");
+    assert_eq!(e.terminal_panes.len(), 2, "setup: both panes must be open");
+    exec(&mut e, "Poke");
+
+    let reached = poll_until(&mut e, std::time::Duration::from_secs(10), |e| {
+        exec(e, "ReadState");
+        e.message.contains("hello_2180") && e.message.ends_with("|0")
+    });
+    assert!(
+        reached,
+        "h2 must keep delivering its own output/exit untouched by h1's \
+         close; last message: {:?}",
+        e.message
+    );
+    assert_eq!(
+        e.terminal_panes.len(),
+        1,
+        "h1 must end up closed and h2 must remain, with no panic in between"
     );
 }
 
