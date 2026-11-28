@@ -165,3 +165,51 @@ pub fn assert_msg_contains(e: &Engine, substr: &str) {
         e.message
     );
 }
+
+// ── Isolated nvim runtime dirs ──────────────────────────────────────────────
+
+/// A private `$XDG_RUNTIME_DIR` for one test-spawned `nvim` process, removed
+/// (server socket and all) when this guard drops.
+///
+/// Every `nvim` process creates a server socket at
+/// `$XDG_RUNTIME_DIR/nvim.<pid>.0` on startup and removes it only on a clean
+/// `:quit`. A harness that kills a disposable per-case `nvim` instead of
+/// quitting it (cheaper, and the usual choice when the process may be
+/// mid-command or mid-prompt) leaves that socket behind in whichever
+/// directory `XDG_RUNTIME_DIR` pointed at. Pointing every spawn at its own
+/// throwaway directory means any such leak lands there instead of the host's
+/// real (and often size-limited) runtime dir, and is deleted along with it —
+/// whether or not `nvim` itself got to clean up first.
+pub struct IsolatedNvimRuntimeDir {
+    path: std::path::PathBuf,
+}
+
+impl IsolatedNvimRuntimeDir {
+    /// Create a fresh, empty directory under the system temp dir and return
+    /// a guard that removes it (recursively) on drop, including on panic —
+    /// local drops run while a `#[test]` thread unwinds.
+    pub fn new(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!(
+            "vimcode_nvim_xdg_{tag}_{}_{nanos}_{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).expect("create isolated XDG_RUNTIME_DIR for nvim");
+        Self { path }
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for IsolatedNvimRuntimeDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
