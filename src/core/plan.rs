@@ -74,7 +74,7 @@ pub fn parse_plan_entries(value: &serde_json::Value) -> Option<Vec<PlanEntry>> {
 /// (`render::populate_ai_chat_controller`). Unicode checkbox glyphs
 /// (`\u{2610}`/`\u{2611}`) rather than Markdown `- [ ]`/`- [x]` syntax,
 /// since the transcript's plain `StyledText` path (not
-/// `ChatController::push_turn_markdown`'s list-aware renderer) is what
+/// `Chat::push_turn_markdown`'s list-aware renderer) is what
 /// every other turn in that panel already uses.
 pub fn plan_to_checklist_text(entries: &[PlanEntry]) -> String {
     let mut out = String::from("Plan:\n");

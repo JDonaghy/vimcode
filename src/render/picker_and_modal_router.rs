@@ -263,6 +263,9 @@ pub fn tab_switcher_to_quadraui_list_view(
         h_scroll: 0,
         max_content_width: None,
         show_v_scrollbar: false,
+        items_window: None,
+        scroll_px: None,
+        striped: false,
     }
 }
 
@@ -388,7 +391,7 @@ impl TabSwitcherGeometry {
 // never a freshly recomputed one.
 //
 // **Not a rung, deliberately:** the folder/workspace picker
-// (`quadraui::FolderPickerController`). It swallows every mouse event while
+// (`quadraui::FolderPicker`). It swallows every mouse event while
 // open, the same way a modal dialog does, so it is checked directly by both
 // backends ([`route_folder_picker_click`]) ahead of this router rather than
 // competing for z-order through [`MOUSE_ARBITRATION_ORDER`].

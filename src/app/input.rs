@@ -112,7 +112,7 @@ impl App {
     /// rather than threaded through unused.
     pub(crate) fn handle_ctrl_mouse_click(
         &mut self,
-        backend: &dyn quadraui::Backend,
+        backend: &mut dyn quadraui::Backend,
         x: f64,
         y: f64,
     ) {
@@ -134,6 +134,7 @@ impl App {
                     true, // real click: focus/tab/gutter side effects are intended
                     &mut drag,
                     false, // Ctrl+click has no Alt-fine-seek concept
+                    backend.paint_surface(),
                 ) {
                     engine.add_cursor_at_pos(line, col);
                 }
@@ -149,7 +150,7 @@ impl App {
     /// dropped from the signature.
     pub(crate) fn handle_mouse_double_click_msg(
         &mut self,
-        backend: &dyn quadraui::Backend,
+        backend: &mut dyn quadraui::Backend,
         x: f64,
         y: f64,
     ) {
@@ -175,12 +176,13 @@ impl App {
         // rather than just selecting, and a field-stack `Form` falls back
         // to `render::handle_plugin_view_tab_ui_event` exactly as the press
         // handler does (that function's own `DoubleClick` arm probes it as
-        // a `MouseDown` for `FormController`).
+        // a `MouseDown` for `ScrolledForm`).
         if let Some((name, rect)) = self.plugin_view_tab_hit(x, y) {
             let mut engine = self.engine.borrow_mut();
             engine.clear_sidebar_focus();
             let event = quadraui::UiEvent::DoubleClick {
                 widget: None,
+                button: quadraui::MouseButton::Left,
                 position: quadraui::Point::new(x as f32, y as f32),
             };
             let backend_rc = self.backend.clone();
@@ -247,6 +249,7 @@ impl App {
                         &self.cached_group_tab_bar_layouts.borrow(),
                         self.cached_editor_band_hits.borrow().as_ref(),
                         &mut drag_rc.borrow_mut(),
+                        backend.paint_surface(),
                     );
                 }
             }
@@ -267,7 +270,7 @@ impl App {
     ) {
         // ── Settings modal overlay scroll ────────────────────────────────
         // When the settings modal is open, route wheel events to its
-        // FormController so the settings list scrolls instead of the
+        // ScrolledForm so the settings list scrolls instead of the
         // editor underneath.
         if self.engine.borrow().settings_modal_open && delta_y.abs() > 0.01 {
             if let Some((px, py)) = self.last_editor_pointer.get() {
@@ -580,7 +583,7 @@ impl App {
     #[allow(clippy::too_many_arguments)]
     /// `ctx` is threaded in solely for the shared Alt rung's
     /// [`render::AltKeyOutcome::ResizeSidebar`] arm: GTK's authoritative
-    /// sidebar width *is* the runner's `AppShell` (TUI keeps its own copy and
+    /// sidebar width *is* the runner's `ShellView` (TUI keeps its own copy and
     /// syncs it out at end of dispatch), and `ShellContext::shell_mut` is the
     /// only handle to it. `ui_event` is the raw event `key_name`/
     /// `unicode`/... were decoded from, needed by the folder-picker rung —
@@ -694,7 +697,7 @@ impl App {
         // ── Shared folder-picker rung ───────────────────────────────────
         // Above every other tier: once `open_folder_dialog` (below) has
         // populated `folder_picker`, every key belongs to the picker.
-        // `FolderPickerController::handle` owns the key→intent mapping
+        // `FolderPicker::handle` owns the key→intent mapping
         // itself (Escape/Enter/Up/Down/k/j/-/Backspace/printable,
         // Ctrl-gated) — this rung just feeds it the raw event and applies
         // the outcome. Mirrors TUI's identical rung in `handle_key_pressed`
@@ -982,7 +985,7 @@ impl App {
     /// The Debug, Ai and Explorer halves of the focus-owner dispatch — the
     /// three arms [`render::dispatch_sidebar_panel_key`] hands back as `None`
     /// because they need state this backend owns (a live `Backend` for the
-    /// DAP `SidebarSystem` and the AI `ChatController`; the explorer
+    /// DAP `Sidebar` and the AI `Chat`; the explorer
     /// `DrawingArea`).
     ///
     /// `None` — not one of these three, keep dispatching.
@@ -998,7 +1001,7 @@ impl App {
     ) -> Option<Option<bool>> {
         match route {
             render::FocusKeyRoute::Debug => {
-                // Pass the real `ui_event` straight to `SidebarSystem::
+                // Pass the real `ui_event` straight to `Sidebar::
                 // handle` instead of reconstructing a `UiEvent` from `key_name`
                 // through the old `gtk_key_name_to_quadraui` table (which only
                 // covered a dozen named/nav keys and silently skipped `.handle`
@@ -1013,11 +1016,11 @@ impl App {
                 let rect = engine.dap_sidebar_body_rect.get();
                 render::populate_dap_sidebar_system(&engine);
                 let backend_rc = self.backend.clone();
-                let sidebar_event = engine.dap_sidebar_system.borrow_mut().handle(
-                    ui_event,
-                    &mut **backend_rc.borrow_mut(),
-                    rect,
-                );
+                let sidebar_event =
+                    engine
+                        .dap_sidebar
+                        .borrow_mut()
+                        .handle(ui_event, &**backend_rc.borrow(), rect);
                 let consumed = engine.dispatch_dap_sidebar_event(sidebar_event);
                 if !consumed {
                     engine.dispatch_dap_sidebar_action_key(key_name);
@@ -1025,7 +1028,7 @@ impl App {
                 Some(Some(engine.dap_sidebar_has_focus))
             }
             render::FocusKeyRoute::Ai => {
-                // Unlike Debug (nav-only), the AI panel's `ChatController`
+                // Unlike Debug (nav-only), the AI panel's `Chat`
                 // needs the real, un-round-tripped `UiEvent` — `KeyPressed`
                 // *or* `CharTyped` — so free-form typed text reaches its
                 // input buffer.
@@ -1061,7 +1064,7 @@ impl App {
         }
     }
 
-    /// Reconcile the runner's own `AppShell` (`ctx.shell()`/`ctx.shell_mut()`)
+    /// Reconcile the runner's own `ShellView` (`ctx.shell()`/`ctx.shell_mut()`)
     /// with `engine.app_shell`'s (the "shadow" copy's) current sidebar
     /// visibility, pushing `show_panel`/`hide_sidebar` through `ctx` if the
     /// two have drifted.
@@ -1070,12 +1073,12 @@ impl App {
     /// original, and until now only, caller — see that method's own doc for
     /// *why* the two copies need reconciling at all) so
     /// [`Self::on_shell_event_ctx`] can call it too. That second call site
-    /// exists because of a gap this issue's fix exposed: `AppShell` never
+    /// exists because of a gap this issue's fix exposed: `ShellView` never
     /// runs its own toggle for a *bottom* item (`BottomItemClicked`) — it
     /// only ever reports the click, both directions — so
     /// `on_shell_event`'s `BottomItemClicked` arm is 100% responsible for
     /// deciding the new visibility, entirely inside `engine.app_shell`. Left
-    /// unsynced, the runner's own `AppShell` (which is what actually
+    /// unsynced, the runner's own `ShellView` (which is what actually
     /// determines whether `render_content`'s sidebar column exists in the
     /// composited frame — `engine.app_shell` only decides *which panel's
     /// content* to paint inside it) never learns the sidebar closed: a
@@ -1102,7 +1105,7 @@ impl App {
     /// `ctx` is threaded in for the visibility sync: `render::post_key_epilogue`'s
     /// autohide arm calls `engine.app_shell.hide_sidebar()`, but
     /// `engine.app_shell` is only the "shadow" copy of shell state — GTK's
-    /// actual painted layout comes from the runner's own `AppShell`, reachable
+    /// actual painted layout comes from the runner's own `ShellView`, reachable
     /// solely through `ShellContext::shell_mut`. Without pushing the change
     /// through, the flag flips but nothing paints from it and the sidebar
     /// visually stays open.

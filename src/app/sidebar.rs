@@ -43,7 +43,7 @@ impl App {
     pub(crate) fn sync_menu_overlay(&self) {}
 
     /// Dispatch a menu action by command string, as produced by
-    /// `quadraui::MenuEvent::Activated`.
+    /// `quadraui::AppMenuEvent::Activated`.
     pub(crate) fn handle_menu_action(&mut self, action: String) {
         match action.as_str() {
             "open_file_dialog" => {
@@ -212,9 +212,9 @@ impl App {
     }
 
     /// `UiEvent` (scroll, mouse) over the explorer panel — routed through
-    /// `TreeController::handle` for scrollbar interaction.
+    /// `TreeView::handle` for scrollbar interaction.
     ///
-    /// The `TreeController` widget dispatch itself is
+    /// The `TreeView` widget dispatch itself is
     /// [`render::route_explorer_tree_event`], shared with TUI. What stays
     /// here is GTK-only plumbing: which events this panel claims at all
     /// (`dominated`), pulling the metrics/backend/theme it needs, and
@@ -292,23 +292,30 @@ impl App {
                 position,
             );
         }
-        if matches!(ev, quadraui::UiEvent::DoubleClick { .. }) {
-            self.engine
-                .borrow_mut()
-                .dispatch_explorer_tree_event(tree_event);
-        } else if matches!(ev, quadraui::UiEvent::MouseDown { .. }) {
-            // Record a potential drag-and-drop source — mirrors
-            // TUI's identical arm in `mouse::handle_mouse` — only a genuine
-            // row selection (not a chevron toggle or a scrollbar drag) arms
-            // one.
-            if let quadraui::TreeControllerEvent::RowSelected { ref path } = tree_event {
-                if let Some(&row_idx) = path.first() {
-                    self.explorer_drag_src = Some(row_idx as usize);
+        if let quadraui::Handled::Event(tree_event) = tree_event {
+            if matches!(ev, quadraui::UiEvent::DoubleClick { .. }) {
+                self.engine
+                    .borrow_mut()
+                    .dispatch_explorer_tree_event(tree_event);
+            } else if matches!(ev, quadraui::UiEvent::MouseDown { .. }) {
+                // Record a potential drag-and-drop source — mirrors
+                // TUI's identical arm in `mouse::handle_mouse` — only a genuine
+                // left-button row press (not a chevron toggle or a scrollbar
+                // drag) arms one.
+                if let quadraui::TreeEvent::RowClicked {
+                    ref path,
+                    button: quadraui::MouseButton::Left,
+                    ..
+                } = tree_event
+                {
+                    if let Some(&row_idx) = path.first() {
+                        self.explorer_drag_src = Some(row_idx as usize);
+                    }
                 }
+                self.engine
+                    .borrow_mut()
+                    .handle_explorer_mouse_event(tree_event);
             }
-            self.engine
-                .borrow_mut()
-                .handle_explorer_mouse_event(tree_event);
         }
         self.queue_explorer_draw();
         self.draw_needed.set(true);
@@ -426,7 +433,7 @@ impl App {
         // `handle_mouse_drag_msg`/`handle_mouse_up_msg` — the
         // `MouseDragRoute::ExplorerDnd` rung and `render::apply_explorer_drop`
         // — not loop back through here into `explorer_ui_event`, which would
-        // hand a plain `MouseMoved` to `TreeController::handle` and get its
+        // hand a plain `MouseMoved` to `TreeView::handle` and get its
         // *scrollbar*-drag `drag_to`, never the row-under-pointer tracking a
         // DnD gesture needs. The press itself still claims capture as usual
         // (`explorer_ui_event` arms `explorer_drag_src` from that same press).
@@ -492,7 +499,7 @@ impl App {
         // click on the diff's left pane (which happens to fall inside
         // `sidebar_content_bounds`, since the surface deliberately doesn't
         // resize/hide the sidebar it's painted over) drove the sidebar's own
-        // `TreeController`/panel row hit-test instead of ever reaching
+        // `TreeView`/panel row hit-test instead of ever reaching
         // `handle_mouse_click_msg`'s change-review block further down —
         // `route_and_apply_change_review_click` was correct but unreachable
         // for any click whose *coordinates* happened to land in that band.
@@ -590,10 +597,10 @@ impl App {
             render::SidebarOwner::ExtPanel(_) => {
                 // `render_content` now paints this panel through
                 // `render::ext_panel_to_tree_view` — the same adapter TUI
-                // uses — not `ext_sidebar_system` (the extension
+                // uses — not `ext_sidebar` (the extension
                 // marketplace), so routing goes through the shared
                 // `render::route_ext_panel_click` router instead, built on
-                // the `Backend::tree_layout` cached at paint time
+                // the `DrawsPrimitives::layout_primitive` cached at paint time
                 // (`Engine::ext_panel_tree_layout`) rather than a
                 // hand-rolled row formula (this backend pitches a tree's
                 // header rows shorter than its item rows — see that cache
@@ -603,7 +610,7 @@ impl App {
                     engine.ext_panel_has_focus = true;
                 }
                 // A view-backed panel painted a `quadraui::Form`, so its
-                // clicks resolve through `FormController` (and dispatch to the
+                // clicks resolve through `ScrolledForm` (and dispatch to the
                 // plugin's `on_event`), not through the tree-row router.
                 let is_view = engine
                     .ext_panel_active
@@ -621,7 +628,7 @@ impl App {
                     // = view_name, ... })` — this arm must come before the
                     // generic `is_view` one below, which would otherwise
                     // swallow every event (including this one) by routing it
-                    // to `FormController` first.
+                    // to `ScrolledForm` first.
                     UiEvent::MouseDown {
                         button: quadraui::MouseButton::Right,
                         ..
@@ -632,7 +639,7 @@ impl App {
                     }
                     // A `ViewBody`-kind view routes through its own
                     // matching primitive's click/scroll resolution instead
-                    // of `FormController` — `render::route_plugin_view_body_
+                    // of `ScrolledForm` — `render::route_plugin_view_body_
                     // event`, shared with the tab-hosted arm below. See the
                     // paint arm (`paint_sidebar_panel_rung`'s `ext:` case)
                     // for the matching kind branch.
@@ -726,7 +733,7 @@ impl App {
     ///
     /// `render_content` paints the title + action-button chrome and stashes its
     /// hit regions in `engine.dap_sidebar_action_hits` in absolute pixel space.
-    /// Everything below the chrome goes to the shared `SidebarSystem` at the body
+    /// Everything below the chrome goes to the shared `Sidebar` at the body
     /// rect it painted into ([`render::dispatch_dap_sidebar_body_event`]).
     pub(crate) fn route_debug_sidebar_event(
         &mut self,
@@ -828,7 +835,7 @@ impl App {
     /// can never derive a different layout than the one actually on screen.
     /// The dispatch itself is [`render::route_ai_chat_event`],
     /// which needs a live `Backend` (like [`Self::route_debug_sidebar_event`])
-    /// for `ChatController::handle`'s own layout/hit-test math. Consumes the
+    /// for `Chat::handle`'s own layout/hit-test math. Consumes the
     /// press unconditionally like every other panel arm in
     /// `try_route_sidebar_mouse_event` — a click on empty panel padding still
     /// belongs to this panel, not the editor underneath it.
@@ -853,7 +860,7 @@ impl App {
             // insert buffered text.
             engine.ai_leader_toggle_pending.clear();
             // A press landing on the pinned plan block's band
-            // toggles its collapse state instead of reaching `ChatController`
+            // toggles its collapse state instead of reaching `Chat`
             // — checked first (before the metrics re-apply/`route_ai_chat_
             // event` call below) exactly like `route_board_sidebar_event`'s
             // right-click resolves against its own cached layout ahead of

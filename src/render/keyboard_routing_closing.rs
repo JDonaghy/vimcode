@@ -13,7 +13,7 @@ use super::*;
 //    the chord fell through to whatever tier was next — `Engine::handle_key`
 //    with the editor focused, or the focused sidebar panel's own key table
 //    otherwise — instead of being consumed as a repaint request.
-// 2. The modal folder picker (`quadraui::FolderPickerController`) — key
+// 2. The modal folder picker (`quadraui::FolderPicker`) — key
 //    handling lives entirely in the controller now, so there is no `render.rs`
 //    rung to state for it; both backends just feed it the raw `UiEvent` while
 //    the picker is open.
@@ -48,9 +48,9 @@ use super::*;
 /// the four routes this cannot own:
 ///
 /// - [`FocusKeyRoute::Debug`] needs a live `Backend` and the un-round-tripped
-///   `UiEvent` to drive `dap_sidebar_system`,
+///   `UiEvent` to drive `dap_sidebar`,
 /// - [`FocusKeyRoute::Ai`] needs the same — a live `Backend` and the
-///   un-round-tripped `UiEvent` — to drive `ai_chat` (`ChatController`);
+///   un-round-tripped `UiEvent` — to drive `ai_chat` (`Chat`);
 ///   see [`route_ai_chat_event`],
 /// - [`FocusKeyRoute::Explorer`] is a backend widget on GTK and a `TuiSidebar`
 ///   on TUI,
@@ -188,7 +188,7 @@ pub fn popup_overlay_closed_this_frame(was_open: bool, is_open_now: bool) -> boo
     was_open && !is_open_now
 }
 
-/// Popup rect for the folder-picker modal (`quadraui::FolderPickerController`,
+/// Popup rect for the folder-picker modal (`quadraui::FolderPicker`,
 /// #815), in the caller's own units.
 ///
 /// Both backends use the same proportions the controller's own
@@ -207,7 +207,7 @@ pub fn folder_picker_popup_rect(viewport: quadraui::Rect, line_height: f32) -> q
 
 /// Visible list rows inside an open folder picker's popup — the popup height
 /// minus the `Palette` chrome (title + query + borders,
-/// `quadraui::PALETTE_CHROME_ROWS`) that `FolderPickerController::handle`
+/// `quadraui::PALETTE_CHROME_ROWS`) that `FolderPicker::handle`
 /// needs to keep the selection's scroll position in sync.
 pub fn folder_picker_visible_rows(popup_rect: quadraui::Rect, line_height: f32) -> usize {
     let rows = (popup_rect.height / line_height.max(f32::EPSILON)) as usize;
@@ -236,7 +236,7 @@ pub enum FolderPickerClickRoute {
 /// Resolve a mouse press at `(x, y)` against the folder picker's painted
 /// popup `rect`. `row_height` is the backend's line height (`1.0` on TUI, the
 /// painted pixel line height on GTK); `scroll_top`/`total_filtered` come
-/// straight off the live `FolderPickerController`.
+/// straight off the live `FolderPicker`.
 pub fn route_folder_picker_click(
     rect: quadraui::Rect,
     x: f32,
@@ -260,23 +260,6 @@ pub fn route_folder_picker_click(
         }
     }
     FolderPickerClickRoute::Consume
-}
-
-/// Move an open folder picker's selection to `idx` by repeated
-/// `move_up`/`move_down` calls.
-///
-/// `FolderPickerController` (quadraui) exposes no direct "set selected index"
-/// setter — only relative movement, clamped at both ends — so a mouse click
-/// on a specific row has to walk there one step at a time. The list is capped
-/// at 50 entries (`FolderPickerController`'s own `filter_dir_entries` cap),
-/// so this is at most 50 calls, all pure index arithmetic.
-pub fn set_folder_picker_selected(picker: &mut quadraui::FolderPickerController, idx: usize) {
-    while picker.selected() < idx {
-        picker.move_down();
-    }
-    while picker.selected() > idx {
-        picker.move_up();
-    }
 }
 
 /// Where a mouse press against the open change-review surface lands,
@@ -1184,7 +1167,7 @@ mod slice7_router_tests {
 
     /// `menu_defs_to_menu_bar` preserves top-level order and reuses each
     /// `MenuDef`'s `ContextMenuItem` list verbatim as the `MenuBarItem`'s
-    /// submenu — the native NSMenu installer and the drawn `MenuSystem`
+    /// submenu — the native NSMenu installer and the drawn `AppMenu`
     /// dropdown must never be able to disagree about what's in the menu.
     #[test]
     fn menu_defs_to_menu_bar_preserves_order_and_submenu_contents() {
@@ -1674,7 +1657,7 @@ mod slice7_router_tests {
 
     #[test]
     fn a_settings_form_event_is_not_mistaken_for_a_plugin_one() {
-        // The Settings panel paints through the *same* `FormController` shape,
+        // The Settings panel paints through the *same* `ScrolledForm` shape,
         // with ids like `cat-0` / `core-tabstop`. If the namespace check were
         // dropped, a Settings click would be dispatched into a plugin.
         assert!(

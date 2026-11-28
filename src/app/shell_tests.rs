@@ -267,7 +267,7 @@ mod portable_entry_point_tests {
     /// The GTK mirror of the pre-#1434 TUI shell's
     /// `take_requested_panel_echo_does_not_steal_focus` — a *reconciliation*
     /// `PanelChanged` (the one `Self::take_requested_panel` synthesizes to steer
-    /// the runner's `AppShell` back to what the shadow `engine.app_shell`
+    /// the runner's `ShellView` back to what the shadow `engine.app_shell`
     /// already believes, e.g. after a DAP reveal or keyboard accelerator)
     /// must only update `Self::last_shell_panel` bookkeeping — never call
     /// `Engine::focus_sidebar_panel` the way a genuine activity-bar click does.
@@ -289,7 +289,7 @@ mod portable_entry_point_tests {
 
         let mut app = App::new_headless(Rc::clone(&engine));
         let _ = app.take_requested_panel(); // returns Some(explorer), arms suppress
-        app.dispatch_shell_event(&quadraui::AppShellEvent::PanelChanged {
+        app.dispatch_shell_event(&quadraui::ShellEvent::PanelChanged {
             panel_id: quadraui::WidgetId::new(PANEL_EXPLORER),
         });
 

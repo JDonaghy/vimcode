@@ -3125,7 +3125,7 @@ mod tests {
             h_plain
                 .engine
                 .borrow()
-                .menu_system
+                .app_menu
                 .borrow_mut()
                 .set_menus(defs);
         }
@@ -3151,7 +3151,7 @@ mod tests {
             h_marked
                 .engine
                 .borrow()
-                .menu_system
+                .app_menu
                 .borrow_mut()
                 .set_menus(defs);
         }
@@ -3345,7 +3345,7 @@ mod tests {
     /// **visible** activity-bar icon on the GTK `ShellApp` path.
     ///
     /// `build_shell_config` derives the runner's panel list from the engine's
-    /// `AppShell`, which only ever holds the seven built-ins — extension
+    /// `ShellView`, which only ever holds the seven built-ins — extension
     /// panels live in `engine.ext_panels` and were dropped entirely, so e.g.
     /// the Git Insights extension registered a display name and an icon and
     /// nothing rendered for it.
@@ -3360,7 +3360,7 @@ mod tests {
     /// rasteriser draws its glyphs straight to the Cairo context
     /// (`quadraui/src/gtk/activity_bar.rs`) rather than through the recorded
     /// `draw_text` path, so `painted_texts()` cannot see the icon strip at
-    /// all. Rather than hard-code the icon's row (fragile against `AppShell`'s
+    /// all. Rather than hard-code the icon's row (fragile against `ShellView`'s
     /// own layout constants), this renders the *same* app twice — once with
     /// the extension registered, once without — and requires the activity-bar
     /// column to differ. Only the extra icon can account for that: everything
@@ -3882,6 +3882,7 @@ mod tests {
         // it hidden.
         h.driver.dispatch(quadraui::UiEvent::DoubleClick {
             widget: None,
+            button: quadraui::MouseButton::Left,
             position: Point::new(ex, ey),
         });
         h.driver.render();
@@ -4317,7 +4318,7 @@ mod tests {
     /// above was never the defect — the engine always opened a second tab.
     /// The tab had nowhere to *paint*. `App::shell_config` left
     /// `ShellConfig::default_sidebar_width` at quadraui's generic `20.0`,
-    /// which `AppShell::compute_layout` multiplies by `line_height` on
+    /// which `ShellView::compute_layout` multiplies by `line_height` on
     /// *every* backend: 20 terminal rows on TUI, but ~460 device pixels on a
     /// GUI one. Beside the 48px activity bar that left ~290px of an 800px
     /// window for the editor and its tab bar — room for exactly one tab.
@@ -4409,6 +4410,7 @@ mod tests {
             .expect("the populated explorer row must paint main.rs's file name");
         h.driver.dispatch(quadraui::UiEvent::DoubleClick {
             widget: None,
+            button: quadraui::MouseButton::Left,
             position: quadraui::Point::new(x, y),
         });
         h.driver.render();
@@ -4621,7 +4623,7 @@ mod sidebar_panel_clicks {
     }
 
     /// Selecting Board renders a board sourced from a mock provider.
-    /// Asserts on the *rasterised* card title (`Backend::draw_board`'s Cairo/Pango
+    /// Asserts on the *rasterised* card title (`DrawsPrimitives::draw_primitive`'s Cairo/Pango
     /// output via `painted_text`), not on `Engine::board_model` being populated.
     #[test]
     fn board_panel_paints_mock_provider_board() {
@@ -4637,7 +4639,7 @@ mod sidebar_panel_clicks {
         assert!(
             h.driver.screen_contains("Improve board host"),
             "Board panel should paint the mock provider's card via \
-             Backend::draw_board; painted: {:?}",
+             DrawsPrimitives::draw_primitive; painted: {:?}",
             h.driver.painted_texts()
         );
         assert!(
@@ -4755,6 +4757,7 @@ mod sidebar_panel_clicks {
 
         h.driver.dispatch(quadraui::UiEvent::DoubleClick {
             widget: None,
+            button: quadraui::MouseButton::Left,
             position: Point::new(cx, cy),
         });
         h.driver.render();
@@ -4917,12 +4920,12 @@ mod sidebar_panel_clicks {
 
     /// The Settings sidebar panel's `SidebarPanelBody` must be given
     /// `background: Some(theme.tab_bar_bg)`, not `None` — before this fix,
-    /// nothing filled the panel rect before `FormController` painted over
+    /// nothing filled the panel rect before `ScrolledForm` painted over
     /// it, so the handful of pixels its scrollbar widget only *partially*
     /// covers (a semi-opaque overlay track at the sidebar's right edge)
     /// still showed whatever was behind them: GTK's own dark default clear
     /// colour with `background: None`, the themed sidebar fill with
-    /// `Some(theme.tab_bar_bg)`. Everywhere else in the panel `FormController`
+    /// `Some(theme.tab_bar_bg)`. Everywhere else in the panel `ScrolledForm`
     /// already paints an opaque per-row background regardless of this field
     /// (confirmed while writing this test — a plain row probe reads
     /// identically with either `background` value), so the scrollbar strip
@@ -4965,17 +4968,17 @@ mod sidebar_panel_clicks {
     }
 
     /// The sidebar header row (the `" EXPLORER "` strip above the tree,
-    /// painted by quadraui's `AppShell::render`) must come from vimcode's own
-    /// theme on GTK too. Before quadraui#1180, `AppShell::render` painted a
+    /// painted by quadraui's `ShellView::render`) must come from vimcode's own
+    /// theme on GTK too. Before quadraui#1180, `ShellView::render` painted a
     /// hard-coded `Color::rgb(37, 37, 38)` regardless of theme; under
     /// `light` that read as a dark band behind a light sidebar.
     /// `to_quadraui_theme_chrome` has mapped `header_bg`/`header_fg` from
     /// `theme.status_bg`/`theme.status_fg`, but the mapping had no effect
-    /// because `AppShell::render` never read those fields.
+    /// because `ShellView::render` never read those fields.
     ///
     /// The header's first frame still reads whatever `Backend::theme()` returned
     /// before any `set_theme` call landed, because `App::sync_per_frame_backend
-    /// _state` pushes the theme *after* `AppShell::render` paints the header.
+    /// _state` pushes the theme *after* `ShellView::render` paints the header.
     /// A second frame carries the now-set theme forward.
     #[test]
     fn sidebar_header_paints_vimcode_theme_not_quadraui_dark_literal() {
@@ -5172,10 +5175,10 @@ mod sidebar_panel_clicks {
     /// unambiguous visibility check.
     ///
     /// `paint_sidebar_panel_rung`'s `PANEL_SEARCH` arm calls
-    /// `search_sidebar_system.set_backend_info` — the exact mechanism already
-    /// fixed for `sc_sidebar_system` and `ext_sidebar_system`. `SidebarSystem::
-    /// handle_cached` returns `SidebarEvent::Ignored` unconditionally until
-    /// `set_backend_info` has been called at least once.
+    /// `search_sidebar.record_metrics` — the exact mechanism already
+    /// fixed for `sc_sidebar` and `ext_sidebar`. `Sidebar::
+    /// handle_cached` returns `SidebarAction::Ignored` unconditionally until
+    /// `record_metrics` has been called at least once.
     #[test]
     fn search_panel_scrolls_under_the_wheel() {
         let mut engine = Engine::new();
@@ -6181,7 +6184,7 @@ second line here
     }
 
     /// AI: selecting the panel must paint its content through the adopted
-    /// `quadraui::ChatController` — the `ChatController::render`'s status strip
+    /// `quadraui::Chat` — the `Chat::render`'s status strip
     /// is this panel's header row. Asserts on the *rendered* header text via
     /// `screen_contains`, never on engine state alone.
     #[test]
@@ -6194,7 +6197,7 @@ second line here
     }
 
     /// AI: a press anywhere in the panel body must focus it. The
-    /// `ChatController` input has no separate "not editing" mode — every
+    /// `Chat` input has no separate "not editing" mode — every
     /// keystroke lands in the input once focused — so this is a single
     /// always-focused body, not a click-focuses/click-in-input-edits split.
     #[test]
@@ -6210,7 +6213,7 @@ second line here
         );
     }
 
-    /// AI: typing after a click must land in the `ChatController` input box
+    /// AI: typing after a click must land in the `Chat` input box
     /// and grow across multiple visual lines on `Enter`. The pre-#819
     /// hand-rolled input never actually supported multi-line input: plain
     /// `Enter` used to *submit* instead of inserting a newline.
@@ -6352,7 +6355,7 @@ second line here
 
     /// AI: the transcript must scroll — messages painted while stuck to the
     /// tail must no longer include the earliest message once scrolled up, and
-    /// scrolling must reveal it. `ChatController` follows the tail by default,
+    /// scrolling must reveal it. `Chat` follows the tail by default,
     /// so a fresh long conversation shows only its most recent turns until the
     /// user scrolls.
     #[test]
@@ -6392,7 +6395,7 @@ second line here
         }
 
         assert_eq!(
-            h.engine.borrow().ai_chat.borrow().transcript_scroll_top(),
+            h.engine.borrow().ai_chat.borrow().transcript_scroll_top,
             0,
             "60 wheel notches (180 rows) must be enough to reach the very \
              top of a 60-message transcript"
@@ -6410,7 +6413,7 @@ second line here
     /// a future Board/remote-worker plan-preview command would hand the engine.
     ///
     /// The plan no longer scrolls with the transcript as a synthetic trailing
-    /// turn — it's a pinned block above `ChatController`, collapsed by default
+    /// turn — it's a pinned block above `Chat`, collapsed by default
     /// to just the in-progress entry, expanding to the full checklist on a
     /// header click.
     #[test]
@@ -7687,7 +7690,7 @@ second line here
     /// rebuilding the transcript from the agent's replayed history through the
     /// exact same chunk-mapping path a live turn uses.
     ///
-    /// Regression guard for collapsed-turn staleness: `ChatController` keys
+    /// Regression guard for collapsed-turn staleness: `Chat` keys
     /// collapsed/summary state by *transcript index* and `set_transcript` does
     /// not clear it, so a `populate_ai_chat_controller` that only ever sets the
     /// collapsed case leaves index 1's pre-`:AiClear` "Thinking…" collapse on the
@@ -8046,7 +8049,7 @@ second line here
     /// clicks. `ShellAdapter::handle` hit-tests the modal stack *before* any
     /// chrome dispatch, and this surface's entry covers the whole viewport, so a
     /// leftover entry routes every later mouse event straight into `App::handle`
-    /// instead of `AppShell`'s own handling — the activity bar stops switching
+    /// instead of `ShellView`'s own handling — the activity bar stops switching
     /// panels for the rest of the session.
     #[test]
     fn change_review_close_restores_chrome_clicks_via_gtk_driver() {
@@ -8092,7 +8095,7 @@ second line here
         );
 
         // The regression: with the surface closed, a click on the Search
-        // icon must still reach `AppShell`'s activity-bar dispatch.
+        // icon must still reach `ShellView`'s activity-bar dispatch.
         let (sx, sy) = h
             .driver
             .find(crate::icons::SEARCH.s())
@@ -8103,7 +8106,7 @@ second line here
             h.driver.screen_contains("Replace…"),
             "after the change-review surface closed, an activity-bar click \
              must still switch panels — a leftover full-viewport ModalStack \
-             entry routes it past AppShell's chrome dispatch entirely"
+             entry routes it past ShellView's chrome dispatch entirely"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -8535,7 +8538,7 @@ second line here
         use super::*;
 
         /// The send/stop/leave hint `render::populate_ai_chat_controller` pins to
-        /// `ChatController::set_hint` must reach the painted surface once the panel
+        /// `Chat::set_hint` must reach the painted surface once the panel
         /// has focus, and stay there once the user starts typing — unlike the
         /// `TextInput` placeholder above it, which vanishes the moment the input
         /// buffer is non-empty.
@@ -8690,7 +8693,7 @@ second line here
 
         /// The AI panel's status strip must show the live in-progress tool call's
         /// title plus an elapsed-time reading while busy, and the busy `Spinner`
-        /// icon (`ChatController::set_spinner_frame`, previously never called at
+        /// icon (`Chat::set_spinner_frame`, previously never called at
         /// all) must actually animate.
         ///
         /// `GtkDriver` has no `tick()` — draining is done directly via
@@ -8751,7 +8754,7 @@ second line here
             // The spinner glyph painted immediately before "execute: Run
             // the tests" must actually move on the *painted surface* —
             // not just `Engine::ai_spinner_frame` (an internal counter
-            // that can advance while `ChatController::render`/the GTK
+            // that can advance while `Chat::render`/the GTK
             // rasteriser stops repainting the glyph, e.g. a stale
             // `set_spinner_frame` call or a layout cache suppressing the
             // repaint). `painted_texts()` lists each distinct text run the
@@ -9028,7 +9031,7 @@ second line here
         /// cancels the busy turn and flips the queued turn to a plain, undimmed line
         /// — all read from the *painted* surface.
         ///
-        /// `queued (1` (no trailing paren): `ChatController::render` overlays a
+        /// `queued (1` (no trailing paren): `Chat::render` overlays a
         /// separate busy `Spinner` icon at a fixed position at the right end of the
         /// status strip, painted on top of whatever status text lands under it.
         #[cfg(unix)]
@@ -11871,7 +11874,7 @@ mod command_center {
     }
 
     /// With no drawn menu row this frame, the title-bar band's background must
-    /// reach the canvas as a plain solid fill — `Backend::draw_solid_fill`, which
+    /// reach the canvas as a plain solid fill — `render::fill_solid`, which
     /// every backend records as a `chrome:solid-fill` zone — and never as an
     /// item-less filler `MenuBar` widget. On a
     /// native-menu backend painting a `MenuBar` is the platform menu-bar *install* point, so
@@ -11917,7 +11920,7 @@ mod command_center {
         });
         assert!(
             band_fill,
-            "the title-bar band must be filled with draw_solid_fill while the \
+            "the title-bar band must be filled with fill_solid while the \
              drawn menu row is hidden (a `chrome:solid-fill` zone spanning the \
              Command Center's painted bounds); zones were {:?}",
             h.driver
@@ -11952,7 +11955,7 @@ mod command_center {
 
         let menu_row = h.menu_row_rect.get();
         let (_app_icon, items_rect) = crate::render::split_menu_row_for_app_icon(menu_row, 0.0);
-        let menu_bar = h.engine.borrow().menu_system.borrow().menu_bar();
+        let menu_bar = h.engine.borrow().app_menu.borrow().build_menu_bar();
         let file_idx = menu_bar
             .items
             .iter()
@@ -11982,9 +11985,9 @@ mod command_center {
         assert_eq!(
             h.engine
                 .borrow()
-                .menu_system
+                .app_menu
                 .borrow()
-                .menu_bar()
+                .build_menu_bar()
                 .focused_item,
             Some(file_idx),
             "precondition: hovering File focuses it"
@@ -12015,9 +12018,9 @@ mod command_center {
         assert_eq!(
             h.engine
                 .borrow()
-                .menu_system
+                .app_menu
                 .borrow()
-                .menu_bar()
+                .build_menu_bar()
                 .focused_item,
             None,
             "moving onto the Command Center must clear the menu-bar hover"
@@ -12068,7 +12071,7 @@ mod command_center {
         // GTK's `titlebar_control_inset()` is the trait default (zero), so menu
         // items start after the app-icon slot.
         let (_app_icon, items_rect) = crate::render::split_menu_row_for_app_icon(menu_row, 0.0);
-        let menu_bar = h.engine.borrow().menu_system.borrow().menu_bar();
+        let menu_bar = h.engine.borrow().app_menu.borrow().build_menu_bar();
         let file_idx = menu_bar
             .items
             .iter()
@@ -14534,7 +14537,7 @@ mod app_icon {
     }
 
     /// The fix lives in **shared**
-    /// `App::handle_dispatch` (the `MenuEvent::Ignored` arm just above the
+    /// `App::handle_dispatch` (the `AppMenuEvent::Ignored` arm just above the
     /// Command Center block), not TUI-side wiring, so a GTK user gets the
     /// identical dismiss-on-unrecognised-key behaviour. On GTK/macOS
     /// `menu_bar_visible` is always `true` (`ShellApp::setup`'s three-way
@@ -14547,12 +14550,12 @@ mod app_icon {
     /// `clicking_file_after_the_app_icon_still_opens_the_file_menu` above
     /// proves opens it), then send one plain, unrecognised `KeyPressed`
     /// (`'q'` — not Escape/an arrow/Enter/a matching Alt+<letter>, so it
-    /// falls through `MenuSystem::handle` to `MenuEvent::Ignored` exactly
+    /// falls through `AppMenu::handle` to `AppMenuEvent::Ignored` exactly
     /// like the TUI scenario's stray `0`/`w`/`d`/`w`), and asserts the
     /// dropdown's "New Tab" entry stops painting.
     ///
     /// RED-verified the same way the TUI test was: reverting the
-    /// `MenuEvent::Ignored` arm to `{}` leaves "New Tab" painted after the
+    /// `AppMenuEvent::Ignored` arm to `{}` leaves "New Tab" painted after the
     /// `'9'` keystroke on this exact path.
     #[test]
     fn unrecognised_key_closes_a_stale_open_dropdown_on_gtk_1763() {
@@ -14574,8 +14577,8 @@ mod app_icon {
         );
 
         // A plain, unrecognised key — not Escape/an arrow/Enter/a matching
-        // Alt+<letter> mnemonic — must fall through `MenuSystem::handle` to
-        // `MenuEvent::Ignored` and, via the shared `App::handle_dispatch`
+        // Alt+<letter> mnemonic — must fall through `AppMenu::handle` to
+        // `AppMenuEvent::Ignored` and, via the shared `App::handle_dispatch`
         // fix, close the stale dropdown. `'9'` (a digit — just starts a
         // harmless, inert Vim count-prefix accumulation underneath, unlike
         // a letter such as `'q'` which would start macro recording) is
@@ -14755,7 +14758,7 @@ mod clipboard_paste {
     /// The command palette's backdrop scrim must dim the editor band behind
     /// it without touching the status bar, on GTK's real Cairo alpha-blend
     /// compositing. `render::paint_picker_rung` is shared between both
-    /// backends, and `Backend::draw_solid_fill` alpha-blends on both — see
+    /// backends, and `render::fill_solid` alpha-blends on both — see
     /// `picker_open_leaves_status_bar_text_visible_via_shell_app` in
     /// `src/tui_main/app_on_tui_tests.rs` for the TUI half — but this
     /// backend needs its own black-box coverage of the same `scrim_rect`
@@ -15573,7 +15576,7 @@ mod scrollbar_paint {
     }
 
     /// A directory listing with far more rows than any plausible viewport,
-    /// so the Explorer's `TreeController` always needs a scrollbar.
+    /// so the Explorer's `TreeView` always needs a scrollbar.
     fn engine_with_overflowing_explorer() -> Engine {
         let mut engine = Engine::new_for_test();
         engine.session.explorer_visible = true;
@@ -15636,7 +15639,7 @@ mod scrollbar_paint {
     }
 
     /// The sidebar scrollbar double-paints an adjacent phantom band.
-    /// `TreeController::render` narrows `rect` into `(tree_rect, sb_rect)`
+    /// `TreeView::render` narrows `rect` into `(tree_rect, sb_rect)`
     /// and paints the real scrollbar explicitly into `sb_rect` (width =
     /// `backend.line_height()`) — but it also calls `backend.draw_tree(
     /// tree_rect, &tree)` first, and `tree` still carries every row,
@@ -15644,7 +15647,7 @@ mod scrollbar_paint {
     /// *unconditionally* re-derives and paints its OWN vertical scrollbar
     /// whenever the (untruncated) row count overflows the rect it was
     /// handed — even though that rect already excludes the column
-    /// `TreeController` itself reserved and is about to paint a second
+    /// `TreeView` itself reserved and is about to paint a second
     /// time. The two scrollbars use different width formulas, so they paint
     /// as two adjacent, differently-sized bands immediately next to each
     /// other. This is current upstream behaviour in the pinned `quadraui`
@@ -15663,7 +15666,7 @@ mod scrollbar_paint {
         // every synthetic row this fixture builds): `(line_height *
         // 1.4).round()`.
         let item_h = (lh * 1.4).round();
-        let outer_w = lh; // `TreeController::scrollbar_track_width`'s fallback
+        let outer_w = lh; // `TreeView::scrollbar_track_width`'s fallback
 
         assert!(
             body_rect.width as f64 > outer_w + item_h + 20.0,
@@ -15694,8 +15697,8 @@ mod scrollbar_paint {
             region_has_non_background_pixel(&mut h.driver, phantom, bg),
             "a second, phantom scrollbar-shaped band must paint immediately \
              left of the real one (#1695's 'two differently-lit segments') \
-             -- `TreeController::render`'s own `backend.draw_tree(tree_rect, \
-             &tree)` call re-paints a scrollbar `TreeController` already \
+             -- `TreeView::render`'s own `backend.draw_tree(tree_rect, \
+             &tree)` call re-paints a scrollbar `TreeView` already \
              owns explicitly, because `tree` still carries every \
              untruncated row and the shared rasteriser never checks for a \
              caller-owned column to suppress itself against"
@@ -17240,7 +17243,7 @@ mod modal_rung {
     }
 }
 
-/// Adopting `quadraui::FolderPickerController` on GTK, replacing the
+/// Adopting `quadraui::FolderPicker` on GTK, replacing the
 /// *native* `gtk4::FileDialog` `open_folder_dialog` used before.
 ///
 /// The GTK half of the cross-backend pair; the TUI half lives in
@@ -17984,7 +17987,7 @@ mod editor_mouse_rungs {
         engine.app_shell.hide_sidebar();
         let mut h = harness(engine, 2000, 700);
         h.driver.set_double_click_folding(false);
-        // `AppShell`'s `hide_sidebar()` flip takes a frame to reach the
+        // `ShellView`'s `hide_sidebar()` flip takes a frame to reach the
         // painted layout, same as the font-size settle frame below.
         h.driver.render();
         h.driver.render();
@@ -18116,6 +18119,7 @@ mod editor_mouse_rungs {
         assert_eq!(uri, "command:definition");
         h.driver.dispatch(quadraui::UiEvent::DoubleClick {
             widget: None,
+            button: quadraui::MouseButton::Left,
             position: quadraui::Point::new(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0),
         });
         h.driver.render();
@@ -18701,7 +18705,7 @@ mod alt_rung {
     /// Asserted through `painted_sidebar_bounds` — the rect `render_content`
     /// filled the active panel into on the last pass — rather than through any
     /// stored width: the GTK sidebar's authoritative width is the runner's own
-    /// `AppShell`, so reading `engine.app_shell` would pass against a fix that
+    /// `ShellView`, so reading `engine.app_shell` would pass against a fix that
     /// never reached the painted layout. **Verified RED:** with no Alt rung, the
     /// sidebar rect is byte-identical before and after and the assertion fires.
     #[test]
@@ -20239,7 +20243,7 @@ mod engine_key_from_ui_gtk_tests {
             crate::core::engine::sidebar::PANEL_GIT,
         ));
         engine.sc_has_focus = true;
-        // Staged, not unstaged: `SC_SECTION_STAGED` is the SidebarSystem's
+        // Staged, not unstaged: `SC_SECTION_STAGED` is the Sidebar's
         // default active section, and PageUp/PageDown navigate *within the
         // active section* — files with no staged entries would leave that
         // section's row list empty and any key navigate nothing, which is
@@ -20439,7 +20443,7 @@ mod conformance_proof_slice {
     /// temporarily made an unconditional no-op (an early `return` before
     /// its body), this test fails on the `screen_has(other)` assertion
     /// right after `type_text` — the query never reaches
-    /// `FolderPickerController::handle`, so nothing gets filtered.
+    /// `FolderPicker::handle`, so nothing gets filtered.
     /// Reverted after confirming; see this issue's PR notes.
     #[test]
     fn folder_picker_filters_and_escape_dismisses() {
@@ -20519,7 +20523,7 @@ mod issue_969_text_metrics_backend_conformance {
 
 // ── Hit-band integrity sweep, the GTK half ────────────────────────
 //
-// The SC/ext-panel `set_backend_info` wiring and the `HeaderActivated`
+// The SC/ext-panel `record_metrics` wiring and the `HeaderActivated`
 // double-toggle fix have no backend gate, so they must hold on this
 // backend too. These two tests are the GTK twins of
 // `mac_driver_tests::sc_panel_header_click_hit_band_matches_the_painted_row`
@@ -20601,16 +20605,16 @@ mod hit_band_sweep_971 {
     /// *that* section — never the log row painted immediately below it. The
     /// GTK twin of `mac_driver_tests::sc_panel_header_click_hit_band_matches_the_painted_row`
     /// — see that test's own doc for the full rationale (the cached
-    /// `SidebarSystem` routing pattern this pins, and why
+    /// `Sidebar` routing pattern this pins, and why
     /// `sweep_hit_band_integrity_resetting` rather than
     /// `sweep_hit_band_integrity` is needed here: quadraui's
     /// `DoubleClickDetector` folds two same-spot `MouseDown`s in quick
     /// succession into a `DoubleClick` on **every** backend — GTK included,
-    /// not just `MacBackend` — and `SidebarSystem::double_click` has no
+    /// not just `MacBackend` — and `Sidebar::double_click` has no
     /// header case).
     ///
     /// **RED-verification:** reverting `App::paint_sidebar_panel_rung`'s
-    /// `PANEL_GIT` arm to drop its `set_backend_info` call (this issue's own
+    /// `PANEL_GIT` arm to drop its `record_metrics` call (this issue's own
     /// fix) takes this test red on GTK exactly as it does on macOS — the
     /// very first sanity click stops collapsing the section at all, so the
     /// "`!screen_contains(...)`" sanity assertion fires before the sweep is
@@ -20642,9 +20646,11 @@ mod hit_band_sweep_971 {
         );
         h.engine
             .borrow_mut()
-            .sc_sidebar_system
+            .sc_sidebar
             .borrow_mut()
-            .set_collapsed(crate::core::engine::SC_SECTION_LOG, false);
+            .sidebar
+            .sections[crate::core::engine::SC_SECTION_LOG]
+            .collapsed = false;
         h.driver.render();
         assert!(
             h.driver.screen_contains("ZQXW971SCLOG0"),
@@ -20662,11 +20668,9 @@ mod hit_band_sweep_971 {
                 // Break the `DoubleClickDetector`'s position match before
                 // every real probe — see this test's own doc.
                 d.click(W as f32 - 20.0, H as f32 - 20.0);
-                engine
-                    .borrow_mut()
-                    .sc_sidebar_system
-                    .borrow_mut()
-                    .set_collapsed(crate::core::engine::SC_SECTION_LOG, false);
+                engine.borrow_mut().sc_sidebar.borrow_mut().sidebar.sections
+                    [crate::core::engine::SC_SECTION_LOG]
+                    .collapsed = false;
                 d.render();
             },
             |d| ConformanceDriver::inventory(d).screen_has("ZQXW971SCLOG0"),
@@ -20840,7 +20844,7 @@ mod issue_991_merge_conflicts {
 /// The converged menu-action `EngineAction` applier must hold on GTK
 /// as well: reached the way a user would, through a real click on the
 /// "Terminal" menu-bar header, then a real click on "New Terminal"
-/// inside the dropdown — through `menu_system.handle()`, the same shared
+/// inside the dropdown — through `app_menu.handle()`, the same shared
 /// dispatch both mouse and key events route through.
 ///
 /// `EngineAction::OpenTerminal` is one of the variants the converged code

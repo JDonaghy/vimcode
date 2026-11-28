@@ -607,9 +607,11 @@ pub fn populate_plugin_view_form_controller(engine: &Engine) -> bool {
         engine.plugin_view_number_edit.as_ref(),
     );
     let mut fc = engine.plugin_view_form_controller.borrow_mut();
-    fc.set_form(form);
-    fc.set_scroll_offset(engine.ext_panel_scroll_top);
-    fc.set_has_focus(engine.ext_panel_has_focus);
+    fc.set_form(
+        form,
+        engine.ext_panel_scroll_top,
+        engine.ext_panel_has_focus,
+    );
     true
 }
 
@@ -642,9 +644,7 @@ pub fn populate_plugin_view_tab_form_controller(
         engine.plugin_view_number_edit.as_ref(),
     );
     let mut fc = engine.plugin_view_tab_form_controller.borrow_mut();
-    fc.set_form(form);
-    fc.set_scroll_offset(engine.plugin_view_tab_scroll_top);
-    fc.set_has_focus(has_focus);
+    fc.set_form(form, engine.plugin_view_tab_scroll_top, has_focus);
     true
 }
 
@@ -675,9 +675,7 @@ pub fn populate_plugin_view_dock_form_controller(
         engine.plugin_view_number_edit.as_ref(),
     );
     let mut fc = engine.plugin_view_dock_form_controller.borrow_mut();
-    fc.set_form(form);
-    fc.set_scroll_offset(engine.plugin_view_dock_scroll_top);
-    fc.set_has_focus(has_focus);
+    fc.set_form(form, engine.plugin_view_dock_scroll_top, has_focus);
     true
 }
 
@@ -704,15 +702,13 @@ pub fn populate_plugin_view_modal_form_controller(engine: &Engine, name: &str) -
         engine.plugin_view_number_edit.as_ref(),
     );
     let mut fc = engine.plugin_view_modal_form_controller.borrow_mut();
-    fc.set_form(form);
-    fc.set_scroll_offset(engine.plugin_view_modal_scroll_top);
-    fc.set_has_focus(true);
+    fc.set_form(form, engine.plugin_view_modal_scroll_top, true);
     true
 }
 
 /// Paint the open `combo_box` field's filtered dropdown as an overlay on
 /// top of whichever host just painted its compact row via
-/// `FormController::render_and_cache` — see EXTENSIONS.md's `combo_box`
+/// `FormHost::paint` — see EXTENSIONS.md's `combo_box`
 /// section for what this is the visible half of. A no-op unless
 /// `Engine::plugin_view_combo_edit` names a field in `view_name` with
 /// `open == true` and at least one filtered option, matching
@@ -720,10 +716,10 @@ pub fn populate_plugin_view_modal_form_controller(engine: &Engine, name: &str) -
 /// contract — in every other case the compact row `Form`'s own paint path
 /// (quadraui's `draw_field_combo_box`) already drew is left untouched.
 ///
-/// Anchors via `FormController::field_rect`, so the popup always lines up
+/// Anchors via `ScrolledForm::field_rect`, so the popup always lines up
 /// with whatever rect the field's compact row actually painted into. `fc`
-/// must be the *same*, already-populated `FormController` `rect`'s
-/// `render_and_cache` call just rendered through — same contract
+/// must be the *same*, already-populated `ScrolledForm` `rect`'s
+/// `paint` call just rendered through — same contract
 /// `field_rect`'s own doc states.
 ///
 /// The dropdown is the popup `quadraui::ComboBox`'s own
@@ -748,7 +744,7 @@ pub fn populate_plugin_view_modal_form_controller(engine: &Engine, name: &str) -
 pub(crate) fn paint_plugin_view_combo_box_dropdown(
     engine: &Engine,
     view_name: &str,
-    fc: &quadraui::FormController,
+    fc: &crate::render::FormHost,
     rect: quadraui::Rect,
     backend: &mut dyn quadraui::Backend,
 ) {
@@ -787,7 +783,11 @@ pub(crate) fn paint_plugin_view_combo_box_dropdown(
     };
 
     let wid = quadraui::WidgetId::new(namespaced_widget_id(view_name, &field.id));
-    let Some(field_bounds) = fc.field_rect(wid, backend, rect) else {
+    let Some(field_bounds) = fc
+        .form
+        .layout_at(&fc.state, &*backend, rect)
+        .field_rect(&wid)
+    else {
         clear_layout();
         return;
     };
@@ -804,7 +804,7 @@ pub(crate) fn paint_plugin_view_combo_box_dropdown(
     }
 
     // The field row itself was already painted by
-    // `FormController::render_and_cache` just before this call, so only the
+    // `FormHost::paint` just before this call, so only the
     // box's own dropdown popup paints here. It is anchored under the whole
     // form row rather than the box's one-line field, and placed inside the
     // host's rect rather than the whole viewport, so it never spills over
@@ -848,7 +848,7 @@ pub(crate) fn paint_plugin_view_combo_box_dropdown(
 /// (`quadraui::FormEvent::ComboBoxCancelled`'s own
 /// `apply_combo_box_form_action` arm). Returns `false` when nothing is
 /// cached (no dropdown is open), so the caller falls through to its own
-/// ordinary `FormController` click routing — including a press on the
+/// ordinary `ScrolledForm` click routing — including a press on the
 /// field's own row, which this function deliberately leaves unconsumed so
 /// that routing still runs (matching `quadraui::ComboBox::click`'s own
 /// "a hit on the field itself produces no event, focusing it is the
@@ -934,11 +934,11 @@ pub(crate) fn route_plugin_view_combo_box_dropdown_click(
 }
 
 /// Route a pointer event over a plugin view through the shared
-/// `quadraui::FormController` and dispatch whatever widget event it resolves to
+/// `quadraui::ScrolledForm` and dispatch whatever widget event it resolves to
 /// the plugin's `on_event` callback.
 ///
 /// `rect` must be the *same* rect the last frame passed to
-/// `FormController::render_and_cache` (cached in
+/// `FormHost::paint` (cached in
 /// `Engine::plugin_view_form_rect`) — `handle_cached` re-derives its row layout
 /// from it. Same contract, and the same reason, as
 /// [`handle_settings_form_ui_event`].
@@ -954,12 +954,16 @@ pub fn handle_plugin_view_ui_event(
     if !populate_plugin_view_form_controller(engine) {
         return false;
     }
-    // `FormController` has no `DoubleClick` arm — probe with the equivalent
+    // `ScrolledForm` has no `DoubleClick` arm — probe with the equivalent
     // press (mirrors `handle_settings_form_ui_event`).
     let probe = match event {
-        quadraui::UiEvent::DoubleClick { widget, position } => quadraui::UiEvent::MouseDown {
+        quadraui::UiEvent::DoubleClick {
+            widget,
+            button,
+            position,
+        } => quadraui::UiEvent::MouseDown {
             widget: *widget,
-            button: quadraui::MouseButton::Left,
+            button: *button,
             position: *position,
             modifiers: quadraui::Modifiers::default(),
         },
@@ -967,7 +971,7 @@ pub fn handle_plugin_view_ui_event(
     };
     // An open `combo_box` dropdown paints on top of the rest of the
     // form, so a press anywhere inside it must be resolved before
-    // `FormController`'s own row-based routing runs — see
+    // `ScrolledForm`'s own row-based routing runs — see
     // `route_plugin_view_combo_box_dropdown_click`'s own doc.
     if let quadraui::UiEvent::MouseDown {
         button: quadraui::MouseButton::Left,
@@ -982,7 +986,7 @@ pub fn handle_plugin_view_ui_event(
     let result = engine
         .plugin_view_form_controller
         .borrow_mut()
-        .handle_cached_event(&probe, rect);
+        .handle_cached(&probe, rect);
 
     let sync_scroll = |engine: &mut Engine| {
         let offset = engine.plugin_view_form_controller.borrow().scroll_offset();
@@ -991,12 +995,11 @@ pub fn handle_plugin_view_ui_event(
 
     let action = match result {
         quadraui::Handled::Ignored => return false,
-        quadraui::Handled::Event(quadraui::FormControllerAction::ScrollChanged)
-        | quadraui::Handled::Consumed => {
+        quadraui::Handled::Consumed => {
             sync_scroll(engine);
             return true;
         }
-        quadraui::Handled::Event(quadraui::FormControllerAction::FormAction(action)) => action,
+        quadraui::Handled::Event(action) => action,
     };
     sync_scroll(engine);
     apply_combo_box_form_action(engine, &action);
@@ -1057,9 +1060,13 @@ pub fn handle_plugin_view_tab_ui_event(
         return false;
     }
     let probe = match event {
-        quadraui::UiEvent::DoubleClick { widget, position } => quadraui::UiEvent::MouseDown {
+        quadraui::UiEvent::DoubleClick {
+            widget,
+            button,
+            position,
+        } => quadraui::UiEvent::MouseDown {
             widget: *widget,
-            button: quadraui::MouseButton::Left,
+            button: *button,
             position: *position,
             modifiers: quadraui::Modifiers::default(),
         },
@@ -1080,7 +1087,7 @@ pub fn handle_plugin_view_tab_ui_event(
     let result = engine
         .plugin_view_tab_form_controller
         .borrow_mut()
-        .handle_cached_event(&probe, rect);
+        .handle_cached(&probe, rect);
 
     let sync_scroll = |engine: &mut Engine| {
         let offset = engine
@@ -1092,12 +1099,11 @@ pub fn handle_plugin_view_tab_ui_event(
 
     let action = match result {
         quadraui::Handled::Ignored => return false,
-        quadraui::Handled::Event(quadraui::FormControllerAction::ScrollChanged)
-        | quadraui::Handled::Consumed => {
+        quadraui::Handled::Consumed => {
             sync_scroll(engine);
             return true;
         }
-        quadraui::Handled::Event(quadraui::FormControllerAction::FormAction(action)) => action,
+        quadraui::Handled::Event(action) => action,
     };
     sync_scroll(engine);
     apply_combo_box_form_action(engine, &action);
@@ -1154,9 +1160,13 @@ pub fn handle_plugin_view_dock_ui_event(
         return false;
     }
     let probe = match event {
-        quadraui::UiEvent::DoubleClick { widget, position } => quadraui::UiEvent::MouseDown {
+        quadraui::UiEvent::DoubleClick {
+            widget,
+            button,
+            position,
+        } => quadraui::UiEvent::MouseDown {
             widget: *widget,
-            button: quadraui::MouseButton::Left,
+            button: *button,
             position: *position,
             modifiers: quadraui::Modifiers::default(),
         },
@@ -1177,7 +1187,7 @@ pub fn handle_plugin_view_dock_ui_event(
     let result = engine
         .plugin_view_dock_form_controller
         .borrow_mut()
-        .handle_cached_event(&probe, rect);
+        .handle_cached(&probe, rect);
 
     let sync_scroll = |engine: &mut Engine| {
         let offset = engine
@@ -1189,12 +1199,11 @@ pub fn handle_plugin_view_dock_ui_event(
 
     let action = match result {
         quadraui::Handled::Ignored => return false,
-        quadraui::Handled::Event(quadraui::FormControllerAction::ScrollChanged)
-        | quadraui::Handled::Consumed => {
+        quadraui::Handled::Consumed => {
             sync_scroll(engine);
             return true;
         }
-        quadraui::Handled::Event(quadraui::FormControllerAction::FormAction(action)) => action,
+        quadraui::Handled::Event(action) => action,
     };
     sync_scroll(engine);
     apply_combo_box_form_action(engine, &action);
@@ -1286,7 +1295,7 @@ pub fn paint_plugin_view_modal(
                     engine
                         .plugin_view_modal_form_controller
                         .borrow_mut()
-                        .render_and_cache(backend, body);
+                        .paint(backend, body);
                     paint_plugin_view_combo_box_dropdown(
                         engine,
                         name,
@@ -1446,9 +1455,7 @@ fn populate_plugin_view_float_form_controller(engine: &Engine, name: &str) -> bo
         engine.plugin_view_number_edit.as_ref(),
     );
     let mut fc = engine.plugin_view_float_form_controller.borrow_mut();
-    fc.set_form(form);
-    fc.set_scroll_offset(0);
-    fc.set_has_focus(false);
+    fc.set_form(form, 0, false);
     true
 }
 
@@ -1476,7 +1483,7 @@ fn paint_plugin_view_float_content(
                 engine
                     .plugin_view_float_form_controller
                     .borrow_mut()
-                    .render_and_cache(backend, content_bounds);
+                    .paint(backend, content_bounds);
             }
         }
         Some("text_view") => {
@@ -1663,9 +1670,13 @@ pub fn handle_plugin_view_modal_ui_event(
         return false;
     }
     let probe = match event {
-        quadraui::UiEvent::DoubleClick { widget, position } => quadraui::UiEvent::MouseDown {
+        quadraui::UiEvent::DoubleClick {
+            widget,
+            button,
+            position,
+        } => quadraui::UiEvent::MouseDown {
             widget: *widget,
-            button: quadraui::MouseButton::Left,
+            button: *button,
             position: *position,
             modifiers: quadraui::Modifiers::default(),
         },
@@ -1686,7 +1697,7 @@ pub fn handle_plugin_view_modal_ui_event(
     let result = engine
         .plugin_view_modal_form_controller
         .borrow_mut()
-        .handle_cached_event(&probe, rect);
+        .handle_cached(&probe, rect);
 
     let sync_scroll = |engine: &mut Engine| {
         let offset = engine
@@ -1698,12 +1709,11 @@ pub fn handle_plugin_view_modal_ui_event(
 
     let action = match result {
         quadraui::Handled::Ignored => return false,
-        quadraui::Handled::Event(quadraui::FormControllerAction::ScrollChanged)
-        | quadraui::Handled::Consumed => {
+        quadraui::Handled::Consumed => {
             sync_scroll(engine);
             return true;
         }
-        quadraui::Handled::Event(quadraui::FormControllerAction::FormAction(action)) => action,
+        quadraui::Handled::Event(action) => action,
     };
     sync_scroll(engine);
     apply_combo_box_form_action(engine, &action);
@@ -1733,9 +1743,9 @@ pub fn handle_plugin_view_modal_ui_event(
 
 /// Route a `UiEvent` over a body-kind (`List`/`Tree`/`Table`/`TextView`/
 /// `Chart`/`MessageList`/`Image`) plugin view at `host`, through the
-/// matching primitive's click/scroll resolution instead of `FormController`.
+/// matching primitive's click/scroll resolution instead of `ScrolledForm`.
 /// `rect` is the rect the view was last painted into for this host — only
-/// the `Tree` arm needs it live (a `TreeController` needs a real rect +
+/// the `Tree` arm needs it live (a `TreeView` needs a real rect +
 /// backend to `handle` against); `List`/`Table`/`Chart`/`MessageList`
 /// resolve through their own cached layouts/rects
 /// (`route_plugin_view_list_click`/`route_plugin_view_table_click`/
@@ -1960,7 +1970,7 @@ fn declared_combo_box_value(engine: &Engine, view: &str, field: &str) -> String 
 /// `Engine::plugin_view_combo_edit` — the vimcode-owned shadow state
 /// `plugin_view_to_form_with_combo_edit`'s `ComboBox` arm feeds back into
 /// the embedded `quadraui::ComboBox` every render, since quadraui's own
-/// `FormController` keeps no such cache itself (see
+/// `ScrolledForm` keeps no such cache itself (see
 /// [`crate::core::plugin_ui::PluginViewComboBoxEditState`]'s doc). A no-op
 /// for any other `FormEvent` variant, or for a `ComboBox*` event whose id
 /// isn't in the plugin namespace.
@@ -2055,7 +2065,7 @@ fn apply_combo_box_form_action(engine: &mut Engine, action: &quadraui::FormEvent
 
 /// Apply a `quadraui::FormEvent::Number*` action to
 /// `Engine::plugin_view_number_edit` — the `number_input` twin of
-/// [`apply_combo_box_form_action`], same "quadraui's `FormController` keeps
+/// [`apply_combo_box_form_action`], same "quadraui's `ScrolledForm` keeps
 /// no shadow cache of its own" reasoning (see that function's doc).
 ///
 /// Called by every `handle_plugin_view_*_ui_event` before
@@ -2118,7 +2128,7 @@ fn apply_number_input_form_action(engine: &mut Engine, action: &quadraui::FormEv
 /// namespace (a Settings field, say) or carries no plugin meaning.
 ///
 /// Kept separate from [`handle_plugin_view_ui_event`] so the mapping is unit
-/// testable without a `FormController`.
+/// testable without a `ScrolledForm`.
 pub(crate) fn plugin_view_event_from_form_event(
     action: &quadraui::FormEvent,
 ) -> Option<(String, String, crate::core::plugin_ui::ViewEventKind)> {

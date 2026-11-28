@@ -15,15 +15,15 @@ use super::*;
 // **Not in this band, deliberately** — the rungs quadraui already owns:
 //
 //   * the **activity bar** and the **sidebar separator**. On both live paths
-//     `AppShell::render` (quadraui `compose::app_shell`) paints these *before*
+//     `ShellView::render` (quadraui `compose::app_shell`) paints these *before*
 //     `render_content` is entered. The test-only `draw_frame` was deleted when
 //     it had no production caller.
 //   * the **debug toolbar**, **quickfix panel** and **bottom panel**. These are
-//     vimcode's own stacked bottom chrome, which `AppShellLayout` has no concept
+//     vimcode's own stacked bottom chrome, which `ShellLayout` has no concept
 //     of. They are chrome, but they are *not* part of this slice.
 //
 // **Why here and not in quadraui**, for the five rungs that *are* in the band:
-// `AppShell` composes the *shell's* own zones and stops there; the menu row's
+// `ShellView` composes the *shell's* own zones and stops there; the menu row's
 // contents, the wildmenu, the global status line and the Vim command line are
 // vimcode's app-level surfaces, and the sidebar *body* is explicitly handed back
 // to the app as `sidebar_content_bounds` for the app to fill. quadraui states no
@@ -74,17 +74,17 @@ impl FrameMetrics {
 /// painter-order vs. ratatui cell coalescence).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FrameOp {
-    /// The reserved title-bar band (`AppShellLayout::title_bar_bounds`):
+    /// The reserved title-bar band (`ShellLayout::title_bar_bounds`):
     /// measure the menu bar, publish the band's rect for hit-testing, and work
     /// out where the command centre / window controls go.
     ///
     /// Measure-only on **both** backends. The band is actually *painted* from
-    /// [`FrameOp::MenuDropdown`], because `MenuSystem::render` repaints
+    /// [`FrameOp::MenuDropdown`], because `AppMenu::render` repaints
     /// the menu bar across the whole band and would erase anything laid down
     /// first. It is still the first rung of the sequence: every later rung's gate,
     /// and the dropdown arm itself, read the rect this one publishes.
     MenuRow,
-    /// The *active panel's body*, into `AppShellLayout::sidebar_content_bounds`
+    /// The *active panel's body*, into `ShellLayout::sidebar_content_bounds`
     /// — explorer / search / debug / source control / extensions / AI / plugin
     /// extension panels. The surrounding sidebar chrome (header, activity bar,
     /// separator) is quadraui's, painted before `render_content` is entered.
@@ -101,10 +101,10 @@ pub enum FrameOp {
     /// The folder / workspace picker modal — the first rung of the overlay
     /// tail.
     ///
-    /// `quadraui::FolderPickerController` renders through the existing
+    /// `quadraui::FolderPicker` renders through the existing
     /// `Palette` widget (painted with `draw_dyn`) on **both** backends.
     FolderPicker,
-    /// `MenuSystem::render` — repaints the whole title-bar band, so it must
+    /// `AppMenu::render` — repaints the whole title-bar band, so it must
     /// come before anything else that draws into that band. On GTK this arm
     /// also paints the app-icon slot and the inline window controls.
     ///
@@ -112,11 +112,11 @@ pub enum FrameOp {
     /// [`Self::MenuRow`] — the band it paints is the band that rung measured.
     MenuDropdown,
     /// The Command Center widget. Must follow [`Self::MenuDropdown`]:
-    /// `MenuSystem::render` repaints the menu bar across the entire band,
+    /// `AppMenu::render` repaints the menu bar across the entire band,
     /// including the command centre's columns, and painting the centre first
     /// left a populated-but-invisible `command_center_layout` on both backends.
     CommandCenter,
-    /// `Backend::draw_find_replace`.
+    /// `DrawsPrimitives::draw_primitive`.
     FindReplace,
     /// The unified picker / command palette — [`paint_picker_rung`] on both
     /// backends.
@@ -215,7 +215,7 @@ pub const FRAME_Z_ORDER: [FrameOp; 17] = [
 /// exactly these rungs must have been composed, in this order".
 ///
 /// Twelve of the fourteen fields are derived from `ScreenLayout` +
-/// `AppShellLayout` by [`Self::from_screen`]. The two that are not
+/// `ShellLayout` by [`Self::from_screen`]. The two that are not
 /// (`toast_stack`, and any backend-specific suppression) are left to the
 /// caller, because they are engine/geometry state rather than screen state.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -228,7 +228,7 @@ pub struct FramePresence {
     /// See [`FrameOp::FolderPicker`]. Not derivable from `ScreenLayout` (the
     /// picker lives on each backend's own shell app / `App`, not the shared
     /// engine), so [`Self::from_screen`] leaves it `false` and the caller
-    /// sets it from its own `Option<FolderPickerController>`.
+    /// sets it from its own `Option<FolderPicker>`.
     pub folder_picker: bool,
     pub menu_dropdown: bool,
     pub command_center: bool,
@@ -244,7 +244,7 @@ pub struct FramePresence {
 }
 
 impl FramePresence {
-    /// The eleven rungs whose gate is a `ScreenLayout` / `AppShellLayout`
+    /// The eleven rungs whose gate is a `ScreenLayout` / `ShellLayout`
     /// field, so a caller only has to supply `toast_stack` (engine state).
     ///
     /// `layout` supplies the shell-reserved bands (title bar, sidebar content)
@@ -252,10 +252,10 @@ impl FramePresence {
     /// line tall", in the caller's own units — see [`FrameMetrics`].
     pub fn from_screen(
         screen: &ScreenLayout,
-        layout: &quadraui::AppShellLayout,
+        layout: &quadraui::ShellLayout,
         metrics: FrameMetrics,
     ) -> Self {
-        // `title_bar_bounds` is `Some` only while `AppShell::set_title_bar_visible`
+        // `title_bar_bounds` is `Some` only while `ShellView::set_title_bar_visible`
         // is set — but the band can still be degenerate on a window too small to hold
         // it, and a degenerate band must not be measured (its `menu_bar_layout` would
         // hand the command centre and the window controls a zero-width strip and leave
@@ -422,7 +422,8 @@ pub fn paint_find_replace_rung(
     panel: &FindReplacePanel,
     viewport: quadraui::Rect,
 ) {
-    b.draw_find_replace(viewport, panel);
+    let rect = panel.anchored_rect(&*b, viewport);
+    quadraui::DrawsPrimitives::draw_primitive(b, rect, panel);
 }
 
 /// The [`FrameOp::CommandCenter`] rung's whole body on both backends.
@@ -443,7 +444,7 @@ pub fn paint_command_center_rung(
 /// The backdrop scrim colour painted behind modal overlays
 /// ([`paint_picker_rung`]): semi-transparent black, signalling modality by
 /// separating the popup from the editor band behind it. Backends that
-/// composite alpha (GTK) blend it into a dim tint; TUI's `draw_solid_fill`
+/// composite alpha (GTK) blend it into a dim tint; TUI's `fill_solid`
 /// drops the alpha channel and fills the band with flat scrim-coloured cells
 /// instead, the terminal-idiomatic equivalent. Either way the fill is confined
 /// to [`modal_scrim_rect`], so the chrome around the editor band stays
@@ -502,7 +503,7 @@ pub fn modal_scrim_rect(
 /// geometry cheaply at click time instead and ignores the return value.
 ///
 /// Paints [`MODAL_SCRIM_COLOR`] into `scrim_rect` before the popup itself, via
-/// `Backend::draw_solid_fill` — the one rect-fill primitive every backend
+/// `render::fill_solid` — the one rect-fill primitive every backend
 /// implements — so the editor/sidebar behind the picker dim on every backend
 /// with zero per-backend code here. `scrim_rect` is the caller's own concern:
 /// it must cover only the editor/sidebar band, never a chrome rung
@@ -523,7 +524,7 @@ pub fn paint_picker_rung(
     sizing: &PickerSizing,
     theme: &Theme,
 ) -> quadraui::Rect {
-    b.draw_solid_fill(scrim_rect, MODAL_SCRIM_COLOR);
+    super::fill_solid(b, scrim_rect, MODAL_SCRIM_COLOR);
     let has_preview = picker.preview.is_some();
     let geo = PickerGeometry::compute(viewport, picker.items.len(), has_preview, sizing);
     let palette = picker_panel_to_palette(picker, theme);
@@ -770,7 +771,7 @@ pub fn paint_change_review_rung(
     // — see `crate::core::review::view_with_inline_comments`'s doc for why
     // this lives in core rather than as backend-specific text munging.
     let painted_view = crate::core::review::view_with_inline_comments(&review.comments, entry);
-    let _ = b.draw_diff_view(diff_rect, &painted_view);
+    quadraui::DrawsPrimitives::draw_primitive(b, diff_rect, painted_view.as_ref());
     engine.change_review_diff_rect.set(diff_rect);
 
     let decision = match entry.decision {
@@ -930,7 +931,7 @@ pub struct TitleBarBands {
 /// Measure the title-bar band's two right-hand slots, in the caller's units.
 ///
 /// The [`FrameOp::MenuRow`] rung's whole body on both backends. `band` is the
-/// shell-reserved row (`AppShellLayout::title_bar_bounds`); `items` is the part
+/// shell-reserved row (`ShellLayout::title_bar_bounds`); `items` is the part
 /// of it the menu labels are laid out in.
 ///
 /// `controls_bar` is `Some` only on GTK. With `None` the controls band collapses

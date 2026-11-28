@@ -79,6 +79,7 @@ pub(crate) fn paint_welcome_panel(
         has_focus: false,
         title: None,
         show_scrollbar: false,
+        items_window: None,
     };
     let _ = crate::render::draw_widget_plain(backend, heading_rect, &heading);
 
@@ -144,6 +145,9 @@ pub(crate) fn paint_welcome_panel(
         h_scroll: 0,
         max_content_width: None,
         show_v_scrollbar: true,
+        items_window: None,
+        scroll_px: None,
+        striped: false,
     };
     let painted = crate::render::draw_widget_plain(backend, list_rect, &list).layout;
     engine

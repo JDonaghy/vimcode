@@ -759,7 +759,7 @@ impl Engine {
     pub fn clear_sidebar_focus(&mut self) {
         self.explorer_has_focus = false;
         self.search_has_focus = false;
-        // Clears `sc_button_focused` and syncs `sc_sidebar_system`'s own focus flag,
+        // Clears `sc_button_focused` and syncs `sc_sidebar`'s own focus flag,
         self.sc_set_focus(false);
         self.dap_sidebar_has_focus = false;
         self.ext_sidebar_has_focus = false;

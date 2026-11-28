@@ -3,10 +3,10 @@ use super::*;
 // ─── ViewBody: List / Tree / Table / TextView ───────────────────────────────
 //
 // A `ViewBody`-kind view paints through the matching quadraui primitive
-// directly — `ListView`, `TreeView` (via `TreeController`), `DataTable`, or
+// directly — `ListView`, `TreeView` (via `TreeView`), `DataTable`, or
 // `TextDisplay` — one sibling translation per kind, rather than wedging four
 // different widget shapes into `Form`'s flat field rows. `List`/`Table` have no
-// composed quadraui controller (unlike `Tree`'s `TreeController`), so selection/
+// composed quadraui controller (unlike `Tree`'s `TreeView`), so selection/
 // scroll interaction for those two is hand-rolled here — in this backend-neutral
 // module — following the "paint caches a `Backend::*_layout`, a click reads it
 // back" split already established for the same reason.
@@ -68,6 +68,9 @@ fn plugin_view_to_list(
         h_scroll: 0,
         max_content_width: None,
         show_v_scrollbar: true,
+        items_window: None,
+        scroll_px: None,
+        striped: false,
     }
 }
 
@@ -290,7 +293,7 @@ fn flatten_tree_nodes(
     out
 }
 
-/// Populate the shared `TreeController` (sidebar or tab, per `host`) from
+/// Populate the shared `TreeView` (sidebar or tab, per `host`) from
 /// the named view's `ViewBody::Tree`. Returns `false` when `name` isn't a
 /// `Tree`-kind view. Mirrors `populate_explorer_tree_controller`/
 /// `populate_plugin_view_form_controller`.
@@ -316,9 +319,9 @@ pub(crate) fn populate_plugin_view_tree_controller(
 }
 
 /// Route an event over a `ViewBody::Tree`-kind view through its
-/// `TreeController` and dispatch the resulting semantic action to the
-/// plugin. Mirrors `route_explorer_tree_event`'s shape (a `TreeController`
-/// needs a live `&mut dyn Backend` to `handle`, unlike `FormController`'s
+/// `TreeView` and dispatch the resulting semantic action to the
+/// plugin. Mirrors `route_explorer_tree_event`'s shape (a `TreeView`
+/// needs a live `&mut dyn Backend` to `handle`, unlike `ScrolledForm`'s
 /// cache-then-read split). Returns `false` when `name` isn't a `Tree`-kind
 /// view.
 #[allow(clippy::too_many_arguments)]
@@ -343,7 +346,12 @@ pub(crate) fn route_plugin_view_tree_event(
         // out for `Dock`, so this arm is unreachable in practice.
         PluginViewHost::Dock | PluginViewHost::Modal | PluginViewHost::Float => return false,
     };
-    let tree_event = controller.borrow_mut().handle(event, backend, rect);
+    let tree_event = controller.borrow_mut().handle(event, &*backend, rect);
+    let tree_event = match tree_event {
+        quadraui::Handled::Event(tree_event) => tree_event,
+        quadraui::Handled::Consumed => return true,
+        quadraui::Handled::Ignored => return false,
+    };
 
     let node_id = |path: &quadraui::TreePath| -> Option<String> {
         let ViewBody::Tree { nodes } = plugin_view_body(engine, name)? else {
@@ -353,7 +361,11 @@ pub(crate) fn route_plugin_view_tree_event(
     };
 
     match tree_event {
-        quadraui::TreeControllerEvent::RowSelected { path } => {
+        quadraui::TreeEvent::RowClicked {
+            path,
+            button: quadraui::MouseButton::Left,
+            ..
+        } => {
             let Some(id) = node_id(&path) else {
                 return true;
             };
@@ -364,7 +376,8 @@ pub(crate) fn route_plugin_view_tree_event(
             });
             true
         }
-        quadraui::TreeControllerEvent::RowActivated { path } => {
+        quadraui::TreeEvent::RowDoubleClicked { path }
+        | quadraui::TreeEvent::RowActivated { path } => {
             let Some(id) = node_id(&path) else {
                 return true;
             };
@@ -375,7 +388,7 @@ pub(crate) fn route_plugin_view_tree_event(
             });
             true
         }
-        quadraui::TreeControllerEvent::RowToggleExpand { path } => {
+        quadraui::TreeEvent::RowToggleExpand { path } => {
             let Some(ViewBody::Tree { nodes }) = plugin_view_body(engine, name) else {
                 return true;
             };
@@ -398,20 +411,16 @@ pub(crate) fn route_plugin_view_tree_event(
             });
             true
         }
-        quadraui::TreeControllerEvent::ScrollChanged | quadraui::TreeControllerEvent::Consumed => {
-            true
-        }
-        quadraui::TreeControllerEvent::Ignored => false,
         _ => true,
     }
 }
 
 /// Keyboard handling for a `ViewBody::Tree`-kind view, entirely backend-free
 /// (unlike [`route_plugin_view_tree_event`], which needs a live
-/// `&mut dyn Backend` for `TreeController::handle`'s mouse-oriented API) —
+/// `&mut dyn Backend` for `TreeView::handle`'s mouse-oriented API) —
 /// this is what lets it be reached from `Engine::handle_plugin_view_key`,
 /// which (like every `core/engine` function) has no backend reference to
-/// hand it. Walks `TreeController::rows()` directly: `j`/`Down`/`k`/`Up`
+/// hand it. Walks `TreeView::rows()` directly: `j`/`Down`/`k`/`Up`
 /// move the flat selection (dispatching `NodeSelected`), `Enter`/`Space`
 /// toggles a branch's expand state or activates a leaf.
 pub(crate) fn handle_plugin_view_tree_key(
@@ -611,17 +620,13 @@ fn next_table_sort(
 /// these fields existed.
 ///
 /// `ViewTableColumn::width`'s own doc commits plugin authors to the same
-/// raw-reinterpretation contract `quadraui::ColumnWidth::Fixed` has (cells on
-/// TUI, pixels on GTK/macOS/Win, no cross-backend conversion) — the
-/// deprecated variant is the only one that keeps that contract; `FixedCells`/
+/// raw-reinterpretation contract `quadraui::ColumnWidth::Native` has (cells on
+/// TUI, pixels on GTK/macOS/Win, no cross-backend conversion); `FixedCells`/
 /// `FixedPx` each convert to the other family's native unit instead, which
-/// would silently rescale every plugin-declared column width. Redesigning the
-/// plugin field itself to pick a cells-vs-pixels variant is a separate,
-/// plugin-API-facing issue, not part of a dependency bump.
-#[allow(deprecated)]
+/// would silently rescale every plugin-declared column width.
 fn plugin_table_column_width(column: &ViewTableColumn) -> quadraui::ColumnWidth {
     match (column.width, column.min_width) {
-        (Some(w), _) => quadraui::ColumnWidth::Fixed(w),
+        (Some(w), _) => quadraui::ColumnWidth::Native(w),
         (None, Some(min)) => quadraui::ColumnWidth::Content { min, max: f32::MAX },
         (None, None) => quadraui::ColumnWidth::Flex(1.0),
     }
@@ -728,14 +733,18 @@ fn plugin_view_to_table(
         column_overrides: column_overrides.to_vec(),
         footer: q_footer,
         bordered,
+        selection_mode: quadraui::SelectionMode::default(),
+        selected_indices: Vec::new(),
+        items_window: None,
+        scroll_px: None,
+        striped: false,
+        glyphs: None,
     }
 }
 
 /// Paint a `ViewBody::Table`-kind view into `rect` and cache the resolved
-/// `Backend::data_table_layout` for [`route_plugin_view_table_click`].
+/// table layout for [`route_plugin_view_table_click`].
 /// Returns `false` when `name` isn't a `Table`-kind view.
-// TODO(#2179): drop once `draw_data_table` moves onto the widget contract.
-#[allow(deprecated)]
 pub(crate) fn paint_plugin_view_table(
     engine: &Engine,
     name: &str,
@@ -787,7 +796,7 @@ pub(crate) fn paint_plugin_view_table(
         footer.as_deref(),
         *bordered,
     );
-    let layout = backend.draw_data_table(rect, &table, None);
+    let layout = quadraui::DrawsPrimitives::draw_primitive(backend, rect, &table).layout;
     let cache = match host {
         PluginViewHost::Sidebar => &engine.plugin_view_table_layout,
         PluginViewHost::Tab => &engine.plugin_view_tab_table_layout,
@@ -1342,6 +1351,7 @@ fn plugin_view_to_text_display(
         has_focus,
         title: None,
         show_scrollbar: true,
+        items_window: None,
     }
 }
 
@@ -1414,7 +1424,7 @@ pub(crate) fn handle_plugin_view_text_key(
 // `Chart` has no scroll or selection state of its own — a data point can be
 // clicked but there is nothing to navigate — so unlike List/Table it needs
 // no `Engine` selection/scroll plumbing, only the layout cache. It also
-// paints and lays out in a *single* `Backend::draw_chart` call, and that
+// paints and lays out in a *single* `DrawsPrimitives::draw_primitive` call, and that
 // call's returned `ChartLayout` is in the ABSOLUTE coordinate frame
 // (shifted by `rect.x`/`rect.y` already — see `Backend::chart_layout`'s doc comment), the
 // opposite of `ListViewLayout`'s LOCAL frame. So the click router below
@@ -1455,6 +1465,8 @@ fn plugin_view_to_chart(
         y_ticks: None,
         x_ticks: None,
         show_grid: false,
+        hovered_point: None,
+        crosshair_x: None,
     }
 }
 
@@ -1480,7 +1492,7 @@ pub(crate) fn paint_plugin_view_chart(
         return false;
     };
     let chart = plugin_view_to_chart(name, *chart_kind, series, x_label, y_label, *show_legend);
-    let layout = backend.draw_chart(rect, &chart, None, None);
+    let layout = quadraui::DrawsPrimitives::draw_primitive(backend, rect, &chart).chart;
     let cache = match host {
         PluginViewHost::Sidebar => &engine.plugin_view_chart_layout,
         PluginViewHost::Tab => &engine.plugin_view_tab_chart_layout,
@@ -1564,7 +1576,7 @@ pub(crate) fn route_plugin_view_chart_click(
 // ── MessageList ──────────────────────────────────────────────────────────
 //
 // `MessageList` carries no `selected_idx`/scroll-layout of its own (unlike
-// `List`'s `ListViewLayout`) — `Backend::draw_message_list` just paints, it
+// `List`'s `ListViewLayout`) — `DrawsPrimitives::draw_primitive` just paints, it
 // doesn't return a hit-testable layout. So, like the quadraui
 // `message_list_demo` example, the click router below rebuilds the same
 // `quadraui::MessageList` value `paint_plugin_view_message_list` just
@@ -1641,7 +1653,7 @@ pub(crate) fn paint_plugin_view_message_list(
     let scroll_top = engine.plugin_view_scroll_top(host);
     let default_fg = backend.theme().foreground;
     let list = plugin_view_to_message_list(name, rows, scroll_top, default_fg);
-    backend.draw_message_list(rect, &list);
+    quadraui::DrawsPrimitives::draw_primitive(backend, rect, &list);
     // Record the line height this call actually painted rows at — see
     // `plugin_view_message_list_line_height`'s doc for why a live
     // `Backend::measure()` queried later, at click time, cannot be trusted

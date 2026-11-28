@@ -1872,43 +1872,45 @@ impl Engine {
     }
 
     pub fn ext_selected_from_sidebar_system(&self) -> (bool, usize) {
-        let sidebar = self.ext_sidebar_system.borrow();
-        let section = sidebar.active_section().unwrap_or(0);
-        let idx = sidebar
-            .selected_path(section)
+        let host = self.ext_sidebar.borrow();
+        let section = host.sidebar.active_section.unwrap_or(0);
+        let idx = host
+            .sidebar
+            .tree(section)
+            .and_then(|t| t.selected_path.as_ref())
             .and_then(|p| p.first().copied())
             .unwrap_or(0) as usize;
         (section == 0, idx)
     }
 
-    pub fn dispatch_ext_sidebar_event(&mut self, event: quadraui::SidebarEvent) -> bool {
-        match event {
-            quadraui::SidebarEvent::RowActivated { .. } => {
-                self.ext_open_selected_readme();
-                true
+    pub fn dispatch_ext_sidebar_event(
+        &mut self,
+        handled: quadraui::Handled<Vec<quadraui::SidebarAction>>,
+    ) -> bool {
+        let actions = match handled {
+            quadraui::Handled::Event(actions) => actions,
+            quadraui::Handled::Consumed => return true,
+            quadraui::Handled::Ignored => return false,
+        };
+        for action in actions {
+            match action {
+                quadraui::SidebarAction::RowActivated { .. } => self.ext_open_selected_readme(),
+                quadraui::SidebarAction::RowSelected { .. } => {
+                    self.ext_sidebar_input_active = false;
+                }
+                // A header click's collapse arrives as its own
+                // `CollapseChanged`, already applied by the host.
+                _ => {}
             }
-            quadraui::SidebarEvent::RowSelected { .. } => {
-                self.ext_sidebar_input_active = false;
-                true
-            }
-            // `SidebarSystem::click` already flips `collapsed[section]`
-            // itself before returning this event — see
-            // `Engine::dispatch_sc_sidebar_event`'s identical fix for the
-            // full story (same double-toggle-cancels-out bug, same fix,
-            // caught by this panel's own
-            // `ext_panel_header_click_hit_band_matches_the_painted_row`
-            // sanity check in `src/macos/mod.rs`).
-            quadraui::SidebarEvent::HeaderActivated { .. } => true,
-            quadraui::SidebarEvent::Ignored => false,
-            _ => true,
         }
+        true
     }
 
     pub fn dispatch_ext_sidebar_action_key(&mut self, key: &str) -> bool {
         match key {
             "Escape" | "q" => {
                 self.ext_sidebar_has_focus = false;
-                self.ext_sidebar_system.borrow_mut().set_has_focus(false);
+                self.ext_sidebar.borrow_mut().sidebar.has_focus = false;
                 true
             }
             "/" => {
@@ -1951,15 +1953,14 @@ impl Engine {
                         // even though the README preview itself may still
                         // be a tick or two away.
                         self.ext_show_readme_or_fetch_async(&name, &display, &base_url, false);
-                        self.ext_sidebar_system.borrow_mut().set_collapsed(0, false);
+                        self.ext_sidebar.borrow_mut().sidebar.sections[0].collapsed = false;
                         let new_installed = self.ext_installed_items();
                         if let Some(pos) = new_installed.iter().position(|m| m.name == name) {
-                            self.ext_sidebar_system
-                                .borrow_mut()
-                                .set_active_section(Some(0));
-                            self.ext_sidebar_system
-                                .borrow_mut()
-                                .set_selected_path(0, Some(vec![pos as u16]));
+                            let mut host = self.ext_sidebar.borrow_mut();
+                            host.sidebar.active_section = Some(0);
+                            if let Some(tree) = host.sidebar.tree_mut(0) {
+                                tree.selected_path = Some(vec![pos as u16]);
+                            }
                         }
                     }
                 }
@@ -2071,13 +2072,13 @@ impl Engine {
             })
             .collect();
 
-        let mut sidebar = self.ext_sidebar_system.borrow_mut();
-        sidebar.set_has_focus(self.ext_sidebar_has_focus);
-        if self.ext_sidebar_has_focus && sidebar.active_section().is_none() {
-            sidebar.set_active_section(Some(0));
+        let mut host = self.ext_sidebar.borrow_mut();
+        host.sidebar.has_focus = self.ext_sidebar_has_focus;
+        if self.ext_sidebar_has_focus && host.sidebar.active_section.is_none() {
+            host.sidebar.active_section = Some(0);
         }
-        sidebar.set_rows(0, installed_rows);
-        sidebar.set_rows(1, available_rows);
+        host.sidebar.set_rows(0, installed_rows);
+        host.sidebar.set_rows(1, available_rows);
     }
 
     fn ext_sidebar_navigate(&mut self, key: quadraui::Key) {
@@ -2098,29 +2099,27 @@ impl Engine {
             modifiers: quadraui::Modifiers::default(),
             repeat: false,
         };
-        let sidebar_event = self
-            .ext_sidebar_system
-            .borrow_mut()
-            .handle_cached(&ev, rect);
-        // `SidebarSystem::move_selection_by` only moves the selection within the
+        let handled = self.ext_sidebar.borrow_mut().handle_cached(&ev, rect);
+        // `Sidebar::move_selection_by` only moves the selection within the
         // already-active section — at the bottom of a section (or while empty)
         // it returns `Consumed` (no row changed) or `Ignored` rather than crossing
         // into the next section. A fresh install starts with an empty INSTALLED
         // section, so Down can never reach AVAILABLE — a single-row Down/j/Up/k
-        // crossing a boundary must be handled here via `SidebarSystem`'s public API.
+        // crossing a boundary must be handled here via `Sidebar`'s public API.
         // `PageUp`/`PageDown`/`Home`/`End` deliberately do not cross: they are
         // jump-by-many/jump-to-extreme commands with no well-defined semantics for
         // "how far into the next section" — they still stop at the section boundary
         // rather than dead-ending, allowing the single-row keys to reach the far
         // section instead.
-        let needs_cross_section = (forward || backward)
-            && matches!(
-                sidebar_event,
-                quadraui::SidebarEvent::Consumed | quadraui::SidebarEvent::Ignored
-            );
-        self.dispatch_ext_sidebar_event(sidebar_event);
+        let moved = matches!(
+            &handled,
+            quadraui::Handled::Event(actions)
+                if actions.iter().any(|a| matches!(a, quadraui::SidebarAction::RowSelected { .. }))
+        );
+        let needs_cross_section = (forward || backward) && !moved;
+        self.dispatch_ext_sidebar_event(handled);
         if needs_cross_section && self.ext_sidebar_cross_section_on_edge(forward, rect) {
-            // Mirror `SidebarEvent::RowSelected`'s side effect
+            // Mirror `SidebarAction::RowSelected`'s side effect
             // (`dispatch_ext_sidebar_event`'s arm just above): a
             // within-section `Down`/`Up` exits filter mode via that arm,
             // but a boundary-crossing move never produces a `RowSelected`
@@ -2140,7 +2139,7 @@ impl Engine {
     /// "available" = 1), so the target index is a flip. Returns whether a cross
     /// actually happened (target section already active or empty are no-ops).
     ///
-    /// Uses `SidebarSystem::reveal` rather than `set_selected_path`: this sidebar
+    /// Uses `Sidebar::reveal` rather than `set_selected_path`: this sidebar
     /// has `set_allow_collapse(true)`, and `set_selected_path` would select a row
     /// inside a collapsed target section (invisible but actionable) without
     /// scrolling it into view. `reveal` un-collapses the section, selects the row,
@@ -2155,13 +2154,13 @@ impl Engine {
         if target_len == 0 {
             return false;
         }
-        let mut sidebar = self.ext_sidebar_system.borrow_mut();
-        if sidebar.active_section() == Some(target_section) {
+        let mut host = self.ext_sidebar.borrow_mut();
+        if host.sidebar.active_section == Some(target_section) {
             return false;
         }
         let row = if forward { 0 } else { target_len - 1 };
-        sidebar.set_active_section(Some(target_section));
-        sidebar.reveal(target_section, &vec![row as u16], rect);
+        host.sidebar.active_section = Some(target_section);
+        host.reveal_cached(target_section, &vec![row as u16], rect);
         true
     }
 
@@ -2207,12 +2206,12 @@ impl Engine {
             match key {
                 "Escape" | "q" => {
                     self.ext_sidebar_has_focus = false;
-                    self.ext_sidebar_system.borrow_mut().set_has_focus(false);
+                    self.ext_sidebar.borrow_mut().sidebar.has_focus = false;
                     ExtSidebarKeyResult::Unfocused
                 }
                 "h" | "Left" => {
                     self.ext_sidebar_has_focus = false;
-                    self.ext_sidebar_system.borrow_mut().set_has_focus(false);
+                    self.ext_sidebar.borrow_mut().sidebar.has_focus = false;
                     self.activity_bar_focus_in_at(5);
                     ExtSidebarKeyResult::FocusActivityBar
                 }
@@ -2256,11 +2255,8 @@ impl Engine {
     pub fn handle_ext_sidebar_ui_event(&mut self, event: quadraui::UiEvent) -> bool {
         self.populate_ext_sidebar_system();
         let rect = self.ext_sidebar_body_rect.get();
-        let sidebar_event = self
-            .ext_sidebar_system
-            .borrow_mut()
-            .handle_cached(&event, rect);
-        self.dispatch_ext_sidebar_event(sidebar_event)
+        let handled = self.ext_sidebar.borrow_mut().handle_cached(&event, rect);
+        self.dispatch_ext_sidebar_event(handled)
     }
 
     /// Returns the filtered list of installed extension manifests.
@@ -3229,7 +3225,7 @@ impl Engine {
     pub fn ai_send_message(&mut self, text: String) {
         let text = text.trim().to_string();
         // A message submitted while a turn is in flight is queued rather than
-        // silently dropped. `quadraui::ChatController` swallows an empty `Submit`
+        // silently dropped. `quadraui::Chat` swallows an empty `Submit`
         // before it reaches this function, so an empty `text` here can only come
         // from a call site other than the chat input's Enter/Ctrl+S — kept as a
         // no-op rather than queuing an empty message.
@@ -3697,7 +3693,7 @@ impl Engine {
         // A staged Visual-selection/`:{range}AI` attachment is
         // composed content the user hasn't sent yet — clearing the
         // conversation drops it too, same as clearing the typed-but-
-        // unsubmitted input would (the input itself is `ChatController`'s
+        // unsubmitted input would (the input itself is `Chat`'s
         // own state, untouched here, matching this function's existing
         // scope).
         self.acp_pending_attachment = None;
@@ -3729,7 +3725,7 @@ impl Engine {
         self.acp_current_turn_entries.clear();
         self.acp_turn_checkpoints.clear();
         self.turn_review_checkpoint_id = None;
-        self.ai_chat.borrow_mut().set_transcript_scroll_top(0);
+        self.ai_chat.borrow_mut().transcript_scroll_top = 0;
         // Clearing the tab's transcript must also clear its label,
         // or `AcpSession::is_blank` would keep reporting this tab as
         // "used" forever — `:AiClose`-ing the last remaining tab (which
@@ -3811,7 +3807,7 @@ impl Engine {
         let chosen = menu.candidates[menu.selected_idx].insert_text.clone();
         let mut chat = self.ai_chat.borrow_mut();
         chat.clear_input();
-        chat.input_insert_str(&format!("{chosen} "));
+        crate::core::engine::ai_chat_insert_str(&mut chat, &format!("{chosen} "));
         true
     }
 
@@ -4022,7 +4018,7 @@ impl Engine {
         new_input.push(' ');
         let mut chat = self.ai_chat.borrow_mut();
         chat.clear_input();
-        chat.input_insert_str(&new_input);
+        crate::core::engine::ai_chat_insert_str(&mut chat, &new_input);
         true
     }
 
@@ -4078,7 +4074,7 @@ impl Engine {
     /// Intercept a plain unmodified character key that might be starting,
     /// continuing, or completing the `<leader>ai` focus-toggle gesture — checked
     /// by `render::route_ai_chat_event` before the key reaches
-    /// `ChatController::handle`'s ordinary text-insertion path, exactly like
+    /// `Chat::handle`'s ordinary text-insertion path, exactly like
     /// that function's existing slash-command/`@`-mention Tab and Enter
     /// intercepts.
     ///
@@ -4099,7 +4095,7 @@ impl Engine {
     /// Returns `true` when the key was consumed as part of the gesture (still
     /// matching, or matched in full). Returns `false` when the key breaks a
     /// match: any previously-buffered prefix is replayed into the input
-    /// verbatim via `ChatController::input_insert_str` so nothing is dropped.
+    /// verbatim via `Chat::input_insert_str` so nothing is dropped.
     pub fn ai_leader_toggle_key(&mut self, ch: char) -> bool {
         if !self.ai_chat.borrow().input_text().is_empty() {
             self.ai_leader_toggle_pending.clear();
@@ -4113,7 +4109,7 @@ impl Engine {
         };
         if ch != expected {
             if !pending.is_empty() {
-                self.ai_chat.borrow_mut().input_insert_str(&pending);
+                crate::core::engine::ai_chat_insert_str(&mut self.ai_chat.borrow_mut(), &pending);
             }
             return false;
         }
@@ -4144,27 +4140,27 @@ impl Engine {
     /// buffered keystrokes" guarantee to keys outside its own dispatch.
     ///
     /// Callers must not use this for `Escape`: that key is about to fire
-    /// `ChatControllerAction::Cancelled` and leave the panel, so the buffer
+    /// `ChatEvent::Cancelled` and leave the panel, so the buffer
     /// should be discarded (`ai_leader_toggle_pending.clear()`) rather than
     /// replayed into an input the user is walking away from — see
     /// `dispatch_ai_chat_event`'s `Cancelled` arm, which does exactly that.
     pub fn ai_leader_toggle_flush(&mut self) {
         let pending = std::mem::take(&mut self.ai_leader_toggle_pending);
         if !pending.is_empty() {
-            self.ai_chat.borrow_mut().input_insert_str(&pending);
+            crate::core::engine::ai_chat_insert_str(&mut self.ai_chat.borrow_mut(), &pending);
         }
     }
 
-    /// Apply a [`quadraui::ChatControllerAction`] the AI panel's `ChatController`
+    /// Apply a [`quadraui::ChatEvent`] the AI panel's `Chat`
     /// returned from `handle_event()` under `Handled::Event`. Shared by GTK and
     /// TUI via `render::route_ai_chat_event`.
     ///
     /// Returns whether the panel should keep keyboard focus — `false` only on
     /// `Cancelled` (Escape), mirroring every other panel's "Escape leaves"
-    /// convention now that the always-focused `ChatController` input has no
+    /// convention now that the always-focused `Chat` input has no
     /// separate "not editing" mode.
-    pub fn dispatch_ai_chat_event(&mut self, event: quadraui::ChatControllerAction) -> bool {
-        use quadraui::ChatControllerAction as Ev;
+    pub fn dispatch_ai_chat_event(&mut self, event: quadraui::ChatEvent) -> bool {
+        use quadraui::ChatEvent as Ev;
         match event {
             Ev::Submit { text } => {
                 self.ai_send_message(text);
@@ -4184,7 +4180,7 @@ impl Engine {
                 false
             }
             // The clickable Send/Stop segment reads
-            // "Stop" while `ChatController::set_busy(true)` — i.e. exactly
+            // "Stop" while `Chat::set_busy(true)` — i.e. exactly
             // while `engine.acp().ai_streaming` — and clicking it there
             // emits this event instead of touching the input buffer.
             // Routes to the identical `session/cancel` path as `Ctrl+C`
@@ -4197,7 +4193,7 @@ impl Engine {
                 self.acp_cancel_turn();
                 true
             }
-            // Ctrl+C: clear the conversation. `ChatController` has no
+            // Ctrl+C: clear the conversation. `Chat` has no
             // built-in binding for it (only Escape/Ctrl+S/Alt+Enter/
             // Ctrl+Enter/PageUp/PageDown/Ctrl+A/Ctrl+E are handled
             // internally), so it falls to this app-hotkey escape hatch,
@@ -4235,7 +4231,7 @@ impl Engine {
             // Ctrl+G ("go now") — cancel the in-flight turn and
             // immediately dispatch whatever's queued instead of waiting
             // for it to be sent automatically once the turn reaches
-            // `PromptStopped` on its own. `ChatController` doesn't bind
+            // `PromptStopped` on its own. `Chat` doesn't bind
             // Ctrl+G internally (unlike Enter/Ctrl+S/Ctrl+Enter, all of
             // which fully consume "submit" — including on an *empty*
             // input, where `try_submit` returns `Ignored` before this
@@ -4248,7 +4244,7 @@ impl Engine {
                 true
             }
             // A click landed on transcript turn `turn_idx`, row
-            // `row_in_turn` into it (`quadraui::ChatController`'s own doc:
+            // `row_in_turn` into it (`quadraui::Chat`'s own doc:
             // row 0 is always the role-header row). See
             // `Self::ai_chat_turn_clicked` for what each turn kind does
             // with it — a tool-call card's header toggles it, a click
@@ -4266,7 +4262,7 @@ impl Engine {
         }
     }
 
-    /// Apply a [`quadraui::ChatControllerAction::TurnClicked`]: a
+    /// Apply a [`quadraui::ChatEvent::TurnClicked`]: a
     /// click or the equivalent focused-turn `Enter` (see
     /// `render::route_ai_chat_event`'s Enter intercept, which resolves the
     /// same way this does before calling this method) landed on transcript
@@ -4280,7 +4276,7 @@ impl Engine {
     ///   already exactly one summary row, so there's no header/body
     ///   distinction to make.
     /// - A tool-call card toggles on `row_in_turn <= 1` — row 0 is
-    ///   `ChatController`'s own role-header row ("System"/"System ▸"), row 1
+    ///   `Chat`'s own role-header row ("System"/"System ▸"), row 1
     ///   is the card's own title line (`tool_call_title_line`/
     ///   `tool_call_summary_line`'s first line), present at that same row
     ///   position whether the card is collapsed (it's the whole body) or
@@ -4334,7 +4330,7 @@ impl Engine {
     /// `render::route_ai_chat_event`'s focused-turn `Enter` intercept.
     /// Resolves `turn_idx` via `AcpSession::transcript_turn_kinds` (same as
     /// its caller) and writes to `AcpSession::thought_expanded`/
-    /// `tool_call_expanded` — **not** `quadraui::ChatController`'s own
+    /// `tool_call_expanded` — **not** `quadraui::Chat`'s own
     /// internal collapsed-turn map, which `populate_ai_chat_controller`
     /// treats as a pure render target and overwrites from these two maps
     /// every frame (see that function's doc on why the vimcode-side maps,
@@ -4834,10 +4830,7 @@ mod ai_mention_completions_exclude_tests {
 
         engine.cwd = workspace.clone();
         engine.workspace_root = Some(workspace.clone());
-        engine
-            .ai_chat
-            .borrow_mut()
-            .input_insert_str("look at @1545");
+        crate::core::engine::ai_chat_insert_str(&mut engine.ai_chat.borrow_mut(), "look at @1545");
 
         let menu = engine
             .ai_mention_completions()
@@ -4922,7 +4915,7 @@ mod ai_leader_toggle_key_tests {
     fn never_engages_once_input_is_non_empty() {
         let mut engine = Engine::new_for_test();
         engine.ai_has_focus = true;
-        engine.ai_chat.borrow_mut().input_insert_str("hello");
+        crate::core::engine::ai_chat_insert_str(&mut engine.ai_chat.borrow_mut(), "hello");
         assert!(!engine.ai_leader_toggle_key(' '));
         assert!(!engine.ai_leader_toggle_key('a'));
         assert!(!engine.ai_leader_toggle_key('i'));
@@ -4985,8 +4978,7 @@ mod ai_leader_toggle_key_tests {
         assert!(engine.ai_leader_toggle_key('a'));
         assert_eq!(engine.ai_leader_toggle_pending, " a");
 
-        let still_focused =
-            engine.dispatch_ai_chat_event(quadraui::ChatControllerAction::Cancelled);
+        let still_focused = engine.dispatch_ai_chat_event(quadraui::ChatEvent::Cancelled);
 
         assert!(!still_focused);
         assert!(!engine.ai_has_focus);
@@ -5039,10 +5031,7 @@ mod issue_1513_at_symbol_and_at_dir_mentions {
                 children: Vec::new(),
             },
         ];
-        engine
-            .ai_chat
-            .borrow_mut()
-            .input_insert_str("look at @MyStr");
+        crate::core::engine::ai_chat_insert_str(&mut engine.ai_chat.borrow_mut(), "look at @MyStr");
 
         let menu = engine
             .ai_mention_completions()
@@ -5088,10 +5077,7 @@ mod issue_1513_at_symbol_and_at_dir_mentions {
             character: 0,
             children: Vec::new(),
         }];
-        engine
-            .ai_chat
-            .borrow_mut()
-            .input_insert_str("look at @MyStr");
+        crate::core::engine::ai_chat_insert_str(&mut engine.ai_chat.borrow_mut(), "look at @MyStr");
 
         assert!(engine.ai_mention_accept_selected());
 
@@ -5125,10 +5111,7 @@ mod issue_1513_at_symbol_and_at_dir_mentions {
         engine.cwd = workspace.clone();
         engine.workspace_root = Some(workspace.clone());
 
-        engine
-            .ai_chat
-            .borrow_mut()
-            .input_insert_str("look at @subd");
+        crate::core::engine::ai_chat_insert_str(&mut engine.ai_chat.borrow_mut(), "look at @subd");
         let menu = engine
             .ai_mention_completions()
             .expect("typing @ with a matching dir prefix should show mention completions");

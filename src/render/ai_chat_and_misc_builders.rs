@@ -35,6 +35,9 @@ pub fn quickfix_to_list_view(qf: &QuickfixPanel) -> quadraui::ListView {
         h_scroll: 0,
         max_content_width: None,
         show_v_scrollbar: false,
+        items_window: None,
+        scroll_px: None,
+        striped: false,
     }
 }
 
@@ -142,7 +145,7 @@ fn span_carries_styling(span: &quadraui::StyledSpan) -> bool {
 
 /// Render `content` as markdown into a single joined [`quadraui::StyledText`]
 /// (`\n`-separated spans, one per source line, matching
-/// [`quadraui::ChatController::push_turn_markdown`]'s own join) plus its
+/// [`quadraui::Chat::push_turn_markdown`]'s own join) plus its
 /// per-line heading scales, reusing `cache[idx]` when `content`'s length is
 /// unchanged since the last call — see [`AcpSession::markdown_turn_cache`]'s
 /// doc for why length is a sufficient staleness check here. Written as a
@@ -155,7 +158,7 @@ fn span_carries_styling(span: &quadraui::StyledSpan) -> bool {
 /// When the render comes back with *nothing to style* — every line at
 /// scale `1.0` and every span carrying no fg/bg/bold/italic/underline —
 /// this returns the rendered text as a single unstyled span and an
-/// **empty** `line_scales`. `ChatController::build_transcript_rows` picks
+/// **empty** `line_scales`. `Chat::build_transcript_rows` picks
 /// its wrap policy off exactly that field — turns with per-line scales wrap
 /// with `WrapPolicy::Char` (mid-word, at the display-width budget), turns
 /// without them go down the flat path and word-wrap via `text_util::word_wrap`.
@@ -236,7 +239,7 @@ pub(crate) fn is_genuine_thought_chunk(
         .any(|m| m.role == "assistant")
 }
 
-/// Populate `engine.ai_chat` (a [`quadraui::ChatController`]) with the
+/// Populate `engine.ai_chat` (a [`quadraui::Chat`]) with the
 /// current conversation and busy state for the next `render()`/`handle()`
 /// pass — the AI-panel twin of [`populate_explorer_tree_controller`]. Call
 /// once before either (both [`route_ai_chat_event`] and the two backends'
@@ -245,7 +248,7 @@ pub(crate) fn is_genuine_thought_chunk(
 /// `engine.acp().ai_messages` stays the business-logic source of truth (what
 /// `crate::core::ai::send_chat` actually sends); this rebuilds the
 /// controller's own `Vec<ChatTurn>` mirror from it on every call, matching
-/// [`quadraui::ChatController::set_transcript`]'s "replace, don't
+/// [`quadraui::Chat::set_transcript`]'s "replace, don't
 /// accumulate" contract so streamed/cleared history never double-renders.
 pub fn populate_ai_chat_controller(
     engine: &Engine,
@@ -256,7 +259,7 @@ pub fn populate_ai_chat_controller(
     // ACP-1: agent "thought" chunks (`session/update`'s
     // `agent_thought_chunk`, role "assistant-thought" — see
     // `Engine::acp_append_chunk`) render under `ChatRole::System`, not
-    // `Assistant` — `ChatController::build_transcript_rows` gives `System`
+    // `Assistant` — `Chat::build_transcript_rows` gives `System`
     // both its own role-header label ("System" vs "AI") and its own colour,
     // which is the acceptance criterion: thought chunks must be visually
     // distinct from message chunks, not merely a different tint on the same
@@ -268,7 +271,7 @@ pub fn populate_ai_chat_controller(
     // user's own words are never markdown *content* to re-render. The
     // per-role colour is no longer the mechanism that keeps thought turns
     // visually distinct from assistant turns — `ChatRole::System`
-    // (vs `Assistant`) already earns that via `ChatController::
+    // (vs `Assistant`) already earns that via `Chat::
     // build_transcript_rows`'s role-header label/colour, and thought turns
     // additionally collapse to a one-line summary below.
     let q_theme = to_quadraui_theme(theme);
@@ -413,14 +416,14 @@ pub fn populate_ai_chat_controller(
 
     // The agent's current plan paints as its own pinned block above the
     // transcript (painted by `paint_ai_plan_band`, in a rect carved out of
-    // the panel *before* `ChatController::render` ever sees the remainder)
+    // the panel *before* `Chat::render` ever sees the remainder)
     // rather than as a synthetic trailing transcript turn. It renders
     // via `ai_plan_multi_section_view`. `ai_messages`/`turns`/`kinds` here
     // are untouched by `engine.acp().plan`.
     *acp.transcript_turn_kinds.borrow_mut() = kinds;
 
     let mut chat = engine.ai_chat.borrow_mut();
-    chat.set_transcript(turns);
+    chat.transcript = turns;
     // Thought turns and tool-call cards each collapse to a
     // one-line summary by default; a user click/`Tab`+`Enter` toggle
     // (`Engine::dispatch_ai_chat_event`'s `TurnClicked`/`KeyPressed` arms)
@@ -432,7 +435,7 @@ pub fn populate_ai_chat_controller(
     // `ai_messages` index / call id never does.
     //
     // Written for every index in the *current* transcript on every frame,
-    // the "stays collapsed"/`None` case included, because `ChatController`
+    // the "stays collapsed"/`None` case included, because `Chat`
     // keeps collapsed/summary state in its own maps **keyed by transcript
     // index**, and `set_transcript` deliberately does not clear them (see
     // its doc). Only setting the "expanded" case would therefore leak a
@@ -477,21 +480,21 @@ pub fn populate_ai_chat_controller(
             }
         }
     }
-    chat.set_busy(engine.acp().ai_streaming);
+    chat.busy = engine.acp().ai_streaming;
     // Plumb the `ai_chat_submit_on_enter` setting straight through to
-    // `ChatController` every call — cheap enough to set unconditionally
-    // (`ChatController::set_submit_on_enter` is a plain field write) and
+    // `Chat` every call — cheap enough to set unconditionally
+    // (`Chat::set_submit_on_enter` is a plain field write) and
     // this is the one place both backends already funnel through before
     // every `render()`/`handle()` pass, so a `:set` toggle takes effect on
     // the very next frame without either backend needing its own wiring.
-    chat.set_submit_on_enter(engine.settings.ai_chat_submit_on_enter);
+    chat.submit_on_enter = engine.settings.ai_chat_submit_on_enter;
     // Advance the status-strip's `Spinner` primitive to the frame
     // `Engine::tick_ai_spinner` last stamped (`poll_idle`, ≥4 Hz while busy
     // — see `App::tick_dispatch`'s `request_frame_in` re-arm). Harmless to
-    // call every frame regardless of `busy`: `ChatController::render` only
+    // call every frame regardless of `busy`: `Chat::render` only
     // ever paints the glyph when `self.busy` is also true (see
     // `set_busy`'s own doc), so this can't animate a frozen/idle panel.
-    chat.set_spinner_frame(engine.ai_spinner_frame);
+    chat.spinner_frame = engine.ai_spinner_frame;
     let header_fg = theme.status_fg;
     let ai_chat_icon = crate::icons::AI_CHAT.nerd;
     let mut header = if engine.acp().ai_streaming {
@@ -619,23 +622,23 @@ pub fn populate_ai_chat_controller(
             ));
         }
     }
-    chat.set_status(quadraui::StyledText::colored(header, header_fg));
-    chat.set_hint(Some(quadraui::StyledText::colored(
+    chat.status = quadraui::StyledText::colored(header, header_fg);
+    chat.hint = Some(quadraui::StyledText::colored(
         ai_chat_hint_line(
             backend,
             engine.settings.ai_chat_submit_on_enter,
             engine.acp().queued_prompt.is_some(),
         ),
         theme.comment,
-    )));
+    ));
 }
 
 /// Build the `quadraui::MultiSectionView` for the AI panel's pinned plan
 /// block, or `None` while `engine.acp().plan` is empty (nothing to pin).
 ///
-/// One section, not the whole `ChatController` transcript. The plan paints
-/// as its own pinned band above `ChatController` (in a rect carved out of
-/// the panel *before* `ChatController::render` ever sees the remainder) so
+/// One section, not the whole `Chat` transcript. The plan paints
+/// as its own pinned band above `Chat` (in a rect carved out of
+/// the panel *before* `Chat::render` ever sees the remainder) so
 /// it never moves regardless of how much transcript text streams in below.
 ///
 /// Collapsed (the default, `!engine.ai_plan_expanded`) shows only the
@@ -718,7 +721,7 @@ pub fn ai_plan_multi_section_view(
 /// reserve at the top of the AI panel rect this frame: `0.0` when there is
 /// no plan to pin, one row for the header when collapsed, or the header
 /// plus one row per entry when expanded. Callers subtract this from the
-/// panel rect's height *before* handing the remainder to `ChatController`
+/// panel rect's height *before* handing the remainder to `Chat`
 /// (`paint_ai_plan_band`'s doc has the call sequence).
 pub fn ai_plan_band_height(engine: &Engine, unit_h: f32) -> f32 {
     let Some(plan_len) = (!engine.acp().plan.is_empty()).then(|| engine.acp().plan.len()) else {
@@ -776,7 +779,7 @@ pub fn paint_ai_plan_band(
         content_size: plan_len * unit_h,
         aux_size: 0.0,
     });
-    backend.draw_multi_section_view(rect, &view);
+    quadraui::DrawsPrimitives::draw_primitive(backend, rect, &view);
     *engine.ai_plan_layout.borrow_mut() = Some(layout);
 }
 
@@ -785,7 +788,7 @@ pub fn paint_ai_plan_band(
 /// header is interactive — clicking it (anywhere in the title area, or the
 /// chevron) toggles `Engine::ai_plan_expanded`. Returns whether the press
 /// landed on the band at all, so the caller (`App::route_ai_sidebar_event`)
-/// knows whether to forward the event to `ChatController` instead.
+/// knows whether to forward the event to `Chat` instead.
 pub fn route_ai_plan_band_click(engine: &mut Engine, pos: quadraui::Point) -> bool {
     let layout = engine.ai_plan_layout.borrow();
     let Some(layout) = layout.as_ref() else {
@@ -810,7 +813,7 @@ pub fn route_ai_plan_band_click(engine: &mut Engine, pos: quadraui::Point) -> bo
 /// here because neither is a public quadraui export: this one is embedded
 /// directly into the status-strip *text* (`⠹ execute: cargo test · 12s`),
 /// not painted through the `Spinner` primitive itself (that's the
-/// separate icon `ChatController::set_spinner_frame`, just above, already
+/// separate icon `Chat::set_spinner_frame`, just above, already
 /// drives). A cosmetic text constant shared verbatim by both backends —
 /// not per-backend rendering logic — so duplicating it here doesn't need
 /// a quadraui issue first.
@@ -861,7 +864,7 @@ fn ai_busy_status_text(engine: &Engine) -> String {
 }
 
 /// The persistent one-line hint `populate_ai_chat_controller` pins to
-/// [`quadraui::ChatController::set_hint`] — unlike the built-in
+/// [`quadraui::Chat::set_hint`] — unlike the built-in
 /// `TextInput` placeholder it replaces, this stays visible once the user
 /// starts typing, which is the whole point: the send/stop/leave keys are
 /// otherwise only discoverable in the empty-input state.
@@ -936,9 +939,9 @@ fn ai_chat_hint_line(
 /// helper's contract. Anchoring at the rect's bottom edge with the rect
 /// itself as the viewport makes `Completions::layout`'s own "prefer below,
 /// flip above on overflow" placement logic put the popup just above the
-/// panel's bottom edge — where `ChatController`'s input box always is —
+/// panel's bottom edge — where `Chat`'s input box always is —
 /// without this function needing to know that box's exact pixel/cell
-/// geometry (`ChatController` doesn't expose it).
+/// geometry (`Chat` doesn't expose it).
 pub fn paint_ai_command_completions(
     backend: &mut dyn quadraui::Backend,
     engine: &Engine,

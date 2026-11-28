@@ -127,6 +127,10 @@ pub(crate) fn pixel_to_click_target(
     // Unused for the minimap (file-wide geometry is always used), but kept
     // in the signature for callers that thread it through to other rungs.
     _alt: bool,
+    // The backend's text-measuring surface (`Backend::paint_surface`), so an
+    // editor click resolves its column against the shaped glyphs the pixel
+    // backends painted. `None` on the cell grid, where columns count cells.
+    text: Option<&mut dyn quadraui::PaintSurface>,
 ) -> ClickTarget {
     // The separated status line and per-window status line are now walked by
     // `render::route_chrome_click`, which `App::handle_mouse_click_msg` runs
@@ -264,7 +268,7 @@ pub(crate) fn pixel_to_click_target(
                     // through — no gutter/scroll reconstruction needed.
                     let (editor, editor_layout) =
                         render_mod::editor_text_layout(rw, char_width, line_height);
-                    let col = editor_layout.col_at_x(&editor, view_row, x as f32);
+                    let col = editor_layout.col_at_x(&editor, view_row, x as f32, text);
                     ClickTarget::BufferPos(window_id, buf_line, col)
                 }
                 _ => ClickTarget::None,
@@ -518,6 +522,7 @@ pub(crate) fn handle_mouse_click(
     group_tab_bar_layouts: &GroupTabBarLayoutMap,
     band_hits: Option<&EditorBandHits>,
     drag: &mut quadraui::DragState,
+    text: Option<&mut dyn quadraui::PaintSurface>,
 ) -> (Option<bool>, Option<EngineAction>) {
     match pixel_to_click_target(
         engine,
@@ -531,6 +536,7 @@ pub(crate) fn handle_mouse_click(
         true, // real click: focus/tab/gutter side effects are intended
         drag,
         alt, // Alt-press arms the minimap's file-wide (old #1187) track; plain press now fine-seeks by default
+        text,
     ) {
         ClickTarget::BufferPos(wid, line, col) => {
             // Alt+Click in VSCode mode → add cursor at position
@@ -599,6 +605,7 @@ pub(crate) fn handle_mouse_double_click(
     group_tab_bar_layouts: &GroupTabBarLayoutMap,
     band_hits: Option<&EditorBandHits>,
     drag: &mut quadraui::DragState,
+    text: Option<&mut dyn quadraui::PaintSurface>,
 ) {
     if let ClickTarget::BufferPos(wid, line, col) = pixel_to_click_target(
         engine,
@@ -612,6 +619,7 @@ pub(crate) fn handle_mouse_double_click(
         true, // real click: focus/tab/gutter side effects are intended
         drag,
         false, // double-click has no Alt-fine-seek concept
+        text,
     ) {
         engine.mouse_double_click(wid, line, col);
     }
@@ -635,6 +643,7 @@ pub(crate) fn handle_mouse_drag(
     group_tab_bar_layouts: &GroupTabBarLayoutMap,
     band_hits: Option<&EditorBandHits>,
     drag: &mut quadraui::DragState,
+    text: Option<&mut dyn quadraui::PaintSurface>,
 ) {
     if let ClickTarget::BufferPos(wid, line, col) = pixel_to_click_target(
         engine,
@@ -648,6 +657,7 @@ pub(crate) fn handle_mouse_drag(
         false, // drag continuation: pure query, no focus/tab/gutter side effects
         drag,
         false, // mutate_focus is false, so the minimap-press rung never runs
+        text,
     ) {
         engine.mouse_drag(wid, line, col);
     }

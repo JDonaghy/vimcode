@@ -1263,7 +1263,7 @@ fn assert_no_workspace_render_scenario<D: quadraui::testing::ConformanceDriver>(
 /// path (minus the ambient `plugin_init`/`ext_refresh_quiet` reads, via
 /// `startup_into_no_workspace_for_test`), but on its own this arm's
 /// `!screen_has("EXPLORER")` assertion is vacuously true: `cell`-profile
-/// `AppShell` registers a hamburger panel at index 0 regardless of engine
+/// `ShellView` registers a hamburger panel at index 0 regardless of engine
 /// state, painting "Menu" rather than "EXPLORER" whether or not the
 /// collapse logic under test actually ran. The `_gtk` arm below is the
 /// control that makes the assertion meaningful on a profile that *would*
@@ -1277,7 +1277,7 @@ fn test_startup_into_no_workspace_renders_empty_editor_with_explorer_collapsed_t
 }
 
 /// GTK arm, and the control half of this pair: GTK's `px`-profile
-/// `AppShell` registers no hamburger panel, so it defaults to Explorer at
+/// `ShellView` registers no hamburger panel, so it defaults to Explorer at
 /// index 0 and *would* paint "EXPLORER" if the sidebar were left visible —
 /// making the `_tui` arm's `!screen_has("EXPLORER")` assertion a real
 /// control here.
@@ -9982,10 +9982,7 @@ fn test_search_unified_dispatch_escape_unfocuses() {
     let mut engine = Engine::new();
     engine.search_has_focus = true;
     engine.search_panel_form_focus.replace(None);
-    engine
-        .search_sidebar_system
-        .borrow_mut()
-        .set_active_section(Some(1));
+    engine.search_sidebar.borrow_mut().sidebar.active_section = Some(1);
     let result = engine.dispatch_search_sidebar_key_unified("Escape", false, false, None);
     assert!(matches!(result, search::SearchKeyResult::Unfocused));
     assert!(!engine.search_has_focus);
@@ -9996,10 +9993,7 @@ fn test_search_unified_dispatch_printable_reenters_form() {
     let mut engine = Engine::new();
     engine.search_has_focus = true;
     engine.search_panel_form_focus.replace(None);
-    engine
-        .search_sidebar_system
-        .borrow_mut()
-        .set_active_section(Some(1));
+    engine.search_sidebar.borrow_mut().sidebar.active_section = Some(1);
     let result = engine.dispatch_search_sidebar_key_unified("", false, false, Some('x'));
     assert!(matches!(result, search::SearchKeyResult::Consumed));
     assert_eq!(
@@ -10014,10 +10008,7 @@ fn test_search_unified_dispatch_tab_switches_to_form() {
     let mut engine = Engine::new();
     engine.search_has_focus = true;
     engine.search_panel_form_focus.replace(None);
-    engine
-        .search_sidebar_system
-        .borrow_mut()
-        .set_active_section(Some(1));
+    engine.search_sidebar.borrow_mut().sidebar.active_section = Some(1);
     let result = engine.dispatch_search_sidebar_key_unified("Tab", false, false, None);
     assert!(matches!(result, search::SearchKeyResult::Consumed));
     assert_eq!(
@@ -10025,7 +10016,7 @@ fn test_search_unified_dispatch_tab_switches_to_form() {
         Some("search:query")
     );
     assert_eq!(
-        engine.search_sidebar_system.borrow().active_section(),
+        engine.search_sidebar.borrow().sidebar.active_section,
         Some(0)
     );
 }
@@ -16956,7 +16947,7 @@ fn test_menu_dispatch_action() {
 #[test]
 fn test_menu_system_starts_closed() {
     let engine = Engine::new();
-    assert!(!engine.menu_system.borrow().is_open());
+    assert!(!engine.app_menu.borrow().is_open());
 }
 
 #[test]
@@ -19962,13 +19953,14 @@ fn test_ext_remove_dialog_shows_on_d() {
     e.ext_registry = Some(vec![mock_bash_manifest()]);
     e.extension_state.mark_installed_version("bash", "1.0.0");
     e.ext_sidebar_has_focus = true;
-    e.ext_sidebar_system.borrow_mut().set_has_focus(true);
-    e.ext_sidebar_system
+    e.ext_sidebar.borrow_mut().sidebar.has_focus = true;
+    e.ext_sidebar.borrow_mut().sidebar.active_section = Some(0);
+    e.ext_sidebar
         .borrow_mut()
-        .set_active_section(Some(0));
-    e.ext_sidebar_system
-        .borrow_mut()
-        .set_selected_path(0, Some(vec![0]));
+        .sidebar
+        .tree_mut(0)
+        .unwrap()
+        .selected_path = Some(vec![0]);
     e.dispatch_ext_sidebar_action_key("d");
     assert!(e.dialog.is_some());
     assert_eq!(e.dialog.as_ref().unwrap().tag, "ext_remove");
@@ -19981,13 +19973,14 @@ fn test_ext_remove_dialog_cancel() {
     let mut e = Engine::new();
     e.ext_registry = Some(vec![mock_bash_manifest()]);
     e.extension_state.mark_installed_version("bash", "1.0.0");
-    e.ext_sidebar_system.borrow_mut().set_has_focus(true);
-    e.ext_sidebar_system
+    e.ext_sidebar.borrow_mut().sidebar.has_focus = true;
+    e.ext_sidebar.borrow_mut().sidebar.active_section = Some(0);
+    e.ext_sidebar
         .borrow_mut()
-        .set_active_section(Some(0));
-    e.ext_sidebar_system
-        .borrow_mut()
-        .set_selected_path(0, Some(vec![0]));
+        .sidebar
+        .tree_mut(0)
+        .unwrap()
+        .selected_path = Some(vec![0]);
     e.dispatch_ext_sidebar_action_key("d");
     assert!(e.dialog.is_some());
     e.handle_key("Escape", None, false);
@@ -20000,13 +19993,14 @@ fn test_ext_remove_dialog_confirm_remove() {
     let mut e = Engine::new();
     e.ext_registry = Some(vec![mock_bash_manifest()]);
     e.extension_state.mark_installed_version("bash", "1.0.0");
-    e.ext_sidebar_system.borrow_mut().set_has_focus(true);
-    e.ext_sidebar_system
+    e.ext_sidebar.borrow_mut().sidebar.has_focus = true;
+    e.ext_sidebar.borrow_mut().sidebar.active_section = Some(0);
+    e.ext_sidebar
         .borrow_mut()
-        .set_active_section(Some(0));
-    e.ext_sidebar_system
-        .borrow_mut()
-        .set_selected_path(0, Some(vec![0]));
+        .sidebar
+        .tree_mut(0)
+        .unwrap()
+        .selected_path = Some(vec![0]);
     e.dispatch_ext_sidebar_action_key("d");
     assert!(e.dialog.is_some());
     e.handle_key("", Some('r'), false);
@@ -20018,7 +20012,7 @@ fn test_ext_remove_dialog_confirm_remove() {
 fn test_ext_sidebar_system_dispatch_action_key_unfocus() {
     let mut e = Engine::new();
     e.ext_sidebar_has_focus = true;
-    e.ext_sidebar_system.borrow_mut().set_has_focus(true);
+    e.ext_sidebar.borrow_mut().sidebar.has_focus = true;
     let consumed = e.dispatch_ext_sidebar_action_key("q");
     assert!(consumed);
     assert!(!e.ext_sidebar_has_focus);
@@ -20038,13 +20032,14 @@ fn test_ext_sidebar_system_dispatch_action_key_remove() {
     let mut e = Engine::new();
     e.ext_registry = Some(vec![mock_bash_manifest()]);
     e.extension_state.mark_installed_version("bash", "1.0.0");
-    e.ext_sidebar_system.borrow_mut().set_has_focus(true);
-    e.ext_sidebar_system
+    e.ext_sidebar.borrow_mut().sidebar.has_focus = true;
+    e.ext_sidebar.borrow_mut().sidebar.active_section = Some(0);
+    e.ext_sidebar
         .borrow_mut()
-        .set_active_section(Some(0));
-    e.ext_sidebar_system
-        .borrow_mut()
-        .set_selected_path(0, Some(vec![0]));
+        .sidebar
+        .tree_mut(0)
+        .unwrap()
+        .selected_path = Some(vec![0]);
     let consumed = e.dispatch_ext_sidebar_action_key("d");
     assert!(consumed);
     assert!(e.dialog.is_some());
@@ -20054,30 +20049,31 @@ fn test_ext_sidebar_system_dispatch_action_key_remove() {
 #[test]
 fn test_ext_sidebar_system_dispatch_event_row_activated() {
     let mut e = Engine::new();
-    let event = quadraui::SidebarEvent::RowActivated {
+    let event = quadraui::SidebarAction::RowActivated {
         section: 0,
         path: vec![0],
     };
-    let consumed = e.dispatch_ext_sidebar_event(event);
+    let consumed = e.dispatch_ext_sidebar_event(quadraui::Handled::Event(vec![event]));
     assert!(consumed);
 }
 
 #[test]
 fn test_ext_sidebar_system_dispatch_event_ignored() {
     let mut e = Engine::new();
-    let consumed = e.dispatch_ext_sidebar_event(quadraui::SidebarEvent::Ignored);
+    let consumed = e.dispatch_ext_sidebar_event(quadraui::Handled::Ignored);
     assert!(!consumed);
 }
 
 #[test]
 fn test_ext_selected_from_sidebar_system() {
-    let mut e = Engine::new();
-    e.ext_sidebar_system
+    let e = Engine::new();
+    e.ext_sidebar.borrow_mut().sidebar.active_section = Some(1);
+    e.ext_sidebar
         .borrow_mut()
-        .set_active_section(Some(1));
-    e.ext_sidebar_system
-        .borrow_mut()
-        .set_selected_path(1, Some(vec![3]));
+        .sidebar
+        .tree_mut(1)
+        .unwrap()
+        .selected_path = Some(vec![3]);
     let (is_installed, idx) = e.ext_selected_from_sidebar_system();
     assert!(!is_installed);
     assert_eq!(idx, 3);
@@ -20563,15 +20559,15 @@ fn test_sc_hover_log_entry_generates_markdown() {
     );
 }
 
-// ─── SC SidebarSystem ───────────────────────────────────────────────────
+// ─── SC Sidebar ───────────────────────────────────────────────────
 
 #[test]
 fn test_sc_sidebar_system_initialized_with_5_sections() {
     let engine = Engine::new();
-    let sidebar = engine.sc_sidebar_system.borrow();
+    let sidebar = engine.sc_sidebar.borrow();
     for section in 0..source_control::SC_SECTION_COUNT {
         assert!(
-            sidebar.is_section_visible(section),
+            sidebar.sidebar.sections[section].visible,
             "section {section} should exist"
         );
     }
@@ -20639,7 +20635,7 @@ fn test_sc_unified_dispatch_stage_all() {
     assert!(matches!(result, source_control::ScKeyResult::Consumed));
     // sc_stage_all calls git which won't work in test env, but the key
     // should at least be consumed (not ignored). Verify it wasn't treated
-    // as a navigation key by checking the SidebarSystem state didn't change.
+    // as a navigation key by checking the Sidebar state didn't change.
 }
 
 #[test]

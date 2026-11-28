@@ -2,9 +2,9 @@
 ///
 /// The `Engine` owns business logic for sending a message, polling the
 /// background response, clearing the conversation, and translating a
-/// `ChatControllerAction` into those engine actions (`Engine::dispatch_ai_chat_event`).
+/// `ChatEvent` into those engine actions (`Engine::dispatch_ai_chat_event`).
 /// Text editing, cursor movement, input buffer, history, and scroll are managed
-/// by `Engine::ai_chat` (a `quadraui::ChatController`), whose behaviour is
+/// by `Engine::ai_chat` (a `quadraui::Chat`), whose behaviour is
 /// covered by quadraui's own test suite.
 use vimcode_core::core::engine::Engine;
 
@@ -39,17 +39,17 @@ fn test_ai_initial_state() {
     assert!(e.ai_chat.borrow().input_text().is_empty());
     assert!(!e.ai_has_focus);
     assert!(!e.acp().ai_streaming);
-    assert_eq!(e.ai_chat.borrow().transcript_scroll_top(), 0);
+    assert_eq!(e.ai_chat.borrow().transcript_scroll_top, 0);
 }
 
-/// `ChatController`'s input has no separate "not editing" mode the way the
+/// `Chat`'s input has no separate "not editing" mode the way the
 /// old `ai_input_active` flag did — it is always focused, so a click or
 /// keystroke reaching the panel types immediately rather than needing an
 /// `i`/`a`/`Return` to "activate" it first.
 #[test]
 fn test_ai_chat_input_has_focus_by_default() {
     let e = engine();
-    assert!(e.ai_chat.borrow().input_has_focus());
+    assert!(e.ai_chat.borrow().input_has_focus);
 }
 
 #[test]
@@ -62,10 +62,10 @@ fn test_ai_clear_resets_state() {
             role: "user".to_string(),
             content: "hello".to_string(),
         });
-    e.ai_chat.borrow_mut().set_transcript_scroll_top(5);
+    e.ai_chat.borrow_mut().transcript_scroll_top = 5;
     e.ai_clear();
     assert!(e.acp_mut().ai_messages.is_empty());
-    assert_eq!(e.ai_chat.borrow().transcript_scroll_top(), 0);
+    assert_eq!(e.ai_chat.borrow().transcript_scroll_top, 0);
     assert!(!e.acp_mut().ai_streaming);
 }
 
@@ -78,30 +78,36 @@ fn test_ai_send_empty_input_is_noop() {
     assert!(!e.acp_mut().ai_streaming);
 }
 
-/// `ChatControllerAction::Cancelled` (Escape) leaves the panel — the
+/// `ChatEvent::Cancelled` (Escape) leaves the panel — the
 /// always-focused input has no intermediate "still focused, not editing"
 /// state to fall back into the way the old two-mode `ai_input_active` did.
 #[test]
 fn test_ai_dispatch_cancelled_clears_focus() {
     let mut e = engine();
     e.ai_has_focus = true;
-    let still_focused =
-        e.dispatch_ai_chat_event(vimcode_core::quadraui::ChatControllerAction::Cancelled);
+    let still_focused = e.dispatch_ai_chat_event(vimcode_core::quadraui::ChatEvent::Cancelled);
     assert!(!still_focused);
     assert!(!e.ai_has_focus);
 }
 
-/// `ChatControllerAction::Submit` is the panel's only path into
-/// `Engine::ai_send_message` now (`ChatController` owns the input buffer);
+/// `ChatEvent::Submit` is the panel's only path into
+/// `Engine::ai_send_message` now (`Chat` owns the input buffer);
 /// the dispatch must also clear the box afterwards.
 #[test]
 fn test_ai_dispatch_submit_sends_and_clears_input() {
     let mut e = engine_with_api_key();
-    e.ai_chat.borrow_mut().input_insert_str("hello world");
-    let still_focused =
-        e.dispatch_ai_chat_event(vimcode_core::quadraui::ChatControllerAction::Submit {
-            text: "hello world".to_string(),
-        });
+    {
+        let mut chat = e.ai_chat.borrow_mut();
+        let typed = chat
+            .edit_input(&vimcode_core::quadraui::EditOp::InsertText(
+                "hello world".to_string(),
+            ))
+            .expect("typing into an empty input changes it");
+        chat.apply(&typed);
+    }
+    let still_focused = e.dispatch_ai_chat_event(vimcode_core::quadraui::ChatEvent::Submit {
+        text: "hello world".to_string(),
+    });
     assert!(still_focused);
     assert_eq!(e.acp_mut().ai_messages.len(), 1);
     assert_eq!(e.acp_mut().ai_messages[0].role, "user");
@@ -114,7 +120,7 @@ fn test_ai_dispatch_submit_sends_and_clears_input() {
 }
 
 /// Ctrl+C is the one hotkey `Engine::dispatch_ai_chat_event` binds itself
-/// via `ChatControllerAction::KeyPressed` (`ChatController` has no built-in
+/// via `ChatEvent::KeyPressed` (`Chat` has no built-in
 /// clear-conversation binding) — the same escape hatch its own doc comment
 /// recommends apps use for hotkeys it doesn't consume.
 #[test]
@@ -126,7 +132,7 @@ fn test_ai_dispatch_ctrl_c_clears_conversation() {
             role: "user".to_string(),
             content: "hello".to_string(),
         });
-    let event = vimcode_core::quadraui::ChatControllerAction::KeyPressed {
+    let event = vimcode_core::quadraui::ChatEvent::KeyPressed {
         key: "Char('c')".to_string(),
         modifiers: vimcode_core::quadraui::Modifiers {
             ctrl: true,
@@ -141,8 +147,12 @@ fn test_ai_dispatch_ctrl_c_clears_conversation() {
 #[test]
 fn test_ai_chat_scroll_transcript_by() {
     let e = engine();
-    e.ai_chat.borrow_mut().scroll_transcript_by(5, 100, 20);
-    assert_eq!(e.ai_chat.borrow().transcript_scroll_top(), 5);
+    let mut chat = e.ai_chat.borrow_mut();
+    // Scrolled away from the tail, the transcript moves from where it is.
+    chat.stuck_to_bottom = false;
+    let scrolled = chat.scroll_transcript_by(5, 100, 20);
+    chat.apply(&scrolled);
+    assert_eq!(chat.transcript_scroll_top, 5);
 }
 
 #[test]

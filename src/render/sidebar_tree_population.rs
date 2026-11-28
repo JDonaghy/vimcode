@@ -1,6 +1,6 @@
 use super::*;
 
-/// Populate the `SidebarSystem` on `engine.sc_sidebar_system` with current
+/// Populate the `Sidebar` on `engine.sc_sidebar` with current
 /// row data for all 5 SC sections. Call once per frame before
 /// `sidebar_system.render()` or `.handle_cached()`.
 pub fn populate_sc_sidebar_system(engine: &Engine, theme: &Theme) {
@@ -104,12 +104,13 @@ pub fn populate_sc_sidebar_system(engine: &Engine, theme: &Theme) {
         })
         .collect();
 
-    let mut sidebar = engine.sc_sidebar_system.borrow_mut();
-    sidebar.set_has_focus(engine.sc_has_focus);
-    if engine.sc_has_focus && sidebar.active_section().is_none() {
+    let mut host = engine.sc_sidebar.borrow_mut();
+    let sidebar = &mut host.sidebar;
+    sidebar.has_focus = engine.sc_has_focus;
+    if engine.sc_has_focus && sidebar.active_section.is_none() {
         // Never land on the (possibly hidden) Merge Changes section by
         // default — its actions resolve conflicts.
-        sidebar.set_active_section(Some(SC_SECTION_STAGED));
+        sidebar.active_section = Some(SC_SECTION_STAGED);
     }
 
     let badge = |n: usize| {
@@ -119,13 +120,13 @@ pub fn populate_sc_sidebar_system(engine: &Engine, theme: &Theme) {
             None
         }
     };
-    sidebar.set_section_badge(SC_SECTION_MERGE, badge(merge.len()));
-    sidebar.set_section_badge(SC_SECTION_STAGED, badge(staged.len()));
-    sidebar.set_section_badge(SC_SECTION_CHANGES, badge(unstaged.len()));
-    sidebar.set_section_badge(SC_SECTION_WORKTREES, badge(engine.sc_worktrees.len()));
-    sidebar.set_section_badge(SC_SECTION_LOG, badge(engine.sc_log.len()));
-    sidebar.set_section_visible(SC_SECTION_MERGE, show_merge);
-    sidebar.set_section_visible(SC_SECTION_WORKTREES, show_worktrees);
+    sidebar.sections[SC_SECTION_MERGE].badge = badge(merge.len());
+    sidebar.sections[SC_SECTION_STAGED].badge = badge(staged.len());
+    sidebar.sections[SC_SECTION_CHANGES].badge = badge(unstaged.len());
+    sidebar.sections[SC_SECTION_WORKTREES].badge = badge(engine.sc_worktrees.len());
+    sidebar.sections[SC_SECTION_LOG].badge = badge(engine.sc_log.len());
+    sidebar.sections[SC_SECTION_MERGE].visible = show_merge;
+    sidebar.sections[SC_SECTION_WORKTREES].visible = show_worktrees;
 
     sidebar.set_rows(SC_SECTION_MERGE, merge_rows);
     sidebar.set_rows(SC_SECTION_STAGED, staged_rows);
@@ -134,7 +135,7 @@ pub fn populate_sc_sidebar_system(engine: &Engine, theme: &Theme) {
     sidebar.set_rows(SC_SECTION_LOG, log_rows);
 }
 
-/// Populate the Search panel's `SidebarSystem` with current form + tree
+/// Populate the Search panel's `Sidebar` with current form + tree
 /// data. Section 0 is the Form (query/replace/toggles/buttons/status);
 /// Section 1 is the TreeView (results grouped by file). Call once per
 /// frame before `sidebar.render()`.
@@ -382,17 +383,20 @@ pub fn populate_search_sidebar_system(engine: &Engine, root: &std::path::Path, t
         prev_header.badge = Some(Badge::plain(format!("({})", file_match_count)));
     }
 
-    let mut sidebar = engine.search_sidebar_system.borrow_mut();
-    sidebar.set_has_focus(engine.search_has_focus);
-    sidebar.set_form(0, form);
+    let mut host = engine.search_sidebar.borrow_mut();
+    let sidebar = &mut host.sidebar;
+    sidebar.has_focus = engine.search_has_focus;
+    if let Some(slot) = sidebar.form_mut(0) {
+        *slot = form;
+    }
     sidebar.set_rows(1, tree_rows);
 
-    if engine.search_has_focus && sidebar.active_section().is_none() {
-        sidebar.set_active_section(Some(0));
+    if engine.search_has_focus && sidebar.active_section.is_none() {
+        sidebar.active_section = Some(0);
     }
 }
 
-/// Populate the `TreeController` on `engine.explorer_tree` with current
+/// Populate the `TreeView` on `engine.explorer_tree` with current
 /// row data. Call once per frame before `tree_controller.render()` or
 /// `.handle()`.
 pub fn populate_explorer_tree_controller(engine: &Engine, theme: &Theme) {

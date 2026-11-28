@@ -199,7 +199,7 @@ fn item(text: &str, id: &str) -> ExtPanelItem {
 /// Deliberately **not** `engine_with_marketplace_as_ext_panel`: that
 /// fixture leaves `ext_panels` empty, so `render::build_ext_panel_data`
 /// returns `None` and the only thing that can paint is the marketplace
-/// `SidebarSystem`. Everything here flows from the registration, exactly as
+/// `Sidebar`. Everything here flows from the registration, exactly as
 /// a live plugin's `vimcode.panel.register` + `panel.set_items` would.
 pub fn engine_with_plugin_panel(fx: &PluginPanelFixture) -> Engine {
     let mut engine = Engine::new_for_test();
@@ -311,15 +311,15 @@ pub fn engine_with_plugin_panel(fx: &PluginPanelFixture) -> Engine {
     // `ext_panel_focus_pending` is what the TUI shell's `tick` consumes to put
     // the sidebar onto this panel.
     engine.ext_panel_focus_pending = Some(PANEL.to_string());
-    // Raw `AppShell::toggle_sidebar`, never `Engine::toggle_sidebar` — the
+    // Raw `ShellView::toggle_sidebar`, never `Engine::toggle_sidebar` — the
     // latter persists to the developer's real session file (the same reason
     // `gtk::testing::sidebar_panel_clicks::panel_harness` avoids it).
     if !engine.app_shell.sidebar_visible() {
         engine.app_shell.toggle_sidebar();
     }
-    // Start the shadow `AppShell` on a panel that is **not** the explorer.
+    // Start the shadow `ShellView` on a panel that is **not** the explorer.
     //
-    // `AppShell::show_panel` is a silent no-op for an id that is not in its
+    // `ShellView::show_panel` is a silent no-op for an id that is not in its
     // own `panels` list, and an `ext:` id never is, so asking for `ext:<name>`
     // here would leave the explorer active and frame 0 would paint the explorer
     // tree. On the TUI shell specifically, the cached `explorer_tree_rect` and

@@ -245,7 +245,7 @@ pub struct AcpSession {
     /// content length with the `quadraui::StyledText`/per-line heading-scale
     /// pair `quadraui::render_markdown_to_styled` produced for it.
     ///
-    /// `render::populate_ai_chat_controller` rebuilds `ChatController`'s
+    /// `render::populate_ai_chat_controller` rebuilds `Chat`'s
     /// transcript from `ai_messages` on *every* frame (matching
     /// `set_transcript`'s "replace, don't accumulate" contract), but during
     /// a streaming turn only the newest (last) message's content actually
@@ -288,14 +288,14 @@ pub struct AcpSession {
     /// index, stable because a thought turn's index never moves once appended.
     pub thought_expanded: HashSet<usize>,
 
-    /// Which `ChatController` transcript turn index is which, rebuilt fresh
+    /// Which `Chat` transcript turn index is which, rebuilt fresh
     /// by `render::populate_ai_chat_controller` every frame —
     /// read back by `Engine::dispatch_ai_chat_event`'s `TurnClicked` arm to
     /// resolve a click/`Enter` on a turn to "toggle this tool-call card" /
     /// "toggle this thought card" / "ordinary message turn, ignore".
     /// Meaningless before the first populate call of a frame, but
     /// `render::route_ai_chat_event` and both backends' `PANEL_AI` render
-    /// arms always populate before `ChatController::handle` can produce a
+    /// arms always populate before `Chat::handle` can produce a
     /// `TurnClicked`, so it is always fresh by the time a click is
     /// dispatched.
     pub transcript_turn_kinds: RefCell<Vec<TranscriptTurnKind>>,

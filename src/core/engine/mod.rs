@@ -35,7 +35,7 @@ use super::window::{
     GroupDivider, GroupId, GroupLayout, SplitDirection, Window, WindowDivider, WindowId,
     WindowLayout, WindowRect,
 };
-use quadraui::compose::workspace::{WorkspaceController, WorkspaceDoc, WorkspaceEvent};
+use quadraui::compose::workspace::{Workspace, WorkspaceDoc, WorkspaceEvent};
 use quadraui::terminal_engine::TerminalSession;
 use std::borrow::Cow;
 
@@ -422,6 +422,14 @@ fn split_ex_command(input: &str) -> (&str, &str, &str) {
 
 /// Normalize an ex-command abbreviation to its canonical form.
 /// Returns `Cow::Borrowed` when no transformation is needed.
+/// Type `text` into the AI chat input at its caret, replacing any
+/// selection, the way a keystroke would.
+pub(crate) fn ai_chat_insert_str(chat: &mut quadraui::Chat, text: &str) {
+    if let Some(event) = chat.edit_input(&quadraui::EditOp::InsertText(text.to_string())) {
+        chat.apply(&event);
+    }
+}
+
 pub fn normalize_ex_command(input: &str) -> Cow<'_, str> {
     if input.is_empty() {
         return Cow::Borrowed(input);
@@ -2954,7 +2962,7 @@ pub struct Engine {
     /// truth for which buffer, if any, is the preview and for applying the
     /// six promotion triggers. See `sync_preview_buffer_id` and
     /// `preview_tab_promote` in `engine/buffers.rs`.
-    preview_tab: WorkspaceController,
+    preview_tab: Workspace,
     /// Cached mirror of `preview_tab`'s current preview document, refreshed
     /// by `sync_preview_buffer_id` after every `preview_tab` mutation.
     pub preview_buffer_id: Option<BufferId>,
@@ -3479,10 +3487,10 @@ pub struct Engine {
     pub explorer_has_focus: bool,
     /// Whether the Search sidebar panel has keyboard focus.
     pub search_has_focus: bool,
-    /// quadraui SidebarSystem — owns Search panel (2 sections: Form chrome +
-    /// Tree results) selection, scroll, keyboard nav, and mouse handling.
-    /// Both TUI and GTK call `render()` and `handle()`.
-    pub search_sidebar_system: std::rc::Rc<std::cell::RefCell<quadraui::SidebarSystem>>,
+    /// The Search panel's quadraui `Sidebar` (2 sections: Form chrome +
+    /// Tree results) — selection, scroll, keyboard nav and mouse handling.
+    /// Every backend paints and drives it through `render::SidebarHost`.
+    pub search_sidebar: std::rc::Rc<std::cell::RefCell<crate::render::SidebarHost>>,
     pub search_sidebar_body_rect: std::cell::Cell<quadraui::Rect>,
 
     // --- Source Control panel ---
@@ -3496,10 +3504,10 @@ pub struct Engine {
     pub sc_sections_expanded: [bool; SC_SECTION_COUNT],
     /// Whether the Source Control panel currently has keyboard focus.
     pub sc_has_focus: bool,
-    /// quadraui SidebarSystem — owns SC sidebar (4 sections: Staged Changes,
-    /// Changes, Worktrees, Recent Commits) selection, scroll, keyboard nav,
-    /// and mouse handling. Both TUI and GTK call `render()` and `handle()`.
-    pub sc_sidebar_system: std::rc::Rc<std::cell::RefCell<quadraui::SidebarSystem>>,
+    /// The SC panel's quadraui `Sidebar` (Merge Changes, Staged Changes,
+    /// Changes, Worktrees, Recent Commits) — selection, scroll, keyboard
+    /// nav and mouse handling, through `render::SidebarHost`.
+    pub sc_sidebar: std::rc::Rc<std::cell::RefCell<crate::render::SidebarHost>>,
     pub sc_sidebar_body_rect: std::cell::Cell<quadraui::Rect>,
     /// Cached layout of the SC `quadraui::SidebarPanel` from the last paint.
     /// Click/hover dispatch reads it via `hit_test()` — no per-backend
@@ -3815,9 +3823,13 @@ pub struct Engine {
     pub menu_bar_visible: bool,
     /// Whether the menu bar can be fully hidden (true in TUI, false in GTK where it's the title bar).
     pub menu_bar_toggleable: bool,
-    /// quadraui MenuSystem — owns all menu bar + dropdown state and logic.
-    /// Both TUI and GTK call `menu_system.render()` and `menu_system.handle()`.
-    pub menu_system: std::rc::Rc<std::cell::RefCell<quadraui::MenuSystem>>,
+    /// The application menu — quadraui's `AppMenu`, the menu bar and its
+    /// dropdown cascade. Every backend paints it with `AppMenu::render`
+    /// and drives it with `AppMenu::handle_ui_event`, which applies each
+    /// view change to it.
+    pub app_menu: std::rc::Rc<std::cell::RefCell<quadraui::AppMenu>>,
+    /// `app_menu`'s interaction state (the open dropdown's type-ahead).
+    pub app_menu_state: std::rc::Rc<std::cell::RefCell<quadraui::AppMenuState>>,
     /// Cached menu-bar band rect from the last paint. GTK already had this as
     /// a backend-local `Cell<Rect>`; TUI's equivalents are split across
     /// `shell_app.rs` (paint + event dispatch) and `mouse.rs` (legacy mouse
@@ -3862,18 +3874,19 @@ pub struct Engine {
     /// Whether a command-line mouse selection is being actively dragged
     /// (button down, pointer moving) — the counterpart to `cmd_sel` above.
     pub cmd_dragging: std::cell::Cell<bool>,
-    /// quadraui SidebarSystem — owns debug sidebar (4 sections: Variables,
-    /// Watch, Call Stack, Breakpoints) selection, scroll, keyboard nav, and
-    /// mouse handling. Both TUI and GTK call `render()` and `handle()`.
-    pub dap_sidebar_system: std::rc::Rc<std::cell::RefCell<quadraui::SidebarSystem>>,
+    /// The debug panel's quadraui `Sidebar` (Variables, Watch, Call Stack,
+    /// Breakpoints) — selection, scroll, keyboard nav and mouse handling,
+    /// through `render::SidebarHost`.
+    pub dap_sidebar: std::rc::Rc<std::cell::RefCell<crate::render::SidebarHost>>,
     /// Cached body rect from last render frame — used by handle() in event
     /// dispatch to pass the same rect that render() used.
     pub dap_sidebar_body_rect: std::cell::Cell<quadraui::Rect>,
-    /// quadraui TreeController — owns explorer file tree selection, scroll,
-    /// scrollbar, and click hit-testing. Both TUI and GTK call `render()`
-    /// for painting and `handle()` for mouse events. Keyboard dispatch goes
-    /// through `dispatch_explorer_key()` using the navigation primitives.
-    pub explorer_tree: std::rc::Rc<std::cell::RefCell<quadraui::TreeController>>,
+    /// The explorer file tree's quadraui `TreeView` state — selection,
+    /// scroll and the inline rename session — kept by `render::TreeHost`.
+    /// Every backend paints it with `TreeHost::paint` and routes mouse
+    /// events through `TreeHost::handle`. Keyboard dispatch goes through
+    /// `dispatch_explorer_key()` using quadraui's navigation core.
+    pub explorer_tree: std::rc::Rc<std::cell::RefCell<crate::render::TreeHost>>,
     /// Flat visible rows for the explorer tree, rebuilt on demand (toggle,
     /// refresh, reveal). `TreePath` index maps directly into this vec.
     pub explorer_rows: Vec<ExplorerRow>,
@@ -4522,11 +4535,10 @@ pub struct Engine {
     pub(crate) tool_acquire_groups: HashMap<String, lsp_ops::ToolAcquireGroup>,
 
     // --- Extensions sidebar state ---
-    /// quadraui SidebarSystem — owns extensions sidebar (2 sections:
-    /// Installed, Available) selection, scroll, keyboard nav, and mouse
-    /// handling. WholePanel scroll mode. Both TUI and GTK will call
-    /// `render()` and `handle()` once backend migration lands.
-    pub ext_sidebar_system: std::rc::Rc<std::cell::RefCell<quadraui::SidebarSystem>>,
+    /// The extensions panel's quadraui `Sidebar` (Installed, Available) —
+    /// selection, scroll, keyboard nav and mouse handling, in WholePanel
+    /// scroll mode, through `render::SidebarHost`.
+    pub ext_sidebar: std::rc::Rc<std::cell::RefCell<crate::render::SidebarHost>>,
     /// Cached body rect from last render frame — used by handle() in
     /// event dispatch to pass the same rect that render() used.
     pub ext_sidebar_body_rect: std::cell::Cell<quadraui::Rect>,
@@ -4641,10 +4653,10 @@ pub struct Engine {
     /// Scroll offset for the settings panel content.
     pub settings_scroll_top: usize,
     /// Form scroll/scrollbar controller for the settings panel.
-    pub settings_form_controller: std::cell::RefCell<quadraui::FormController>,
+    pub settings_form_controller: std::cell::RefCell<crate::render::FormHost>,
     /// Cached content rect from the last render frame — the same rect
     /// `render_settings_panel` (TUI) / the GTK `PANEL_SETTINGS` arm passed to
-    /// `FormController::render_and_cache`. Hit-testing must reuse this exact
+    /// `FormHost::paint`. Hit-testing must reuse this exact
     /// rect (mirrors `explorer_tree_rect` / `dap_sidebar_body_rect`) rather
     /// than re-deriving it by hand — a hand-derived `y = 2` TUI rect can drift
     /// from the real painted origin when the menu bar (or any other chrome above
@@ -4779,12 +4791,16 @@ pub struct Engine {
     pub ai_leader_toggle_pending: String,
     /// Channel for receiving the AI response from the background thread.
     pub ai_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
-    /// quadraui ChatController — owns the AI sidebar's transcript scroll,
-    /// multi-line input buffer/cursor/history, and scrollbar-drag state.
-    /// Both TUI and GTK call `render()` for painting and `handle()`
-    /// for mouse/keyboard events via the shared `render::route_ai_chat_event`
-    /// wrapper.
-    pub ai_chat: std::rc::Rc<std::cell::RefCell<quadraui::ChatController>>,
+    /// The AI sidebar's quadraui `Chat` descriptor — its transcript,
+    /// transcript scroll, input buffer and caret, focused turn and collapsed
+    /// turns. Painted by `render::paint_ai_chat` and driven by
+    /// `render::route_ai_chat_event`, which applies every `ChatEvent` the
+    /// widget reports back onto it.
+    pub ai_chat: std::rc::Rc<std::cell::RefCell<quadraui::Chat>>,
+    /// The `Chat` widget's own interaction state (input history, the
+    /// text-edit core's per-focus state, scrollbar drag), kept beside the
+    /// descriptor and lent to the widget for every paint and event.
+    pub ai_chat_state: std::rc::Rc<std::cell::RefCell<quadraui::ChatState>>,
     /// Cached rect from last render frame — used by `route_ai_chat_event` so
     /// keyboard/mouse dispatch computes the same layout `render()` painted.
     pub ai_chat_rect: std::cell::Cell<quadraui::Rect>,
@@ -4888,10 +4904,10 @@ pub struct Engine {
     /// The map is seeded when the `PluginManager` is attached, so a view-backed
     /// panel is distinguishable from a tree panel before its first render.
     pub plugin_views: HashMap<String, crate::core::plugin_ui::PluginView>,
-    /// The shared `quadraui::FormController` a plugin view is painted through —
+    /// The shared `quadraui::ScrolledForm` a plugin view is painted through —
     /// the same compose-tier host the Settings panel uses, so neither backend
     /// needs per-backend row geometry for plugin UI.
-    pub plugin_view_form_controller: std::cell::RefCell<quadraui::FormController>,
+    pub plugin_view_form_controller: std::cell::RefCell<crate::render::FormHost>,
     /// The exact rect the last frame painted the plugin view's form into, cached
     /// for the click router (same contract as
     /// [`Engine::settings_form_rect`](Self::settings_form_rect)).
@@ -4912,7 +4928,7 @@ pub struct Engine {
     /// Local interaction state for whichever plugin-view `combo_box` field
     /// currently has keyboard focus — the `combo_box` twin of
     /// `plugin_view_text_edit`, same "one field suffices, only one surface
-    /// holds focus" reasoning. quadraui's `FormController` keeps no shadow
+    /// holds focus" reasoning. quadraui's `ScrolledForm` keeps no shadow
     /// cache of its own for `FieldKind::ComboBox` (unlike `FieldKind::
     /// DatePicker`'s scrub position), so vimcode supplies the embedded
     /// `quadraui::ComboBox`'s `text`/`open`/`highlighted` fresh from here
@@ -4927,7 +4943,7 @@ pub struct Engine {
     /// cached for the click router the same way
     /// `plugin_view_modal_rect`/`plugin_view_*_form_rect` cache their own
     /// paint-time geometry — a live `Backend` (needed to resolve it via
-    /// `FormController::field_rect`) isn't available at click time.
+    /// `ScrolledForm::field_rect`) isn't available at click time.
     ///
     /// Unlike those per-host cells, this one is shared across all four form
     /// hosts (tab, sidebar, dock, modal) because `plugin_view_combo_edit`
@@ -4944,7 +4960,7 @@ pub struct Engine {
         std::cell::RefCell<Option<(String, String, crate::core::plugin_ui::ComboDropdownLayout)>>,
     /// Local interaction state for whichever plugin-view `number_input`
     /// field currently has keyboard focus — the `number_input` twin of
-    /// `plugin_view_combo_edit`, same "quadraui's `FormController` keeps no
+    /// `plugin_view_combo_edit`, same "quadraui's `ScrolledForm` keeps no
     /// shadow cache of its own" reasoning. Created on demand by the first
     /// digit typed into a focused `number_input` field; cleared on blur,
     /// a stepper step/commit (Enter) or cancel (Escape) — see
@@ -4962,11 +4978,11 @@ pub struct Engine {
     /// twin of `ext_panel_scroll_top`, kept separate for the same reason as
     /// `plugin_view_tab_selected`.
     pub plugin_view_tab_scroll_top: usize,
-    /// The `quadraui::FormController` an editor-tab-hosted plugin view is
+    /// The `quadraui::ScrolledForm` an editor-tab-hosted plugin view is
     /// painted through — kept separate from `plugin_view_form_controller`
     /// (the sidebar's) so a simultaneously-visible sidebar view and tab view
     /// don't overwrite each other's cached click-routing geometry.
-    pub plugin_view_tab_form_controller: std::cell::RefCell<quadraui::FormController>,
+    pub plugin_view_tab_form_controller: std::cell::RefCell<crate::render::FormHost>,
     /// The exact rect the last frame painted the editor-tab-hosted plugin
     /// view's form into (tab twin of `plugin_view_form_rect`).
     pub plugin_view_tab_form_rect: std::cell::Cell<quadraui::Rect>,
@@ -4980,7 +4996,7 @@ pub struct Engine {
     /// because `open_plugin_view_tab` runs through the immediate (`live_engine`)
     /// API, which has no `PluginCallContext` to queue into.
     pub(crate) plugin_view_tab_pending_refresh: Vec<String>,
-    /// The shared `quadraui::TreeController` a `ViewBody::Tree`-kind plugin
+    /// The shared `quadraui::TreeView` a `ViewBody::Tree`-kind plugin
     /// view is painted through in the sidebar — the `Tree` twin of
     /// `plugin_view_form_controller`. Selection is a `TreePath` (an index
     /// chain into the plugin-declared `ViewTreeNode` hierarchy), resolved
@@ -4996,11 +5012,11 @@ pub struct Engine {
     /// active, so a per-view id would have to change out from under a
     /// live, possibly-retained widget identity every time the active view
     /// switched.
-    pub plugin_view_tree_controller: std::rc::Rc<std::cell::RefCell<quadraui::TreeController>>,
+    pub plugin_view_tree_controller: std::rc::Rc<std::cell::RefCell<crate::render::TreeHost>>,
     /// Tab twin of `plugin_view_tree_controller`, kept separate for the same
     /// reason `plugin_view_tab_form_controller` is kept separate from
     /// `plugin_view_form_controller`.
-    pub plugin_view_tab_tree_controller: std::rc::Rc<std::cell::RefCell<quadraui::TreeController>>,
+    pub plugin_view_tab_tree_controller: std::rc::Rc<std::cell::RefCell<crate::render::TreeHost>>,
     /// The list-local `ListViewLayout` the `ListView` widget resolved in the
     /// last frame that painted a `ViewBody::List`-kind plugin view in the sidebar, alongside
     /// the rect it was resolved against — same "paint caches, click reads"
@@ -5045,18 +5061,18 @@ pub struct Engine {
     #[allow(clippy::type_complexity)]
     pub plugin_view_tab_table_layout:
         std::cell::RefCell<Option<(quadraui::Rect, quadraui::DataTableLayout)>>,
-    /// The `ChartLayout` returned by `Backend::draw_chart` for the last
+    /// The `ChartLayout` returned by `DrawsPrimitives::draw_primitive` for the last
     /// frame that painted a `ViewBody::Chart`-kind plugin view in the
     /// sidebar. Unlike `plugin_view_table_layout`, no rect is carried
     /// alongside it: `ChartLayout` is already in the ABSOLUTE frame (see
-    /// `Backend::draw_chart`'s doc), so there's nothing to shift click
+    /// `DrawsPrimitives::draw_primitive`'s doc), so there's nothing to shift click
     /// coordinates by. `Chart` has no scroll or persistent selection state
     /// of its own (unlike `List`/`Table`), so this is the only piece of
     /// plugin-view-chart state `Engine` needs to carry.
     pub plugin_view_chart_layout: std::cell::RefCell<Option<quadraui::ChartLayout>>,
     /// Tab twin of `plugin_view_chart_layout`.
     pub plugin_view_tab_chart_layout: std::cell::RefCell<Option<quadraui::ChartLayout>>,
-    /// The chrome line height `Backend::draw_message_list` actually
+    /// The chrome line height `DrawsPrimitives::draw_primitive` actually
     /// painted a `ViewBody::MessageList`-kind sidebar view's rows at, for
     /// `route_plugin_view_message_list_click`'s `MessageList::hit_test`
     /// call. Unlike `ListView`/`DataTable`/`Chart`, `MessageList` has no
@@ -5143,11 +5159,11 @@ pub struct Engine {
     /// Scroll offset for a dock-hosted plugin view — the dock twin of
     /// `plugin_view_tab_scroll_top`.
     pub plugin_view_dock_scroll_top: usize,
-    /// The `quadraui::FormController` a dock-hosted plugin view is painted
+    /// The `quadraui::ScrolledForm` a dock-hosted plugin view is painted
     /// through — the dock twin of `plugin_view_tab_form_controller`, kept
     /// separate so a simultaneously-visible tab/sidebar view and the dock
     /// view don't overwrite each other's cached click-routing geometry.
-    pub plugin_view_dock_form_controller: std::cell::RefCell<quadraui::FormController>,
+    pub plugin_view_dock_form_controller: std::cell::RefCell<crate::render::FormHost>,
     /// The exact rect the last frame painted the dock-hosted plugin view's
     /// form into (dock twin of `plugin_view_tab_form_rect`).
     pub plugin_view_dock_form_rect: std::cell::Cell<quadraui::Rect>,
@@ -5186,10 +5202,10 @@ pub struct Engine {
     pub plugin_view_modal_selected: usize,
     /// Scroll offset for the modal-hosted plugin view.
     pub plugin_view_modal_scroll_top: usize,
-    /// The `quadraui::FormController` the modal-hosted plugin view is
+    /// The `quadraui::ScrolledForm` the modal-hosted plugin view is
     /// painted through, kept separate from the tab/dock/sidebar controllers
     /// so a view painted beneath the modal can't clobber its click geometry.
-    pub plugin_view_modal_form_controller: std::cell::RefCell<quadraui::FormController>,
+    pub plugin_view_modal_form_controller: std::cell::RefCell<crate::render::FormHost>,
     /// The exact rect the last frame painted the modal-hosted view's body
     /// into — the click router hit-tests against this.
     pub plugin_view_modal_form_rect: std::cell::Cell<quadraui::Rect>,
@@ -5216,7 +5232,7 @@ pub struct Engine {
     /// `Engine::close_plugin_view_float` and by `Engine::close_plugin_view`
     /// when its `name` argument matches.
     pub(crate) plugin_views_float: HashMap<String, crate::core::plugin_ui::PluginViewFloatSpec>,
-    /// The `quadraui::FormController` a `location = "float"` view's
+    /// The `quadraui::ScrolledForm` a `location = "float"` view's
     /// field-stack `Form` default is painted through — the float twin of
     /// `plugin_view_modal_form_controller`. Any number of floats may be
     /// open at once (`Self::plugin_views_float`'s doc), but they paint
@@ -5227,7 +5243,7 @@ pub struct Engine {
     /// never holds keyboard focus today (`PluginViewHost::Float`'s doc), so
     /// nothing reads this controller's cached click-routing geometry back —
     /// only its paint output is observed.
-    pub plugin_view_float_form_controller: std::cell::RefCell<quadraui::FormController>,
+    pub plugin_view_float_form_controller: std::cell::RefCell<crate::render::FormHost>,
     /// Per-panel section expanded state.
     pub ext_panel_sections_expanded: HashMap<String, Vec<bool>>,
     /// Per-panel tree item expand state: (panel_name, item_id) → expanded.
@@ -5260,12 +5276,12 @@ pub struct Engine {
     /// to attribute commands/keymaps/panels/views back to the extension
     /// that declared them.
     pub ext_plugin_names: HashMap<String, Vec<String>>,
-    /// The `AppShellLayout::sidebar_content_bounds` rect `render_ext_panel` was
+    /// The `ShellLayout::sidebar_content_bounds` rect `render_ext_panel` was
     /// last painted into — i.e. its own `area` parameter, verbatim, *before*
     /// subtracting the panel's own header/search chrome. Originally read by click
     /// routing to avoid re-deriving the sidebar content's top row from the
     /// menu-bar row count by hand — that hand-rolled arithmetic never budgeted
-    /// for `AppShellLayout`'s own one-row sidebar header *above*
+    /// for `ShellLayout`'s own one-row sidebar header *above*
     /// `sidebar_content_bounds`, landing every click one row low. Click and
     /// hover routing moved onto `ext_panel_tree_layout` below (a real
     /// multi-section panel has no single row height for this field's rect to
@@ -5274,7 +5290,7 @@ pub struct Engine {
     /// machinery. Mirrors `explorer_tree_rect` / `dap_sidebar_body_rect`'s
     /// "cache what was actually painted" pattern.
     pub ext_panel_content_rect: std::cell::Cell<quadraui::Rect>,
-    /// The `Backend::tree_layout` result for the plugin panel's tree body,
+    /// The `DrawsPrimitives::layout_primitive` result for the plugin panel's tree body,
     /// paired with the body rect (chrome excluded) it was computed
     /// against — cached by whichever paint arm ran this frame
     /// (`tui_main::panels::render_ext_panel` or `App::
@@ -5287,8 +5303,8 @@ pub struct Engine {
     /// `line_height * 1.4` (`quadraui::TreeStyle::row_height`'s own doc).
     /// Every real plugin panel has more than one section, so it has no
     /// single row height a linear formula could hit-test against on those
-    /// backends — only `Backend::tree_layout`'s own per-row bounds (the
-    /// same ones `Backend::draw_tree` painted with) resolve correctly.
+    /// backends — only `DrawsPrimitives::layout_primitive`'s own per-row bounds (the
+    /// same ones `DrawsPrimitives::draw_primitive` painted with) resolve correctly.
     /// `None` when nothing is currently painted (no live registration, or
     /// the panel's body has zero height this frame).
     pub ext_panel_tree_layout:
@@ -5408,8 +5424,8 @@ pub struct Engine {
     /// a temporary editable row is inserted in the tree under `parent_dir`.
     pub explorer_new_entry: Option<ExplorerNewEntryState>,
 
-    // --- AppShell (activity bar + sidebar state) ---
-    pub app_shell: quadraui::AppShell,
+    // --- ShellView (activity bar + sidebar state) ---
+    pub app_shell: quadraui::ShellView,
 
     // --- File watching (external modification detection) ---
     /// Cross-platform file watcher (notify crate). Watches open buffer files for changes.
@@ -5432,7 +5448,7 @@ pub struct Engine {
     /// Busy-spinner animation frame, advanced by `poll_idle` once
     /// per tick while any `acp_sessions` entry is `ai_streaming` — the app-
     /// owned counter `quadraui::Spinner`'s own doc says a host must drive
-    /// (`ChatController::set_spinner_frame`, painted by
+    /// (`Chat::set_spinner_frame`, painted by
     /// `render::populate_ai_chat_controller`). Left unchanged while idle,
     /// same "app decides when frames advance, primitive has no timer of its
     /// own" contract every other quadraui `Spinner` adopter follows.
@@ -5521,7 +5537,7 @@ impl Engine {
             next_group_id: 1,
             next_window_id: 2,
             next_tab_id: 2,
-            preview_tab: WorkspaceController::new("vimcode:preview"),
+            preview_tab: Workspace::new("vimcode:preview"),
             preview_buffer_id: None,
             mode: Mode::Normal,
             command_buffer: String::new(),
@@ -5673,13 +5689,16 @@ impl Engine {
             base_settings: None,
             explorer_has_focus: false,
             search_has_focus: false,
-            search_sidebar_system: {
-                let mut s = quadraui::SidebarSystem::new(vec![
-                    quadraui::SidebarSectionDef::form("chrome", "SEARCH"),
-                    quadraui::SidebarSectionDef::new("results", "RESULTS"),
-                ]);
-                s.set_navigation_mode(quadraui::NavigationMode::Selection);
-                s.set_allow_collapse(false);
+            search_sidebar: {
+                let mut s = crate::render::SidebarHost::new(
+                    "search-sidebar",
+                    &[
+                        quadraui::SidebarSectionDef::form("chrome", "SEARCH"),
+                        quadraui::SidebarSectionDef::new("results", "RESULTS"),
+                    ],
+                );
+                s.sidebar.navigation_mode = quadraui::NavigationMode::Selection;
+                s.sidebar.allow_collapse = false;
                 std::rc::Rc::new(std::cell::RefCell::new(s))
             },
             search_sidebar_body_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
@@ -5688,20 +5707,23 @@ impl Engine {
             sc_selected: 0,
             sc_sections_expanded: [true; SC_SECTION_COUNT],
             sc_has_focus: false,
-            sc_sidebar_system: {
+            sc_sidebar: {
                 // Order matters — it is the painted order, and the
                 // `SC_SECTION_*` constants index it. MERGE CHANGES sits
                 // above STAGED CHANGES, matching VS Code.
-                let mut s = quadraui::SidebarSystem::new(vec![
-                    quadraui::SidebarSectionDef::new("merge", "MERGE CHANGES"),
-                    quadraui::SidebarSectionDef::new("staged", "STAGED CHANGES"),
-                    quadraui::SidebarSectionDef::new("changes", "CHANGES"),
-                    quadraui::SidebarSectionDef::new("worktrees", "WORKTREES"),
-                    quadraui::SidebarSectionDef::new("log", "RECENT COMMITS"),
-                ]);
-                s.set_navigation_mode(quadraui::NavigationMode::Selection);
-                s.set_scroll_mode(quadraui::ScrollMode::WholePanel);
-                s.set_allow_collapse(true);
+                let mut s = crate::render::SidebarHost::new(
+                    "sc-sidebar",
+                    &[
+                        quadraui::SidebarSectionDef::new("merge", "MERGE CHANGES"),
+                        quadraui::SidebarSectionDef::new("staged", "STAGED CHANGES"),
+                        quadraui::SidebarSectionDef::new("changes", "CHANGES"),
+                        quadraui::SidebarSectionDef::new("worktrees", "WORKTREES"),
+                        quadraui::SidebarSectionDef::new("log", "RECENT COMMITS"),
+                    ],
+                );
+                s.sidebar.navigation_mode = quadraui::NavigationMode::Selection;
+                s.sidebar.scroll_mode = quadraui::ScrollMode::WholePanel;
+                s.sidebar.allow_collapse = true;
                 std::rc::Rc::new(std::cell::RefCell::new(s))
             },
             sc_sidebar_body_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
@@ -5797,33 +5819,38 @@ impl Engine {
             menu_bar_toggleable: false,
             // A printable key in an open dropdown reaches the editor (the
             // dropdown closes on it) rather than jumping the highlight.
-            menu_system: {
-                let mut menus = quadraui::MenuSystem::new(Vec::new());
-                menus.set_typeahead(false);
+            app_menu: {
+                let mut menus =
+                    quadraui::AppMenu::new(quadraui::WidgetId::new("menu-system-bar"), Vec::new());
+                menus.typeahead = false;
                 std::rc::Rc::new(std::cell::RefCell::new(menus))
             },
+            app_menu_state: std::rc::Rc::new(std::cell::RefCell::new(
+                quadraui::AppMenuState::default(),
+            )),
             menu_bar_rect: std::cell::Cell::new(quadraui::Rect::default()),
             hamburger_stale_click_guard: false,
             global_status_rect: std::cell::Cell::new(quadraui::Rect::default()),
             command_line_rect: std::cell::Cell::new(quadraui::Rect::default()),
             cmd_sel: std::cell::Cell::new(None),
             cmd_dragging: std::cell::Cell::new(false),
-            dap_sidebar_system: {
-                let mut s = quadraui::SidebarSystem::new(vec![
-                    quadraui::SidebarSectionDef::new("vars", "VARIABLES"),
-                    quadraui::SidebarSectionDef::new("watch", "WATCH"),
-                    quadraui::SidebarSectionDef::new("stack", "CALL STACK"),
-                    quadraui::SidebarSectionDef::new("bps", "BREAKPOINTS"),
-                ]);
-                s.set_navigation_mode(quadraui::NavigationMode::Selection);
+            dap_sidebar: {
+                let mut s = crate::render::SidebarHost::new(
+                    "dap-sidebar",
+                    &[
+                        quadraui::SidebarSectionDef::new("vars", "VARIABLES"),
+                        quadraui::SidebarSectionDef::new("watch", "WATCH"),
+                        quadraui::SidebarSectionDef::new("stack", "CALL STACK"),
+                        quadraui::SidebarSectionDef::new("bps", "BREAKPOINTS"),
+                    ],
+                );
+                s.sidebar.navigation_mode = quadraui::NavigationMode::Selection;
                 std::rc::Rc::new(std::cell::RefCell::new(s))
             },
             dap_sidebar_body_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
-            explorer_tree: {
-                let mut tc = quadraui::TreeController::new("explorer-tree");
-                tc.set_vim_keys(true);
-                std::rc::Rc::new(std::cell::RefCell::new(tc))
-            },
+            explorer_tree: std::rc::Rc::new(std::cell::RefCell::new(crate::render::TreeHost::new(
+                "explorer-tree",
+            ))),
             explorer_rows: Vec::new(),
             explorer_expanded: {
                 let mut set = std::collections::HashSet::new();
@@ -5958,14 +5985,17 @@ impl Engine {
             ext_scripts_fetch_rx: Vec::new(),
             tool_acquire_tasks: HashMap::new(),
             tool_acquire_groups: HashMap::new(),
-            ext_sidebar_system: {
-                let mut s = quadraui::SidebarSystem::new(vec![
-                    quadraui::SidebarSectionDef::new("installed", "INSTALLED"),
-                    quadraui::SidebarSectionDef::new("available", "AVAILABLE"),
-                ]);
-                s.set_navigation_mode(quadraui::NavigationMode::Selection);
-                s.set_scroll_mode(quadraui::ScrollMode::WholePanel);
-                s.set_allow_collapse(true);
+            ext_sidebar: {
+                let mut s = crate::render::SidebarHost::new(
+                    "ext-sidebar",
+                    &[
+                        quadraui::SidebarSectionDef::new("installed", "INSTALLED"),
+                        quadraui::SidebarSectionDef::new("available", "AVAILABLE"),
+                    ],
+                );
+                s.sidebar.navigation_mode = quadraui::NavigationMode::Selection;
+                s.sidebar.scroll_mode = quadraui::ScrollMode::WholePanel;
+                s.sidebar.allow_collapse = true;
                 std::rc::Rc::new(std::cell::RefCell::new(s))
             },
             ext_sidebar_body_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
@@ -5994,8 +6024,8 @@ impl Engine {
             settings_has_focus: false,
             settings_selected: 1,
             settings_scroll_top: 0,
-            settings_form_controller: std::cell::RefCell::new(quadraui::FormController::new(
-                "settings".to_string(),
+            settings_form_controller: std::cell::RefCell::new(crate::render::FormHost::new(
+                "settings",
             )),
             settings_form_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
             settings_modal_open: false,
@@ -6030,9 +6060,10 @@ impl Engine {
             ai_has_focus: false,
             ai_leader_toggle_pending: String::new(),
             ai_rx: None,
-            ai_chat: std::rc::Rc::new(std::cell::RefCell::new(quadraui::ChatController::new(
-                "vimcode:ai",
-            ))),
+            ai_chat: std::rc::Rc::new(std::cell::RefCell::new(quadraui::Chat::new("vimcode:ai"))),
+            ai_chat_state: std::rc::Rc::new(
+                std::cell::RefCell::new(quadraui::ChatState::default()),
+            ),
             ai_chat_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
             ai_plan_expanded: false,
             ai_plan_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
@@ -6055,8 +6086,8 @@ impl Engine {
             ext_panel_selected: 0,
             ext_panel_scroll_top: 0,
             plugin_views: HashMap::new(),
-            plugin_view_form_controller: std::cell::RefCell::new(quadraui::FormController::new(
-                "plugin-view".to_string(),
+            plugin_view_form_controller: std::cell::RefCell::new(crate::render::FormHost::new(
+                "plugin-view",
             )),
             plugin_view_form_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
             plugin_view_render_depth: 0,
@@ -6066,18 +6097,18 @@ impl Engine {
             plugin_view_number_edit: None,
             plugin_view_tab_selected: 0,
             plugin_view_tab_scroll_top: 0,
-            plugin_view_tab_form_controller: std::cell::RefCell::new(
-                quadraui::FormController::new("plugin-view-tab".to_string()),
-            ),
+            plugin_view_tab_form_controller: std::cell::RefCell::new(crate::render::FormHost::new(
+                "plugin-view-tab",
+            )),
             plugin_view_tab_form_rect: std::cell::Cell::new(quadraui::Rect::new(
                 0.0, 0.0, 0.0, 0.0,
             )),
             plugin_view_tab_pending_refresh: Vec::new(),
             plugin_view_tree_controller: std::rc::Rc::new(std::cell::RefCell::new(
-                quadraui::TreeController::new("plugin-view-tree"),
+                crate::render::TreeHost::new("plugin-view-tree"),
             )),
             plugin_view_tab_tree_controller: std::rc::Rc::new(std::cell::RefCell::new(
-                quadraui::TreeController::new("plugin-view-tab-tree"),
+                crate::render::TreeHost::new("plugin-view-tab-tree"),
             )),
             plugin_view_list_layout: std::cell::RefCell::new(None),
             plugin_view_tab_list_layout: std::cell::RefCell::new(None),
@@ -6100,7 +6131,7 @@ impl Engine {
             plugin_view_dock_selected: 0,
             plugin_view_dock_scroll_top: 0,
             plugin_view_dock_form_controller: std::cell::RefCell::new(
-                quadraui::FormController::new("plugin-view-dock".to_string()),
+                crate::render::FormHost::new("plugin-view-dock"),
             ),
             plugin_view_dock_form_rect: std::cell::Cell::new(quadraui::Rect::new(
                 0.0, 0.0, 0.0, 0.0,
@@ -6113,7 +6144,7 @@ impl Engine {
             plugin_view_modal_selected: 0,
             plugin_view_modal_scroll_top: 0,
             plugin_view_modal_form_controller: std::cell::RefCell::new(
-                quadraui::FormController::new("plugin-view-modal".to_string()),
+                crate::render::FormHost::new("plugin-view-modal"),
             ),
             plugin_view_modal_form_rect: std::cell::Cell::new(quadraui::Rect::new(
                 0.0, 0.0, 0.0, 0.0,
@@ -6124,7 +6155,7 @@ impl Engine {
             plugin_view_modal_prev_focus: None,
             plugin_views_float: HashMap::new(),
             plugin_view_float_form_controller: std::cell::RefCell::new(
-                quadraui::FormController::new("plugin-view-float".to_string()),
+                crate::render::FormHost::new("plugin-view-float"),
             ),
             ext_panel_sections_expanded: HashMap::new(),
             ext_panel_tree_expanded: HashMap::new(),
@@ -6168,14 +6199,17 @@ impl Engine {
             explorer_new_entry: None,
             // The panel list — order, ids, titles, tooltips — is built from
             // `sidebar::engine_app_shell_panel_definitions` rather than a
-            // hand-transcribed literal, so this shadow `AppShell` (which
+            // hand-transcribed literal, so this shadow `ShellView` (which
             // `App::shell_config` reads through `app_shell.panels()` on every GUI
             // backend) can no longer silently drift out of order with
             // `sidebar::FIXED_ACTIVITY_PANEL_IDS` — the same constant the TUI
             // shell's `build_shell_config` iterates directly. Both sources of
             // truth must stay synchronized.
-            app_shell: quadraui::AppShell::new(sidebar::engine_app_shell_panel_definitions(), 30.0)
-                .with_status_bar_under_main_column(),
+            app_shell: quadraui::ShellView::new(
+                sidebar::engine_app_shell_panel_definitions(),
+                30.0,
+            )
+            .with_status_bar_under_main_column(),
             file_watcher: None,
             file_watcher_rx: None,
             file_watcher_pending: HashSet::new(),
@@ -6183,7 +6217,7 @@ impl Engine {
             idle_last_file_check: std::time::Instant::now(),
             ai_spinner_frame: 0,
         };
-        // A freshly-built `AppShell` (above) defaults `sidebar_visible: true`,
+        // A freshly-built `ShellView` (above) defaults `sidebar_visible: true`,
         // so this only ever needs to *hide* it here — but it's expressed via the
         // same bidirectional `Engine::sync_app_shell_sidebar_visibility` every
         // other caller uses rather than a second copy of the `autohide_panels` /
@@ -6448,7 +6482,7 @@ impl Engine {
     /// - `format_save_quit_ready` — backends must check and trigger exit
     /// - `pending_terminal_command` — needs backend-supplied terminal size
     /// - `ext_panel_focus_pending` — extension panel reveals (needs dynamic
-    ///   AppShell panels)
+    ///   ShellView panels)
     /// - `explorer_needs_refresh` — GTK calls `App::refresh_file_tree`
     /// - SC/explorer periodic auto-refresh — gated on sidebar visibility
     /// - Settings file auto-reload

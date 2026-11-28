@@ -250,7 +250,7 @@ pub fn status_bar_zones_from_layout(layout: &quadraui::StatusBarLayout) -> Statu
 ///
 /// The painted *background fill* under a single window's status bar extends
 /// edge-to-edge under the sidebar/activity bar, but the clickable band/zones
-/// recovered here deliberately stay window-bounded — AppShell's own
+/// recovered here deliberately stay window-bounded — ShellView's own
 /// activity-bar/sidebar hit-test runs *before* `App::handle` ever sees the event,
 /// so a click over that visually-capped region never reaches this router at all.
 pub fn status_bands<'a>(

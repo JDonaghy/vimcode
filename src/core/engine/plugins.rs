@@ -162,7 +162,7 @@ fn spawn_cwd(cwd: &std::path::Path) -> std::borrow::Cow<'_, std::path::Path> {
 /// routing — see `keys.rs`; the dock does not take keyboard focus at all,
 /// mirroring the bottom panel's other non-Terminal content), but any
 /// combination may be *painted* in the same frame, hosting different views,
-/// so each keeps its own selection/scroll index and `FormController` rather
+/// so each keeps its own selection/scroll index and `ScrolledForm` rather
 /// than sharing one — see `Engine::plugin_view_tab_selected`'s doc for why
 /// sharing would be wrong, not just redundant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -807,7 +807,7 @@ impl Engine {
         // visual selection. Handing focus back must not rewrite what the
         // user had typed.
         self.search_has_focus = prev.search;
-        // `sc_set_focus` keeps the engine flag and `sc_sidebar_system` in
+        // `sc_set_focus` keeps the engine flag and `sc_sidebar` in
         // sync; setting the flag alone would leave the panel painting
         // unfocused.
         self.sc_set_focus(prev.source_control);
@@ -1242,7 +1242,7 @@ impl Engine {
     ///
     /// When the focused row is a `Date` field, `Left`/`Right`/`Up`/`Down`/
     /// `PageUp`/`PageDown`/`Enter` are forwarded to the shared
-    /// `quadraui::FormController` as a `KeyPressed` event — the same
+    /// `quadraui::ScrolledForm` as a `KeyPressed` event — the same
     /// controller a mouse click on the field already routes through (see
     /// `render::handle_plugin_view_ui_event`) — because `quadraui::DatePicker`
     /// only exposes keyboard scrub-and-confirm navigation; there is no
@@ -1409,7 +1409,7 @@ impl Engine {
 
         // `combo_box`: forward every key the embedded `quadraui::ComboBox`
         // recognises (typed characters, `Backspace`, `Up`/`Down`, `Enter`,
-        // `Escape`) to the shared `quadraui::FormController`, which drives
+        // `Escape`) to the shared `quadraui::ScrolledForm`, which drives
         // its filtering/highlight/commit/cancel logic directly — see
         // `combo_box_key_from`'s doc for why a key it has no path for at
         // all (`Home`/`End`/`Delete`/`Left`/`Right`/function keys) instead
@@ -1450,7 +1450,7 @@ impl Engine {
         // `number_input`: forward every key the embedded
         // `quadraui::NumberInput` recognises (digits/`-`/`.`, `Backspace`,
         // `Up`/`Down`, `Enter`, `Escape`) to the shared
-        // `quadraui::FormController`, which drives its draft/step/commit/
+        // `quadraui::ScrolledForm`, which drives its draft/step/commit/
         // cancel logic directly — see `number_input_key_from`'s doc for why
         // a key it has no path for at all (letters, `Home`/`End`/`Left`/
         // `Right`/function keys) instead falls through to the generic
@@ -1488,7 +1488,7 @@ impl Engine {
         }
 
         // `radio_group`: forward `Up`/`Left`/`Down`/`Right` to the shared
-        // `quadraui::FormController`, which drives the embedded
+        // `quadraui::ScrolledForm`, which drives the embedded
         // `RadioGroup`'s own cursor movement (wrapping, skipping disabled
         // options) and fires `FormEvent::RadioChanged` immediately — no
         // separate confirm step, so there is nothing for `Enter`/`Space` to
@@ -1693,7 +1693,7 @@ impl Engine {
                     ViewFieldKind::ComboBox { .. } => {
                         // Unreachable: `is_combo_box_field` routes every key
                         // for a focused `combo_box` field to the shared
-                        // `quadraui::FormController` above, including
+                        // `quadraui::ScrolledForm` above, including
                         // `Enter`/`Space` (`Space` is just `Key::Char(' ')`
                         // to the embedded `ComboBox`, appended to the filter
                         // text like any other character).
@@ -1712,7 +1712,7 @@ impl Engine {
                         // Reached only for `Space`, which is not one of the
                         // `DatePicker`'s own navigation keys: Enter is already
                         // intercepted above (see `is_date_field`) and forwarded to
-                        // the `FormController` to confirm the scrubbed day.
+                        // the `ScrolledForm` to confirm the scrubbed day.
                         return true;
                     }
                     ViewFieldKind::Slider {
@@ -1721,7 +1721,7 @@ impl Engine {
                         max,
                         step,
                     } => {
-                        // `quadraui::FormController` has no native keyboard path
+                        // `quadraui::ScrolledForm` has no native keyboard path
                         // for a slider (unlike `Date`'s scrub-and-confirm), so
                         // Enter/Space steps and reaches the plugin directly —
                         // there is no separate confirm step.
@@ -1744,7 +1744,7 @@ impl Engine {
                         // (it is not an ASCII digit/`-`/`.`): every other
                         // key is intercepted above (see
                         // `is_number_input_field`) and forwarded to the
-                        // `FormController`, including `Enter`/`Up`/`Down`.
+                        // `ScrolledForm`, including `Enter`/`Up`/`Down`.
                         return true;
                     }
                     ViewFieldKind::RadioGroup { .. } => {

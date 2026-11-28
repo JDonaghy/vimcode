@@ -246,23 +246,16 @@ fn ext_sidebar_setup(e: &mut vimcode_core::Engine, section: usize, idx: usize) {
     e.ext_sidebar_has_focus = true;
     e.ext_sidebar_body_rect
         .set(quadraui::Rect::new(0.0, 0.0, 200.0, 400.0));
-    e.ext_sidebar_system.borrow_mut().set_backend_info(
-        16.0,
-        quadraui::MsvLayoutMetrics {
-            header_size: 16.0,
-            divider_size: 1.0,
-            scrollbar_size: 8.0,
-            cell_quantum: 0.0,
-        },
-    );
+    e.ext_sidebar
+        .borrow_mut()
+        .record_metrics(&quadraui::tui::TuiBackend::new());
     e.populate_ext_sidebar_system();
-    e.ext_sidebar_system.borrow_mut().set_has_focus(true);
-    e.ext_sidebar_system
-        .borrow_mut()
-        .set_active_section(Some(section));
-    e.ext_sidebar_system
-        .borrow_mut()
-        .set_selected_path(section, Some(vec![idx as u16]));
+    let mut host = e.ext_sidebar.borrow_mut();
+    host.sidebar.has_focus = true;
+    host.sidebar.active_section = Some(section);
+    if let Some(tree) = host.sidebar.tree_mut(section) {
+        tree.selected_path = Some(vec![idx as u16]);
+    }
 }
 
 // ── :ExtList ──────────────────────────────────────────────────────────────────
@@ -1116,9 +1109,9 @@ fn ext_sidebar_tab_toggles_installed_section() {
     e.extension_state.mark_installed("csharp");
     ext_sidebar_setup(&mut e, 0, 0);
     e.dispatch_ext_sidebar_key_unified("Tab", None);
-    let sidebar = e.ext_sidebar_system.borrow();
+    let host = e.ext_sidebar.borrow();
     assert_eq!(
-        sidebar.active_section(),
+        host.sidebar.active_section,
         Some(1),
         "Tab should cycle from installed (0) to available (1)"
     );
@@ -1129,9 +1122,9 @@ fn ext_sidebar_tab_toggles_available_section_when_no_installed() {
     let mut e = engine_with_registry("");
     ext_sidebar_setup(&mut e, 1, 0);
     e.dispatch_ext_sidebar_key_unified("Tab", None);
-    let sidebar = e.ext_sidebar_system.borrow();
+    let host = e.ext_sidebar.borrow();
     assert_eq!(
-        sidebar.active_section(),
+        host.sidebar.active_section,
         Some(0),
         "Tab should cycle from available (1) back to installed (0)"
     );
@@ -1621,7 +1614,7 @@ fn ext_install_via_return_resets_selection_to_installed_item() {
 fn ext_delete_last_installed_expands_available_if_collapsed() {
     let mut e = engine_with_registry("");
     e.extension_state.mark_installed("bash");
-    e.ext_sidebar_system.borrow_mut().set_collapsed(1, true);
+    e.ext_sidebar.borrow_mut().sidebar.sections[1].collapsed = true;
     ext_sidebar_setup(&mut e, 0, 0);
 
     let installed_before = e.ext_installed_items();
@@ -1642,9 +1635,9 @@ fn ext_delete_last_installed_expands_available_if_collapsed() {
         "bash should be removed"
     );
 
-    // The available section should now be expanded in the SidebarSystem
+    // The available section should now be expanded in the Sidebar
     assert!(
-        !e.ext_sidebar_system.borrow().is_collapsed(1),
+        !e.ext_sidebar.borrow().sidebar.sections[1].collapsed,
         "available section should be expanded after deleting last installed item"
     );
 

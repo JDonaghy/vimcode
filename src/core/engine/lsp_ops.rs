@@ -1320,7 +1320,7 @@ impl Engine {
 
         // Ensure the available section is visible after removal so the
         // user can see where the extension moved.
-        self.ext_sidebar_system.borrow_mut().set_collapsed(1, false);
+        self.ext_sidebar.borrow_mut().sidebar.sections[1].collapsed = false;
     }
 
     /// Remove LSP/DAP tool binaries installed by an extension.

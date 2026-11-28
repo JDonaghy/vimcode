@@ -184,7 +184,7 @@ impl App {
     /// Request a native folder dialog. On backends with `native_dialogs`
     /// this opens the OS file picker (NSOpenPanel / GtkFileChooser /
     /// IFileOpenDialog); on TUI it falls back to the in-app
-    /// `FolderPickerController`. Deferred to `tick()` where `backend` is
+    /// `FolderPicker`. Deferred to `tick()` where `backend` is
     /// available — see `PendingFileDialog`.
     pub(crate) fn open_folder_dialog_native(&mut self) {
         self.pending_file_dialog
@@ -195,7 +195,7 @@ impl App {
     /// Show the in-app folder/workspace picker modal (fallback for TUI).
     pub(crate) fn open_folder_dialog(&mut self) {
         let engine = self.engine.borrow();
-        let controller = quadraui::FolderPickerController::rooted_at(
+        let controller = quadraui::FolderPicker::rooted_at(
             engine.cwd.clone(),
             vec![".vimcode-workspace".to_string()],
         )
@@ -207,9 +207,10 @@ impl App {
 
     /// Drive an open folder picker with one raw `UiEvent` and apply the
     /// result. The decision (key→intent, filesystem walk, filtering,
-    /// scroll) is entirely `quadraui::FolderPickerController`'s own;
-    /// this only applies the `Confirmed`/`Cancelled` outcomes to GTK-local
-    /// state and the engine. Mirrors TUI's identical
+    /// scroll) is entirely `quadraui::FolderPicker`'s own: a browsing
+    /// change goes back to the picker through `FolderPicker::apply`, and
+    /// the `Confirmed`/`Cancelled` outcomes are applied to app-local state
+    /// and the engine. Mirrors TUI's identical
     /// `apply_folder_picker_event` (`shell_app.rs`) — same controller, same
     /// outcome handling; the popup rect comes from the painted-rect cache
     /// (`folder_picker_popup_rect`) here instead of a fresh
@@ -225,7 +226,11 @@ impl App {
             let Some(picker) = picker_ref.as_mut() else {
                 return;
             };
-            picker.handle_event(event, visible_rows)
+            let outcome = picker.handle_event(event, visible_rows);
+            if let quadraui::Handled::Event(action) = &outcome {
+                picker.apply(action, visible_rows);
+            }
+            outcome
         };
         match outcome {
             quadraui::Handled::Event(quadraui::PathPickerAction::Confirmed { path }) => {
@@ -245,7 +250,7 @@ impl App {
     /// Resolve a mouse press at `(x, y)` against the open folder picker's
     /// painted popup and apply the result. Mirrors TUI's identical block in
     /// `mouse::handle_mouse` — same shared `render::route_folder_picker_click`
-    /// / `render::set_folder_picker_selected`, same "select row" / "consume"
+    /// / `FolderPicker`'s own row selection, same "select row" / "consume"
     /// / "dismiss" outcomes.
     pub(crate) fn route_and_apply_folder_picker_click(&mut self, x: f64, y: f64) {
         let Some(rect) = self.folder_picker_popup_rect.get() else {
@@ -262,7 +267,7 @@ impl App {
             .folder_picker
             .borrow()
             .as_ref()
-            .map(|p| (p.scroll_top(), p.filtered().len()))
+            .map(|p| (p.paths.scroll_top, p.paths.filtered.len()))
         else {
             return;
         };
@@ -277,9 +282,11 @@ impl App {
         match route {
             render::FolderPickerClickRoute::SelectRow(idx) => {
                 if let Some(picker) = self.folder_picker.borrow_mut().as_mut() {
-                    render::set_folder_picker_selected(picker, idx);
                     let visible_rows = render::folder_picker_visible_rows(rect, lh);
-                    picker.sync_scroll(visible_rows);
+                    picker.apply(
+                        &quadraui::PathPickerAction::SelectionChanged { idx },
+                        visible_rows,
+                    );
                 }
             }
             render::FolderPickerClickRoute::Consume => {}

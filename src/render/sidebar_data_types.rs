@@ -41,12 +41,12 @@ use super::*;
 //     TUI paints its tab-drag ghost in the editor band and has neither an app
 //     icon nor in-canvas window controls. The app icon and window controls are
 //     painted from the [`FrameOp::MenuDropdown`] arm, because
-//     `MenuSystem::render` repaints the whole title-bar band and would erase
+//     `AppMenu::render` repaints the whole title-bar band and would erase
 //     anything laid down before it.
 //
 // **Why here and not in quadraui** (`CLAUDE.md`'s "check quadraui first"):
-// quadraui already owns the *shell* composition — `compose::app_shell::AppShell`
-// hands both backends `AppShellLayout` (title-bar / activity-bar / sidebar /
+// quadraui already owns the *shell* composition — `compose::app_shell::ShellView`
+// hands both backends `ShellLayout` (title-bar / activity-bar / sidebar /
 // bottom-panel / main-content bounds), and vimcode consumes it verbatim. The
 // overlay tail is a different thing: it is vimcode's own set of app-level
 // surfaces, and quadraui's nearest neighbour — `ModalStack` — explicitly
@@ -253,7 +253,7 @@ pub struct BranchPickerData {
 
 // The live path is `Engine::populate_ext_sidebar_system`
 // (`core/engine/ext_panel.rs`), which paints straight into
-// `engine.ext_sidebar_system` (`quadraui::SidebarSystem`).
+// `engine.ext_sidebar` (`quadraui::Sidebar`).
 
 // ─── BoardData ─────────────────────────────────────────────────────────────────
 

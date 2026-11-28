@@ -442,7 +442,7 @@ impl Engine {
         }
 
         // Debug sidebar intercepts all keys when it has focus
-        // (TUI and GTK route through SidebarSystem directly),
+        // (TUI and GTK route through Sidebar directly),
         // EXCEPT debug F-keys which must always reach the engine.
         if self.dap_sidebar_has_focus {
             if !ctrl && matches!(key_name, "F5" | "F9" | "F10" | "F11") {
@@ -10888,7 +10888,7 @@ impl Engine {
 
         if self.ai_has_focus {
             let filtered: String = first_line.chars().filter(|c| !c.is_control()).collect();
-            self.ai_chat.borrow_mut().input_insert_str(&filtered);
+            crate::core::engine::ai_chat_insert_str(&mut self.ai_chat.borrow_mut(), &filtered);
             return;
         }
 

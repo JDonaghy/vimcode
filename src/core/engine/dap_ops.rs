@@ -451,9 +451,9 @@ impl Engine {
         self.dap_deferred_lang = None;
         self.dap_sidebar_scroll = [0; 4];
         {
-            let mut sidebar = self.dap_sidebar_system.borrow_mut();
+            let mut host = self.dap_sidebar.borrow_mut();
             for i in 0..4 {
-                sidebar.set_rows(i, Vec::new());
+                host.sidebar.set_rows(i, Vec::new());
             }
         }
         self.message = "DAP: session stopped".to_string();
@@ -656,7 +656,7 @@ impl Engine {
         None
     }
 
-    /// Dispatch a row activation from `SidebarSystem` (Enter or click).
+    /// Dispatch a row activation from `Sidebar` (Enter or click).
     /// Maps the flat row index back to the engine action (expand variable,
     /// navigate stack frame, jump to breakpoint).
     pub fn dispatch_dap_sidebar_row_activated(&mut self, section: usize, path: &[u16]) {
@@ -706,19 +706,22 @@ impl Engine {
         }
     }
 
-    /// Dispatch a delete action (x/d) from SidebarSystem. Reads the
+    /// Dispatch a delete action (x/d) from Sidebar. Reads the
     /// currently selected row from the sidebar system and deletes the
     /// watch expression or breakpoint at that index.
     pub fn dispatch_dap_sidebar_delete(&mut self) {
         let section = self
-            .dap_sidebar_system
+            .dap_sidebar
             .borrow()
-            .active_section()
+            .sidebar
+            .active_section
             .unwrap_or(0);
         let flat_idx = self
-            .dap_sidebar_system
+            .dap_sidebar
             .borrow()
-            .selected_path(section)
+            .sidebar
+            .tree(section)
+            .and_then(|t| t.selected_path.as_ref())
             .and_then(|p| p.first().copied())
             .unwrap_or(u16::MAX) as usize;
         if flat_idx == u16::MAX as usize {
@@ -744,29 +747,38 @@ impl Engine {
         }
     }
 
-    /// Process a `SidebarEvent` from the `SidebarSystem` and take the
+    /// Process a `SidebarAction` from the `Sidebar` and take the
     /// appropriate engine action. Returns `true` if the event was
     /// consumed (caller should redraw), `false` if `Ignored` (caller
     /// should fall through to action-key dispatch).
-    pub fn dispatch_dap_sidebar_event(&mut self, event: quadraui::SidebarEvent) -> bool {
-        match event {
-            quadraui::SidebarEvent::RowActivated { section, ref path }
-            | quadraui::SidebarEvent::RowSelected { section, ref path } => {
-                self.dispatch_dap_sidebar_row_activated(section, path);
-                true
+    pub fn dispatch_dap_sidebar_event(
+        &mut self,
+        handled: quadraui::Handled<Vec<quadraui::SidebarAction>>,
+    ) -> bool {
+        let actions = match handled {
+            quadraui::Handled::Event(actions) => actions,
+            quadraui::Handled::Consumed => return true,
+            quadraui::Handled::Ignored => return false,
+        };
+        for action in actions {
+            match action {
+                quadraui::SidebarAction::RowActivated { section, ref path }
+                | quadraui::SidebarAction::RowSelected { section, ref path } => {
+                    self.dispatch_dap_sidebar_row_activated(section, path);
+                }
+                quadraui::SidebarAction::HeaderActivated { section } => {
+                    let mut host = self.dap_sidebar.borrow_mut();
+                    if let Some(s) = host.sidebar.sections.get_mut(section) {
+                        s.collapsed = !s.collapsed;
+                    }
+                }
+                _ => {}
             }
-            quadraui::SidebarEvent::HeaderActivated { section } => {
-                let mut sys = self.dap_sidebar_system.borrow_mut();
-                let collapsed = sys.is_collapsed(section);
-                sys.set_collapsed(section, !collapsed);
-                true
-            }
-            quadraui::SidebarEvent::Ignored => false,
-            _ => true,
         }
+        true
     }
 
-    /// Handle action keys that `SidebarSystem` didn't consume
+    /// Handle action keys that `Sidebar` didn't consume
     /// (returned `Ignored`). Shared between TUI and GTK backends.
     /// Returns `true` if the sidebar lost focus (q/Esc/h).
     pub fn dispatch_dap_sidebar_action_key(&mut self, key_name: &str) -> bool {

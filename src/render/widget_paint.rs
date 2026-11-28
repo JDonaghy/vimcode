@@ -319,3 +319,126 @@ where
         .expect("drawing into a TestBackend never fails");
     terminal.backend().buffer().clone()
 }
+
+/// Fill `rect` with one solid colour — a quadraui `Canvas` holding a single
+/// `DrawOp::Rect` over its whole area, registered as a `chrome:solid-fill`
+/// zone. An opaque colour covers what is under it; a translucent one blends
+/// over it (on the cell grid, over each cell's background, keeping its
+/// glyph), which is what a modal scrim needs.
+pub(crate) fn fill_solid(backend: &mut dyn Backend, rect: Rect, color: quadraui::Color) {
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
+    }
+    let canvas = quadraui::Canvas {
+        id: WidgetId::new("chrome:solid-fill"),
+        ops: vec![quadraui::DrawOp::Rect {
+            rect: Rect::new(0.0, 0.0, rect.width, rect.height),
+            color,
+        }],
+        regions: Vec::new(),
+        focusable: false,
+    };
+    backend.draw_primitive(rect, &canvas);
+}
+
+/// The layout metrics a widget was last painted with, for routing an event
+/// to it where no backend is in reach (engine-side keyboard dispatch). The
+/// same metrics `DrawsPrimitives::layout_primitive` lays a widget out with,
+/// minus the backend's text measurer.
+#[derive(Debug, Clone)]
+pub(crate) struct PaintedMetrics {
+    line_height: f32,
+    char_width: f32,
+    nerd_fonts_enabled: bool,
+    editor_line_height: f32,
+    chrome_line_height: f32,
+    chrome_text_line_height: f32,
+    scales_text_rows: bool,
+    style: quadraui::Style,
+}
+
+impl PaintedMetrics {
+    pub(crate) fn of(backend: &dyn Backend) -> Self {
+        let style = backend.style();
+        Self {
+            line_height: quadraui::primitive::LayoutCtx::resolve_row_height(
+                backend.chrome_line_height(),
+                &style,
+            ),
+            char_width: backend.char_width(),
+            nerd_fonts_enabled: backend.nerd_fonts_enabled(),
+            editor_line_height: backend.line_height(),
+            chrome_line_height: backend.chrome_line_height(),
+            chrome_text_line_height: backend.measure_text("M", quadraui::FontRole::Chrome).1,
+            scales_text_rows: backend.scales_text_rows(),
+            style,
+        }
+    }
+
+    pub(crate) fn ctx(&self) -> quadraui::primitive::LayoutCtx<'_> {
+        quadraui::primitive::LayoutCtx::new(
+            self.line_height,
+            self.char_width,
+            self.nerd_fonts_enabled,
+        )
+        .with_editor_line_height(self.editor_line_height)
+        .with_chrome_line_height(self.chrome_line_height)
+        .with_chrome_text_line_height(self.chrome_text_line_height)
+        .with_scaled_text_rows(self.scales_text_rows)
+        .with_style(&self.style)
+    }
+}
+
+/// The `EventHost` a widget driven outside the runtime handles an event
+/// against: the widget is the host's whole world, so it holds focus on every
+/// part; capture, cursor and redraw requests have nowhere further to go.
+struct DetachedHost {
+    units: quadraui::primitive::Units,
+    emitted: Vec<quadraui::UiEvent>,
+}
+
+impl quadraui::interactive::EventHost for DetachedHost {
+    fn is_focused(&self, _id: &WidgetId, _sub: Option<SubTarget>) -> bool {
+        true
+    }
+    fn request_focus(&mut self, _id: &WidgetId, _sub: Option<SubTarget>) {}
+    fn capture_pointer(&mut self, _id: &WidgetId) {}
+    fn release_pointer(&mut self) {}
+    fn set_cursor(&mut self, _cursor: quadraui::PointerShape) {}
+    fn request_redraw(&mut self) {}
+    fn emit(&mut self, event: quadraui::UiEvent) {
+        self.emitted.push(event);
+    }
+    fn units(&self) -> quadraui::primitive::Units {
+        self.units
+    }
+}
+
+/// Drive `widget` with one raw event against a `layout` it was laid out
+/// into at `rect` — what `quadraui::drive_ui_event` does, for a layout
+/// resolved from [`PaintedMetrics`] rather than a live backend. Answers the
+/// widget's own result plus every event it emitted, or `None` for an event
+/// no widget handles.
+pub(crate) fn drive_laid_out<W: Interactive>(
+    widget: &W,
+    state: &mut W::State,
+    event: &quadraui::UiEvent,
+    layout: &W::Layout,
+    rect: Rect,
+    units: quadraui::primitive::Units,
+) -> Option<(quadraui::Handled<W::Action>, Vec<quadraui::UiEvent>)> {
+    let subs = Interactive::sub_regions(widget, layout);
+    let routed = quadraui::compose::routed_event(event, rect, &subs)?;
+    let id = quadraui::primitive::Primitive::id(widget)
+        .copied()
+        .unwrap_or_else(|| WidgetId::new("widget"));
+    let mut host = DetachedHost {
+        units,
+        emitted: Vec::new(),
+    };
+    let handled = {
+        let mut cx = quadraui::interactive::EventCx::new(id, &mut host);
+        widget.handle(state, &routed, layout, &mut cx)
+    };
+    Some((handled, host.emitted))
+}

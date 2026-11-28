@@ -2,7 +2,7 @@
 //! backend.
 //!
 //! quadraui already ships the whole Win-GUI backend: `WinBackend` implements
-//! every `Backend` trait method `AppShell` renders through, and
+//! every `Backend` trait method `ShellView` renders through, and
 //! [`quadraui::win::shell_runner::run_with_shell`] composes it with the
 //! shared `ShellAdapter` exactly the way `quadraui::gtk::shell_runner` /
 //! `quadraui::macos::shell_runner` / `quadraui::tui::shell_runner` do.
@@ -211,7 +211,8 @@ mod win_gutter_contract_1691 {
         let backend = super::backend::WinBackend::new();
         let cell_width = backend.char_width() as f64;
         let line_height = backend.line_height() as f64;
-        let scrollbar_reserve = backend.scrollbar_reserve() as f64;
+        // The editor's own scrollbar gutter; Windows reserves no overlay room.
+        let scrollbar_reserve = 0.0;
         assert!(
             cell_width > 0.0 && line_height > 0.0,
             "WinBackend must report real text metrics before any gutter \
@@ -403,7 +404,8 @@ mod win_minimap_scrollbar_1869 {
         let v_scrollbar_w = Some(14.0);
         let char_width = backend.char_width() as f64;
         let line_height = backend.line_height() as f64;
-        let scrollbar_reserve = backend.scrollbar_reserve() as f64;
+        // The editor's own scrollbar gutter; Windows reserves no overlay room.
+        let scrollbar_reserve = 0.0;
         assert!(
             char_width > 0.0 && line_height > 0.0,
             "WinBackend must report real text metrics before any minimap \
@@ -1417,7 +1419,7 @@ mod win_driver_tests {
     //
     // `App::handle` (`src/app/shell.rs`) calls
     // `ctx.shell_mut().set_active_accent(Some(theme.activity_active_accent))`
-    // on every real dispatch, so the runner's `AppShell` carries the
+    // on every real dispatch, so the runner's `ShellView` carries the
     // theme's accent colour once a real `UiEvent` has gone through
     // `handle`. `ShellContext` is reachable only from `ShellApp::handle`/
     // `on_shell_event_ctx` (quadraui 0.2.1), not from `setup`/`pre_render`,

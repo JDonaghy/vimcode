@@ -72,7 +72,7 @@ pub enum FocusKeyRoute {
     ExtPanel,
     /// The search/replace panel — `dispatch_search_sidebar_key_unified`.
     Search,
-    /// The debug (DAP) panel — `SidebarSystem::handle` first, then
+    /// The debug (DAP) panel — `Sidebar::handle` first, then
     /// `dispatch_dap_sidebar_action_key`.
     Debug,
     /// The extensions *marketplace* panel —
@@ -199,7 +199,7 @@ pub enum SidebarChordAction {
 /// focused (`Engine::activity_bar_focused`): the toolbar is the leftmost
 /// stop, so `h`/`Left` is a no-op; `l`/`Right` moves to the panel named by
 /// `Engine::activity_bar_toolbar_idx_for_active_panel`'s inverse —
-/// `AppShell::active_panel_id` — if the sidebar is visible, or to the editor
+/// `ShellView::active_panel_id` — if the sidebar is visible, or to the editor
 /// otherwise.
 pub fn route_sidebar_chord_key(
     engine: &mut Engine,
@@ -463,9 +463,9 @@ pub fn route_terminal_resize(engine: &mut Engine, panel_cols: u16, rows: u16) {
 // chord → pass-through to `Engine::handle_key`. The menu tier is already
 // shared. This rung converges the second tier.
 
-/// Lower bound Alt+Left clamps the sidebar width to, in `AppShell` width units
+/// Lower bound Alt+Left clamps the sidebar width to, in `ShellView` width units
 /// (columns on TUI, line-heights on GTK — see
-/// `quadraui::AppShell::set_sidebar_width`).
+/// `quadraui::ShellView::set_sidebar_width`).
 pub const ALT_SIDEBAR_WIDTH_MIN: u16 = 15;
 /// Upper bound Alt+Right clamps the sidebar width to. See
 /// [`ALT_SIDEBAR_WIDTH_MIN`].
@@ -476,13 +476,13 @@ pub const ALT_SIDEBAR_WIDTH_MAX: u16 = 150;
 ///
 /// The width itself cannot live in the resolver: TUI's authoritative copy is
 /// the pre-#1434 TUI shell's `sidebar_width` (which its end-of-dispatch sync pushes into the
-/// runner's `AppShell`), while GTK's is the runner `AppShell` itself, reached
+/// runner's `ShellView`), while GTK's is the runner `ShellView` itself, reached
 /// through `ShellContext::shell_mut`. The *clamp* is shared so the two cannot
 /// drift apart — which is the only part a user can observe.
 ///
-/// Both backends additionally configure their `AppShell` with these same two
+/// Both backends additionally configure their `ShellView` with these same two
 /// bounds (the pre-#1434 TUI shell's `shell_config`, `gtk::build_shell_config`), so
-/// `AppShell::set_sidebar_width`'s own internal clamp cannot narrow the rung's
+/// `ShellView::set_sidebar_width`'s own internal clamp cannot narrow the rung's
 /// range on one backend and not the other. That was live on GTK before #759:
 /// quadraui's generic default is `8.0..=50.0`, which TUI had already overridden
 /// for exactly this reason and GTK had not.
@@ -492,7 +492,7 @@ pub fn alt_resized_sidebar_width(current: u16, delta: i32) -> u16 {
 }
 
 /// Whether the engine's current mode is safe for an Alt+<mnemonic>
-/// `KeyPressed` to open a *closed* `quadraui::MenuSystem` dropdown.
+/// `KeyPressed` to open a *closed* `quadraui::AppMenu` dropdown.
 ///
 /// Vim mode has no `<M-x>` mapping support at all — nothing in
 /// `src/core/engine` spells a `"<M-"` binding — so the only two things an
@@ -1128,7 +1128,7 @@ mod alt_key_router_tests {
 
         // 3. Neither profile may open *below* the shared Alt rung's floor.
         //    Two independent reasons, both load-bearing:
-        //      * `AppShell::compute_layout` clamps the opening width through
+        //      * `ShellView::compute_layout` clamps the opening width through
         //        `min_sidebar_width` (still `ALT_SIDEBAR_WIDTH_MIN` on every
         //        backend), so a narrower value is silently discarded; and
         //      * the user's first Alt+Right would jump straight to the floor

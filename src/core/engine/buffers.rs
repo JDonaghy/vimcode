@@ -3538,7 +3538,7 @@ impl Engine {
     pub(super) fn sync_preview_buffer_id(&mut self) {
         self.preview_buffer_id = self
             .preview_tab
-            .docs()
+            .docs
             .iter()
             .find(|d| self.preview_tab.is_preview(&d.id))
             .and_then(|d| d.id.parse::<usize>().ok())

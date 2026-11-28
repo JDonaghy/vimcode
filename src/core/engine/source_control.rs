@@ -9,9 +9,9 @@ pub const SC_BUTTON_IDS: [&str; 4] = ["sc:commit", "sc:push", "sc:pull", "sc:syn
 // ─── SC panel section indices ─────────────────────────────────────────────
 //
 // The SC panel's sections are addressed positionally by call sites throughout
-// the codebase. Section indices are absolute into the `SidebarSystem`'s
+// the codebase. Section indices are absolute into the `Sidebar`'s
 // section list — they do not shift when a section is hidden.
-// `SidebarSystem::set_section_visible` keeps indices stable and simply
+// `Sidebar::set_section_visible` keeps indices stable and simply
 // skips invisible sections when rendering and when cycling focus.
 
 /// Merge Changes — unmerged (conflicted) paths. Only visible when the
@@ -1012,7 +1012,7 @@ impl Engine {
     /// MERGE CHANGES appears only when the working tree has a conflict;
     /// WORKTREES only when there are linked worktrees. The returned indices
     /// are the absolute `SC_SECTION_*` values, which do not shift when a
-    /// section is hidden — the same contract `SidebarSystem::set_section_visible`
+    /// section is hidden — the same contract `Sidebar::set_section_visible`
     /// keeps on the rendering side.
     pub fn sc_visible_sections(&self) -> Vec<(usize, usize)> {
         let mut out: Vec<(usize, usize)> = Vec::with_capacity(SC_SECTION_COUNT);
@@ -1118,14 +1118,14 @@ impl Engine {
         (last, usize::MAX) // fallback: past the end → last section's header
     }
 
-    // ─── SidebarSystem integration ───────────────────────────────────
+    // ─── Sidebar integration ───────────────────────────────────
 
     /// Set SC panel keyboard focus on both the engine flag and the
-    /// SidebarSystem. Backends should call this instead of setting
+    /// Sidebar. Backends should call this instead of setting
     /// `sc_has_focus` directly to keep the two in sync.
     pub fn sc_set_focus(&mut self, focused: bool) {
         self.sc_has_focus = focused;
-        self.sc_sidebar_system.borrow_mut().set_has_focus(focused);
+        self.sc_sidebar.borrow_mut().sidebar.has_focus = focused;
         if !focused {
             self.sc_button_focused = None;
         }
@@ -1172,23 +1172,25 @@ impl Engine {
     }
 
     /// Read the active section index and selected item index from the
-    /// SidebarSystem. Returns `(section, item_idx)` where section is one of
+    /// Sidebar. Returns `(section, item_idx)` where section is one of
     /// the `SC_SECTION_*` constants (0=merge, 1=staged, 2=changes,
     /// 3=worktrees, 4=log). Returns `(SC_SECTION_STAGED, usize::MAX)` if
     /// nothing is selected — Merge Changes is never the implicit default,
     /// since its actions resolve conflicts.
     pub fn sc_selected_from_sidebar_system(&self) -> (usize, usize) {
-        let sidebar = self.sc_sidebar_system.borrow();
-        let section = sidebar.active_section().unwrap_or(SC_SECTION_STAGED);
-        let idx = sidebar
-            .selected_path(section)
+        let host = self.sc_sidebar.borrow();
+        let section = host.sidebar.active_section.unwrap_or(SC_SECTION_STAGED);
+        let idx = host
+            .sidebar
+            .tree(section)
+            .and_then(|t| t.selected_path.as_ref())
             .and_then(|p| p.first().copied())
             .map(|v| v as usize)
             .unwrap_or(usize::MAX);
         (section, idx)
     }
 
-    /// Feed a navigation key through the SidebarSystem (using the layout
+    /// Feed a navigation key through the Sidebar (using the layout
     /// cached during the previous render frame) and dispatch the result.
     fn sc_sidebar_navigate(&mut self, key: quadraui::Key) {
         let rect = self.sc_sidebar_body_rect.get();
@@ -1197,33 +1199,30 @@ impl Engine {
             modifiers: quadraui::Modifiers::default(),
             repeat: false,
         };
-        let sidebar_event = self.sc_sidebar_system.borrow_mut().handle_cached(&ev, rect);
-        self.dispatch_sc_sidebar_event(sidebar_event);
+        let handled = self.sc_sidebar.borrow_mut().handle_cached(&ev, rect);
+        self.dispatch_sc_sidebar_event(handled);
     }
 
-    /// Handle a SidebarEvent produced by the SidebarSystem after a
+    /// Handle a SidebarAction produced by the Sidebar after a
     /// navigation key or mouse click.
-    pub fn dispatch_sc_sidebar_event(&mut self, event: quadraui::SidebarEvent) -> bool {
-        match event {
-            quadraui::SidebarEvent::RowActivated { section, .. } => {
+    pub fn dispatch_sc_sidebar_event(
+        &mut self,
+        handled: quadraui::Handled<Vec<quadraui::SidebarAction>>,
+    ) -> bool {
+        let actions = match handled {
+            quadraui::Handled::Event(actions) => actions,
+            quadraui::Handled::Consumed => return true,
+            quadraui::Handled::Ignored => return false,
+        };
+        for action in actions {
+            // A header click's collapse is a `CollapseChanged` the host has
+            // already applied, so `HeaderActivated` and every other
+            // write-back need nothing more here.
+            if let quadraui::SidebarAction::RowActivated { section, .. } = action {
                 self.sc_activate_row(section);
-                true
             }
-            quadraui::SidebarEvent::RowSelected { .. } => true,
-            // `SidebarSystem::click` already flips `collapsed[section]`
-            // itself before returning this event (when `allow_collapse` is
-            // set, which `Engine::new`'s `sc_sidebar_system` does) —
-            // `HeaderActivated` is a *notification*, not an instruction to
-            // toggle again. Re-toggling here canceled the click's own
-            // toggle out on every press, so a header click looked like it
-            // took focus (the active-section chevron moved) but never
-            // actually collapsed/expanded anything — caught by
-            // `src/macos/mod.rs`'s `sc_panel_header_click_hit_band_matches_the_painted_row`
-            // sanity check, added alongside this fix.
-            quadraui::SidebarEvent::HeaderActivated { .. } => true,
-            quadraui::SidebarEvent::Ignored => false,
-            _ => true,
         }
+        true
     }
 
     /// Activate the selected row in the given section (equivalent to
@@ -1394,7 +1393,7 @@ impl Engine {
             return ScKeyResult::Consumed;
         }
 
-        // Navigation keys → feed through SidebarSystem.
+        // Navigation keys → feed through Sidebar.
         let nav_key = match key {
             "j" | "Down" => Some(Key::Named(NamedKey::Down)),
             "k" | "Up" => Some(Key::Named(NamedKey::Up)),
@@ -1436,15 +1435,12 @@ impl Engine {
     }
 
     /// Handle a mouse/scroll UiEvent by feeding it through the
-    /// SidebarSystem (using the layout cached during the previous
+    /// Sidebar (using the layout cached during the previous
     /// render frame) and dispatching the result.
     pub fn handle_sc_sidebar_ui_event(&mut self, event: quadraui::UiEvent) -> bool {
         let rect = self.sc_sidebar_body_rect.get();
-        let sidebar_event = self
-            .sc_sidebar_system
-            .borrow_mut()
-            .handle_cached(&event, rect);
-        self.dispatch_sc_sidebar_event(sidebar_event)
+        let handled = self.sc_sidebar.borrow_mut().handle_cached(&event, rect);
+        self.dispatch_sc_sidebar_event(handled)
     }
 }
 

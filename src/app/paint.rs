@@ -228,7 +228,7 @@ impl App {
     ///
     /// Divider hit-testing must run against the geometry the renderer used, not
     /// a parallel re-derivation: `render_content` anchors `editor_bounds` at
-    /// `AppShellLayout::main_content_bounds` (offset right by the activity
+    /// `ShellLayout::main_content_bounds` (offset right by the activity
     /// bar/sidebar, down by the title-bar band), so any handler that rebuilt
     /// bounds at `(0.0, 0.0)` hit-tested a phantom divider displaced by that offset.
     ///
@@ -361,7 +361,7 @@ impl App {
             // paints a `Form`, not buffer text — the same shared
             // `quadraui::Form` primitive + adapter
             // (`render::plugin_view_to_form`) the sidebar body already paints
-            // through, just routed through its own `FormController`/rect pair
+            // through, just routed through its own `ScrolledForm`/rect pair
             // (`Engine::plugin_view_tab_form_controller`/`_tab_form_rect`) so
             // a simultaneously-visible sidebar view can't clobber this one's
             // cached click geometry. `window_editors` still gets `editor`
@@ -403,7 +403,7 @@ impl App {
                             engine
                                 .plugin_view_tab_tree_controller
                                 .borrow()
-                                .render(backend, rect);
+                                .paint(backend, rect);
                         }
                     }
                     Some("table") => {
@@ -456,7 +456,7 @@ impl App {
                             engine
                                 .plugin_view_tab_form_controller
                                 .borrow_mut()
-                                .render_and_cache(backend, rect);
+                                .paint(backend, rect);
                             render::paint_plugin_view_combo_box_dropdown(
                                 &engine,
                                 view_name,
@@ -510,11 +510,11 @@ impl App {
             // terminal width *before* the real (window-bounded) bar below —
             // VS Code's status bar runs under the activity bar and sidebar
             // too, not just the editor pane (see the issue's side-by-side
-            // pixel sampling). `AppShell::render` paints the sidebar/
+            // pixel sampling). `ShellView::render` paints the sidebar/
             // activity bar *before* `render_content` ever runs (see
             // `shell_adapter::render`), so this backdrop, painted here,
             // after, simply draws over their bottom edge, capping them —
-            // with no `AppShellLayout`/sidebar-height change needed. See
+            // with no `ShellLayout`/sidebar-height change needed. See
             // `render::paint_status_backdrop`'s doc for why this is a
             // separate, content-free paint rather than widening `sb_rect`
             // itself. With two or more windows there is no single
@@ -575,8 +575,6 @@ impl App {
     /// bar is recorded as a `FrameTree` node in `click::EditorBandHits` for
     /// click routing.
     #[allow(clippy::too_many_arguments)]
-    // TODO(#2177): drop once `tree_layout` moves onto the widget contract.
-    #[allow(deprecated)]
     pub(crate) fn paint_sidebar_panel_rung(
         &self,
         backend: &mut dyn quadraui::Backend,
@@ -599,7 +597,7 @@ impl App {
                 // `panels::render_explorer_sidebar_content` uses the same
                 // composer with `background: Some(tab_bar_bg)`. `render_with`
                 // takes the body as a closure with no `Send + 'static` bound,
-                // so the `!Send`, `Rc<RefCell<_>>`-backed `TreeController` on
+                // so the `!Send`, `Rc<RefCell<_>>`-backed `TreeView` on
                 // `Engine` can be the body directly instead of the
                 // hand-copied `render::paint_sidebar_panel_chrome` split
                 // #1242 needed before #1059 existed.
@@ -629,22 +627,17 @@ impl App {
                 let layout = panel.render_with(backend, q_sb, |backend, body_rect| {
                     engine.explorer_tree_rect.set(body_rect);
                     engine.explorer_viewport_rows.set(body_rect.height as usize);
-                    engine.explorer_tree.borrow().render(backend, body_rect);
+                    engine.explorer_tree.borrow().paint(backend, body_rect);
                 });
                 engine
                     .explorer_toolbar_hits
                     .replace(layout.status_bar_hit_regions);
             }
             PANEL_SEARCH => {
-                // `search_sidebar_system` needs backend info set so `handle_cached`
-                // returns real events instead of `Ignored` unconditionally.
-                // Every content-row press and every wheel notch over the search results
-                // list was silently no-op before this call was added.
-                let search_lh = backend.line_height();
-                engine
-                    .search_sidebar_system
-                    .borrow_mut()
-                    .set_backend_info(search_lh, (self.units.sidebar_system_metrics)(search_lh));
+                // `search_sidebar` needs this backend's metrics recorded so
+                // `handle_cached` returns real events instead of `Ignored`
+                // unconditionally.
+                engine.search_sidebar.borrow_mut().record_metrics(&*backend);
                 render::populate_search_sidebar_system(engine, &engine.cwd, theme);
                 // Wrap in `SidebarPanelBody` so the sidebar background is
                 // filled with `tab_bar_bg` before the search system renders.
@@ -657,10 +650,7 @@ impl App {
                 };
                 panel.render_with(backend, q_sb, |backend, body_rect| {
                     engine.search_sidebar_body_rect.set(body_rect);
-                    engine
-                        .search_sidebar_system
-                        .borrow()
-                        .render(backend, body_rect);
+                    engine.search_sidebar.borrow_mut().paint(backend, body_rect);
                 });
             }
             PANEL_DEBUG => {
@@ -678,10 +668,7 @@ impl App {
                 let layout = panel.render_with(backend, q_sb, |backend, body_rect| {
                     engine.dap_sidebar_body_rect.set(body_rect);
                     render::populate_dap_sidebar_system(engine);
-                    engine
-                        .dap_sidebar_system
-                        .borrow()
-                        .render(backend, body_rect);
+                    engine.dap_sidebar.borrow_mut().paint(backend, body_rect);
                 });
                 engine
                     .dap_sidebar_action_hits
@@ -750,7 +737,7 @@ impl App {
                             .map(|l| l.content_bounds)
                             .unwrap_or(slab_rect);
                         engine.sc_sidebar_body_rect.set(body_rect);
-                        // Without this, `sc_sidebar_system.handle_cached`
+                        // Without this, `sc_sidebar.handle_cached`
                         // returns `Ignored` unconditionally and every
                         // content-row press (header collapse, row select) is a
                         // silent no-op — see `render::UnitProfile::
@@ -763,13 +750,9 @@ impl App {
                         // lines down actually reads it — so the metrics
                         // `handle_cached` hit-tests against can never disagree
                         // with what this exact `render()` call paints.
-                        let sc_lh = backend.line_height();
-                        engine
-                            .sc_sidebar_system
-                            .borrow_mut()
-                            .set_backend_info(sc_lh, (self.units.sidebar_system_metrics)(sc_lh));
+                        engine.sc_sidebar.borrow_mut().record_metrics(&*backend);
                         render::populate_sc_sidebar_system(engine, theme);
-                        engine.sc_sidebar_system.borrow().render(backend, body_rect);
+                        engine.sc_sidebar.borrow_mut().paint(backend, body_rect);
 
                         // Branch picker / create popup and help dialog — both keyboard-reachable
                         // even though the git sidebar has no live mouse-click routing yet.
@@ -809,7 +792,7 @@ impl App {
                 });
             }
             PANEL_EXTENSIONS => {
-                // The shell's own `AppShell` sidebar header already
+                // The shell's own `ShellView` sidebar header already
                 // paints " EXTENSIONS " above `q_sb` — this arm paints only
                 // the search/filter row (#1256 found GTK painting neither
                 // row at all).
@@ -833,25 +816,22 @@ impl App {
                     scrollbar_gutter: None,
                 };
                 panel.render_with(backend, q_sb, |backend, body_rect| {
-                    Self::refresh_ext_sidebar_metrics(backend, engine, self.units);
                     render::populate_ext_sidebar_system(engine);
                     engine.ext_sidebar_body_rect.set(body_rect);
-                    engine
-                        .ext_sidebar_system
-                        .borrow()
-                        .render(backend, body_rect);
+                    engine.ext_sidebar.borrow_mut().paint(backend, body_rect);
                 });
             }
             PANEL_BOARD => {
                 // Generic Board panel host — the *only* GTK-specific
                 // code here is picking which `screen.board` field to read
                 // and where to put the rect; the actual rasterisation is
-                // `Backend::draw_board`, the same call TUI's
+                // `DrawsPrimitives::draw_primitive`, the same call TUI's
                 // `panels::render_board_panel` makes (Platform-Neutrality
                 // Rule: no bespoke board drawing per backend).
                 if let Some(ref board) = screen.board {
                     if let Some(ref model) = board.model {
-                        let layout = backend.draw_board(q_sb, model);
+                        let layout =
+                            quadraui::DrawsPrimitives::draw_primitive(backend, q_sb, model);
                         engine.board_layout.replace(Some(layout));
                     } else {
                         engine.board_layout.replace(None);
@@ -872,7 +852,7 @@ impl App {
                 // Settings only ever shows as a centred modal overlay
                 // (the SettingsModal rung). The sidebar slot is always
                 // blank — just background fill.
-                backend.draw_solid_fill(q_sb, theme.tab_bar_bg);
+                render::fill_solid(backend, q_sb, theme.tab_bar_bg);
             }
             id if id
                 .strip_prefix("ext:")
@@ -880,7 +860,7 @@ impl App {
             {
                 // A `vimcode.ui.register_view` panel — the plugin declared
                 // a widget tree, so paint it as a `quadraui::Form` through the
-                // *same* shared `FormController` the `PANEL_SETTINGS` arm above
+                // *same* shared `ScrolledForm` the `PANEL_SETTINGS` arm above
                 // uses, rather than as `ExtPanelItem` tree rows. This is the
                 // whole per-surface cost of plugin UI: one arm in the shared
                 // shell, zero lines in `src/gtk/` or `src/tui_main/`.
@@ -939,7 +919,7 @@ impl App {
                                 engine
                                     .plugin_view_tree_controller
                                     .borrow()
-                                    .render(backend, body_rect);
+                                    .paint(backend, body_rect);
                             }
                         }
                         Some("table") => {
@@ -988,7 +968,7 @@ impl App {
                                 engine
                                     .plugin_view_form_controller
                                     .borrow_mut()
-                                    .render_and_cache(backend, body_rect);
+                                    .paint(backend, body_rect);
                                 render::paint_plugin_view_combo_box_dropdown(
                                     engine,
                                     &name,
@@ -1003,7 +983,7 @@ impl App {
             }
             id if id.starts_with("ext:") => {
                 // A plugin-provided panel — paint its own sections + items via
-                // `render::ext_panel_to_tree_view` + `Backend::draw_tree`, the same
+                // `render::ext_panel_to_tree_view` + `DrawsPrimitives::draw_primitive`, the same
                 // adapter `tui_main::panels::render_ext_panel` uses.
                 // Composed through `SidebarPanelBody::render` with chrome, same as TUI.
                 if let Some(ref panel) = screen.ext_panel {
@@ -1058,7 +1038,7 @@ impl App {
                     });
 
                     if layout.body_rect.height > 0.0 {
-                        // Cache the exact `Backend::tree_layout` this
+                        // Cache the exact tree layout this
                         // frame painted with — the click router
                         // (`render::route_ext_panel_click`, shared with TUI's
                         // `mouse::handle_mouse`) reads this instead of
@@ -1066,7 +1046,12 @@ impl App {
                         // See `Engine::ext_panel_tree_layout`'s own doc for why
                         // that matters here: this backend pitches a tree's
                         // header rows shorter than its item rows.
-                        let tree_layout = backend.tree_layout(layout.body_rect, &body.0);
+                        let tree_layout = quadraui::DrawsPrimitives::layout_primitive(
+                            &*backend,
+                            layout.body_rect,
+                            &body.0,
+                        )
+                        .layout;
                         engine
                             .ext_panel_tree_layout
                             .replace(Some((layout.body_rect, tree_layout)));
@@ -1094,15 +1079,15 @@ impl App {
                 }
             }
             PANEL_AI => {
-                // Adopts quadraui's `ChatController` — one shared
+                // Adopts quadraui's `Chat` — one shared
                 // `render()` for both backends, like `explorer_tree` and
-                // `ext_sidebar_system` above, replacing the hand-painted
+                // `ext_sidebar` above, replacing the hand-painted
                 // `draw_ai_sidebar_panel`. `ai_chat_rect` is cached on
                 // `Engine` (not here) so `route_ai_chat_event` re-derives
                 // the identical layout `render()` painted.
                 render::populate_ai_chat_controller(engine, theme, backend);
                 // The pinned plan block gets a band carved off the
-                // top of the panel rect *before* `ChatController` ever sees
+                // top of the panel rect *before* `Chat` ever sees
                 // the remainder — `ai_chat_rect` (and therefore every
                 // `route_ai_chat_event` hit-test) is the shrunk rect, so a
                 // click inside the band never reaches the transcript below
@@ -1123,7 +1108,7 @@ impl App {
                 };
                 render::paint_ai_plan_band(backend, engine, theme, plan_rect);
                 engine.ai_chat_rect.set(chat_rect);
-                engine.ai_chat.borrow().render(backend, chat_rect);
+                render::paint_ai_chat(engine, backend, chat_rect);
                 // Slash-command completions, painted on top — no-op unless the input
                 // matches an agent-declared command. Pass `chat_rect` (not `q_sb`) so
                 // the popup anchors off the input box's actual position, unaffected by
@@ -1146,28 +1131,6 @@ impl App {
         // to ensure it stays visible when the sidebar is collapsed.
     }
 
-    /// Re-derive `ext_sidebar_system`'s backend metrics from what `backend`
-    /// is about to paint with.
-    ///
-    /// Without this, `ext_sidebar_system.handle_cached` returns `Ignored`
-    /// unconditionally and every content-row press on the plugin ext panel
-    /// is a silent no-op. Reads `backend.line_height()` directly rather than
-    /// accepting a cached parameter — a cached value can lag behind what
-    /// `backend` reports by the time `render()` actually reads it. Shared by
-    /// multiple sidebar panel arms that were previously verbatim copies of
-    /// the same code.
-    pub(crate) fn refresh_ext_sidebar_metrics(
-        backend: &mut dyn quadraui::Backend,
-        engine: &Engine,
-        units: render::UnitProfile,
-    ) {
-        let ext_lh = backend.line_height();
-        engine
-            .ext_sidebar_system
-            .borrow_mut()
-            .set_backend_info(ext_lh, (units.sidebar_system_metrics)(ext_lh));
-    }
-
     /// Compose the editor-anchored popups: completion menu, LSP hover, editor
     /// hover (rich markdown), diff peek and signature help.
     ///
@@ -1182,7 +1145,7 @@ impl App {
     /// scaling into GTK's native pixel units (`lh`/`cw`), and picking each
     /// popup's clip viewport.
     ///
-    /// `main` is `AppShellLayout::main_content_bounds` — the clip viewport
+    /// `main` is `ShellLayout::main_content_bounds` — the clip viewport
     /// every popup but the completion menu and editor-hover popup is placed
     /// inside; those two clamp to the active window's own rect instead.
     pub(crate) fn paint_editor_popups_rung(
@@ -1548,7 +1511,7 @@ impl App {
     ///
     /// One function because all three draw into the *same* strip and their
     /// order within it is fixed by a rasteriser detail rather than by taste:
-    /// `MenuSystem::render` paints the menu bar across the whole band, so the
+    /// `AppMenu::render` paints the menu bar across the whole band, so the
     /// icon slot and the controls must follow it or get erased (the #552
     /// round-2/3 "buttons render blank" regression). Kept off
     /// [`render::FRAME_Z_ORDER`]'s overlay tail because TUI has neither an app icon nor
@@ -1567,10 +1530,10 @@ impl App {
     ) {
         {
             // `menu_items_rect`, not `menu_row_rect` — the app icon owns the
-            // leading slot. `MenuSystem::render` positions the open
+            // leading slot. `AppMenu::render` positions the open
             // dropdown from this same rect, so passing the narrowed one is
             // what keeps a dropdown under the label that opened it.
-            engine.menu_system.borrow().render(backend, menu_items_rect);
+            engine.app_menu.borrow().render(backend, menu_items_rect);
 
             // ── App icon, left of `File` ─────────────────────────────────
             // The menu bar above only filled `menu_items_rect`, so the
@@ -1606,7 +1569,7 @@ impl App {
         }
 
         // ── Inline window controls (min/max/close) — after the bar ───────────
-        // `menu_system.render()` above repaints the menu bar across the full
+        // `app_menu.render()` above repaints the menu bar across the full
         // `menu_row_rect` band, so the controls must be painted *after* it or
         // they get erased. The controls sit in the title-bar band, to the right
         // of the menu labels; the dropdown body drops *below* the band, so painting

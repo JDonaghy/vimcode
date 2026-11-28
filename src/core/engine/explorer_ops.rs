@@ -182,12 +182,16 @@ impl Engine {
         self.explorer_tree.borrow_mut().scroll_by(delta, viewport);
     }
 
-    /// Handle a TreeController event originating from a mouse click.
-    /// Single-click toggles dirs / previews files; double-click opens.
+    /// Handle a tree event originating from a mouse press.
+    /// A left click toggles dirs / previews files; a double-click opens.
     /// Returns `true` if the event was consumed.
-    pub fn handle_explorer_mouse_event(&mut self, event: quadraui::TreeControllerEvent) -> bool {
+    pub fn handle_explorer_mouse_event(&mut self, event: quadraui::TreeEvent) -> bool {
         match event {
-            quadraui::TreeControllerEvent::RowSelected { ref path } => {
+            quadraui::TreeEvent::RowClicked {
+                ref path,
+                button: quadraui::MouseButton::Left,
+                ..
+            } => {
                 let idx = path[0] as usize;
                 if idx < self.explorer_rows.len() {
                     if self.explorer_rows[idx].is_dir {
@@ -203,9 +207,10 @@ impl Engine {
         }
     }
 
-    pub fn dispatch_explorer_tree_event(&mut self, event: quadraui::TreeControllerEvent) -> bool {
+    pub fn dispatch_explorer_tree_event(&mut self, event: quadraui::TreeEvent) -> bool {
+        use quadraui::TreeEvent;
         match event {
-            quadraui::TreeControllerEvent::RowActivated { ref path } => {
+            TreeEvent::RowDoubleClicked { ref path } | TreeEvent::RowActivated { ref path } => {
                 let idx = path[0] as usize;
                 if idx < self.explorer_rows.len() {
                     if self.explorer_rows[idx].is_dir {
@@ -218,45 +223,29 @@ impl Engine {
                 }
                 true
             }
-            // A chevron-zone click resolves to
-            // `RowToggleExpand`, a distinct variant from the `RowActivated`
-            // a label-zone double-click (or Enter) produces. Before this
-            // arm existed, `RowToggleExpand` fell through the catch-all
-            // below and was silently swallowed — reported as consumed with
-            // no effect — so the chevron needed a second click to fold
-            // through `DoubleClickDetector` into a `RowActivated` it *did*
-            // handle. `explorer_toggle_dir` already flips expanded ->
-            // collapsed and back, so one click here toggles either
-            // direction, matching the label's one-click arity both ways.
-            quadraui::TreeControllerEvent::RowToggleExpand { ref path } => {
+            // A chevron-zone click resolves to `RowToggleExpand`, a distinct
+            // event from the `RowDoubleClicked` a label-zone double-click
+            // produces. `explorer_toggle_dir` flips expanded -> collapsed and
+            // back, so one click here toggles either direction, matching the
+            // label's one-click arity both ways.
+            TreeEvent::RowToggleExpand { ref path } => {
                 let idx = path[0] as usize;
                 if idx < self.explorer_rows.len() && self.explorer_rows[idx].is_dir {
                     self.explorer_toggle_dir(idx);
                 }
                 true
             }
-            quadraui::TreeControllerEvent::EditConfirmed {
-                ref path,
-                ref new_text,
-            } => {
-                self.handle_explorer_edit_confirmed(path, new_text);
+            TreeEvent::RowRenameCommitted { ref path, ref text } => {
+                self.handle_explorer_edit_confirmed(path, text);
                 true
             }
-            quadraui::TreeControllerEvent::EditCancelled { .. } => {
+            TreeEvent::RowRenameCancelled { .. } => {
                 self.handle_explorer_edit_cancelled();
                 true
             }
-            quadraui::TreeControllerEvent::RowSelected { .. } => true,
-            quadraui::TreeControllerEvent::Ignored => false,
-            // Each `TreeControllerEvent` variant is enumerated explicitly rather than
-            // caught by a `_ => true` catch-all. These are all legitimate no-ops today
-            // (scrollbar interaction, drag/hover, keystroke, context menu), but naming
-            // them means a new quadraui variant becomes a compile error here, not a
-            // silent swallow.
-            quadraui::TreeControllerEvent::ScrollChanged
-            | quadraui::TreeControllerEvent::Consumed
-            | quadraui::TreeControllerEvent::EditChanged { .. }
-            | quadraui::TreeControllerEvent::ContextMenuRequested { .. } => true,
+            // Selection, scroll, rename keystrokes, other buttons and context
+            // menus: the tree host has already stored what they changed.
+            _ => true,
         }
     }
 
@@ -314,8 +303,9 @@ impl Engine {
         ctrl: bool,
     ) -> ExplorerKeyResult {
         if self.explorer_tree.borrow().is_editing() {
-            let event = self.dispatch_explorer_edit_key(key_name, chr, ctrl);
-            self.dispatch_explorer_tree_event(event);
+            if let Some(event) = self.dispatch_explorer_edit_key(key_name, chr, ctrl) {
+                self.dispatch_explorer_tree_event(event);
+            }
             return ExplorerKeyResult::Consumed;
         }
 
@@ -400,7 +390,7 @@ impl Engine {
         key_name: &str,
         chr: Option<char>,
         ctrl: bool,
-    ) -> quadraui::TreeControllerEvent {
+    ) -> Option<quadraui::TreeEvent> {
         use quadraui::{Key, Modifiers, NamedKey};
 
         let modifiers = Modifiers {
@@ -409,74 +399,29 @@ impl Engine {
             alt: false,
             cmd: false,
         };
-
-        match key_name {
-            "Return" | "KP_Enter" => {
-                let key = Key::Named(NamedKey::Enter);
-                self.explorer_tree
-                    .borrow_mut()
-                    .handle_edit_key_via(&key, &modifiers)
-            }
-            "Escape" => {
-                let key = Key::Named(NamedKey::Escape);
-                self.explorer_tree
-                    .borrow_mut()
-                    .handle_edit_key_via(&key, &modifiers)
-            }
-            "BackSpace" => {
-                let key = Key::Named(NamedKey::Backspace);
-                self.explorer_tree
-                    .borrow_mut()
-                    .handle_edit_key_via(&key, &modifiers)
-            }
-            "Delete" => {
-                let key = Key::Named(NamedKey::Delete);
-                self.explorer_tree
-                    .borrow_mut()
-                    .handle_edit_key_via(&key, &modifiers)
-            }
-            "Left" => {
-                let key = Key::Named(NamedKey::Left);
-                self.explorer_tree
-                    .borrow_mut()
-                    .handle_edit_key_via(&key, &modifiers)
-            }
-            "Right" => {
-                let key = Key::Named(NamedKey::Right);
-                self.explorer_tree
-                    .borrow_mut()
-                    .handle_edit_key_via(&key, &modifiers)
-            }
-            "Home" => {
-                let key = Key::Named(NamedKey::Home);
-                self.explorer_tree
-                    .borrow_mut()
-                    .handle_edit_key_via(&key, &modifiers)
-            }
-            "End" => {
-                let key = Key::Named(NamedKey::End);
-                self.explorer_tree
-                    .borrow_mut()
-                    .handle_edit_key_via(&key, &modifiers)
-            }
-            _ => {
-                if ctrl {
-                    if let Some(c) = chr {
-                        let key = Key::Char(c);
-                        return self
-                            .explorer_tree
-                            .borrow_mut()
-                            .handle_edit_key_via(&key, &modifiers);
-                    }
-                }
-                if let Some(c) = chr {
-                    if !c.is_control() {
-                        return self.explorer_tree.borrow_mut().edit_insert_char_via(c);
-                    }
-                }
-                quadraui::TreeControllerEvent::Consumed
-            }
+        let named = match key_name {
+            "Return" | "KP_Enter" => Some(NamedKey::Enter),
+            "Escape" => Some(NamedKey::Escape),
+            "BackSpace" => Some(NamedKey::Backspace),
+            "Delete" => Some(NamedKey::Delete),
+            "Left" => Some(NamedKey::Left),
+            "Right" => Some(NamedKey::Right),
+            "Home" => Some(NamedKey::Home),
+            "End" => Some(NamedKey::End),
+            _ => None,
+        };
+        let mut tree = self.explorer_tree.borrow_mut();
+        if let Some(named) = named {
+            return tree.rename_key(&Key::Named(named), modifiers);
         }
+        let c = chr?;
+        if ctrl {
+            return tree.rename_key(&Key::Char(c), modifiers);
+        }
+        if c.is_control() {
+            return None;
+        }
+        tree.rename_insert(&c.to_string())
     }
 
     fn explorer_collapse_or_parent(&mut self) -> ExplorerKeyResult {

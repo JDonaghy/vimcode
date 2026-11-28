@@ -147,10 +147,10 @@ use crate::core::Engine;
 // ── Role-based locators ───────────────────────────────────────────────
 //
 // Typed, stable names for each UI region. Maps 1:1 to `WidgetId` strings
-// `AppShell::render`'s `register_chrome_zones` already registers -- no
+// `ShellView::render`'s `register_chrome_zones` already registers -- no
 // upstream quadraui change required.
 
-/// Semantic role for a UI region that `AppShell::render`'s
+/// Semantic role for a UI region that `ShellView::render`'s
 /// `register_chrome_zones` already registers as a `WidgetId`-keyed zone.
 ///
 /// Each variant maps 1:1 to a known `WidgetId` string via [`UiRole::zone_id`].
@@ -1439,7 +1439,7 @@ pub const SCENARIO_REGISTRY: &[ScenarioMeta] = &[
         area: FeatureArea::Editor,
         driver_cap: DriverCap::TextOnly,
         // TUI only: `native_dialogs` is false there, so activating "Open
-        // Folder" defers to the in-app `FolderPickerController` fallback
+        // Folder" defers to the in-app `FolderPicker` fallback
         // this scenario asserts on. On GTK/macOS/Windows the same action
         // would block on a real OS file-open dialog, which a headless
         // conformance run cannot drive.
@@ -1849,7 +1849,7 @@ pub(crate) fn build_app_and_config(
 }
 
 /// Open `dir`'s shared folder/workspace picker on `app` — the same
-/// [`quadraui::FolderPickerController`] a live `:OpenFolder` ex-command
+/// [`quadraui::FolderPicker`] a live `:OpenFolder` ex-command
 /// builds via `App::open_folder_dialog`, seeded directly here so a
 /// scenario can start from "the picker is already open" without depending
 /// on the command-line/ex-command path itself. [`command_palette_filters_and_escape_dismisses`]
@@ -1943,13 +1943,12 @@ pub fn make_conflicted_repo(tag: &str) -> PathBuf {
 }
 
 pub(crate) fn install_folder_picker(app: &App, dir: PathBuf) {
-    *app.folder_picker.borrow_mut() =
-        Some(quadraui::FolderPickerController::rooted_at(dir, vec![]));
+    *app.folder_picker.borrow_mut() = Some(quadraui::FolderPicker::rooted_at(dir, vec![]));
 }
 
 /// Scenario 1: opening the shared folder/workspace picker paints
 /// its entries, typing filters them via the live
-/// `FolderPickerController::handle` path, and Esc dismisses it.
+/// `FolderPicker::handle` path, and Esc dismisses it.
 ///
 /// `distinctive`/`other` must be two sibling directory names such that a
 /// fuzzy-subsequence match of `query` (the full `distinctive` string)
@@ -1992,7 +1991,7 @@ pub fn folder_picker_filters_and_escape_dismisses<D: ConformanceDriver>(
 /// `PickerSource::Commands`) opens via the ordinary ex-command path and
 /// types a filter, filters, and Esc dismisses. Together with scenario 1
 /// this covers both of vimcode's two fuzzy-picker implementations
-/// (`FolderPickerController` and the engine-native `PickerSource` machinery)
+/// (`FolderPicker` and the engine-native `PickerSource` machinery)
 /// on every GUI backend.
 ///
 /// Filters on `"Sidebar"` against the always-present "View: Toggle
@@ -2415,7 +2414,7 @@ pub fn activity_bar_click_focuses_search_panel<D: ConformanceDriver + DriverInpu
 ///
 /// Locates the Search activity-bar icon via `FrameInventory::zones()` —
 /// [`crate::core::engine::sidebar::PANEL_SEARCH`] is literally the
-/// `"panel:search"` `WidgetId` `compose::app_shell::AppShell::render`'s
+/// `"panel:search"` `WidgetId` `compose::app_shell::ShellView::render`'s
 /// `register_chrome_zones` keys every activity-bar item's zone by —
 /// rather than `click_text`, since the icon's fallback glyph collides
 /// with ordinary path separators the explorer tree paints.
@@ -3120,14 +3119,7 @@ pub(crate) fn assert_text_metrics_backend_applies_metrics<B: quadraui::Backend>(
 /// category (unit/caps/feature/quadraui/product) and target child are
 /// recorded next to it, not just its issue number, per that issue's own
 /// gate-labelling requirement.
-///
-/// `gtk_click_column_after_wide_glyph`
-/// (`gtk::click::emoji_click_column_tests`): quadraui resolves an editor
-/// click column monospace (`EditorLayout::col_at_x`) while the pixel
-/// backends shape the painted text, so a click after an emoji lands one
-/// column right per preceding wide glyph. Category: quadraui (no shaped
-/// column inverse a host can call outside paint).
-pub(crate) const KNOWN_BUGS: &[&str] = &["gtk_click_column_after_wide_glyph"];
+pub(crate) const KNOWN_BUGS: &[&str] = &[];
 
 /// A regression guard, not a "list stays empty forever" rule: an empty
 /// list and a list with a genuine, still-open entry (see the doc above
@@ -3139,7 +3131,7 @@ pub(crate) const KNOWN_BUGS: &[&str] = &["gtk_click_column_after_wide_glyph"];
 mod known_bugs_is_empty {
     #[test]
     fn known_bugs_has_the_expected_entries() {
-        let expected: &[&str] = &["gtk_click_column_after_wide_glyph"];
+        let expected: &[&str] = &[];
         assert_eq!(
             super::KNOWN_BUGS,
             expected,
@@ -3985,7 +3977,7 @@ mod tests {
 
 // The file explorer's expand/collapse chevron needs a double click, while
 // its row's text label needs one. The root cause: a missing
-// `TreeControllerEvent::RowToggleExpand` match arm in
+// `TreeEvent::RowToggleExpand` match arm in
 // `Engine::dispatch_explorer_tree_event`. This bug reproduces on both backends.
 #[cfg(test)]
 mod issue_984_explorer_chevron_needs_a_double_click {
@@ -4025,7 +4017,7 @@ mod issue_984_explorer_chevron_needs_a_double_click {
         // not re-run that sync, so the shadow's `sidebar_visible()` would
         // otherwise stay stale-`false` — which `render::sync_runner_sidebar_visibility`
         // (called unconditionally on every dispatch) then mirrors onto the
-        // *runner's* own `AppShell`, collapsing the sidebar column entirely
+        // *runner's* own `ShellView`, collapsing the sidebar column entirely
         // after the very first click and erasing the chevron-expand this
         // scenario asserts on. `show_panel` sets the shadow's `sidebar_visible`
         // directly, sidestepping the staleness.
@@ -4720,9 +4712,9 @@ mod issue_1429_shared_mouse_routes {
                 !driver.screen_has("New File"),
                 "precondition: no context menu is open yet"
             );
-            // `app-shell:sidebar-content` (the quadraui `AppShell` chrome zone) is
+            // `app-shell:sidebar-content` (the quadraui `ShellView` chrome zone) is
             // only registered by the shared `App` — `tui_prod`'s production TUI shell
-            // doesn't compose through `AppShell`. The empty-space point is derived from
+            // doesn't compose through `ShellView`. The empty-space point is derived from
             // the last painted row's bounds, which every arm paints identically.
             let last_row = driver
                 .inventory()
@@ -4869,8 +4861,8 @@ mod issue_986_confirm_prompt_never_built {
 }
 
 /// A dead ~55-line hand-rolled `ActivityBarTarget` dispatch block was deleted
-/// from `mouse.rs`. The block was confirmed-unreachable: `AppShell` consumes
-/// the click into a semantic `AppShellEvent` upstream of the production TUI shell's
+/// from `mouse.rs`. The block was confirmed-unreachable: `ShellView` consumes
+/// the click into a semantic `ShellEvent` upstream of the production TUI shell's
 /// `handle` -> `mouse::handle_mouse` entirely. This is the systematic convergence-audit
 /// registration the issue asks for, sampling two targets through the independent
 /// `conformance_harness_prod` lens: an ordinary fixed panel (Search) and the
@@ -4973,12 +4965,12 @@ mod issue_1057_bottom_item_click_toggles_sidebar {
     //
     // Marker is "Appearance" (the Settings form's first group header, from
     // the shared `render::populate_settings_form_controller` +
-    // `FormController` -- identical on every backend), not the literal
+    // `ScrolledForm` -- identical on every backend), not the literal
     // "SETTINGS" caption: that caption is painted by
     // `tui_main::panels::render_settings_panel`'s own
     // `draw_settings_chrome(.., " SETTINGS", ..)` call, which is genuine
     // *TUI-only* chrome -- `App::render_content`'s `PANEL_SETTINGS` arm
-    // (`src/app.rs`) renders the shared `FormController` directly, with no
+    // (`src/app.rs`) renders the shared `ScrolledForm` directly, with no
     // such caption. That's a real, separate divergence (a candidate for its
     // own future convergence item), not something this issue's fix touches
     // -- so this test doesn't lean on it.
@@ -5039,7 +5031,7 @@ mod issue_1057_bottom_item_click_toggles_sidebar {
     }
 }
 
-/// The third of three `AppShellEvent` shadow-`engine.app_shell` sync arms
+/// The third of three `ShellEvent` shadow-`engine.app_shell` sync arms
 /// (`PanelChanged`/`SidebarHidden`/`SidebarResized`) converged onto one shared
 /// function, [`render::sync_shell_event_shadow`]. #988 was one of these forgetting
 /// the sync entirely: `PanelChanged { hamburger }` returned early before sync.
@@ -5066,7 +5058,7 @@ mod issue_1062_shell_event_shadow_sync {
             // `click_text`, and double-click folding disabled. A bare down-only click
             // leaves the simulated button latched for the second press, and two real
             // clicks close together would otherwise fold into a `DoubleClick`, which
-            // bypasses `ShellAdapter`'s semantic `AppShellEvent` dispatch.
+            // bypasses `ShellAdapter`'s semantic `ShellEvent` dispatch.
             driver.set_double_click_folding(false);
 
             assert!(
@@ -5080,7 +5072,7 @@ mod issue_1062_shell_event_shadow_sync {
             assert!(
                 driver.screen_has("Replace…"),
                 "clicking the Search icon once must open the Search panel \
-                 -- AppShellEvent::PanelChanged synced onto the shadow \
+                 -- ShellEvent::PanelChanged synced onto the shadow \
                  engine.app_shell via render::sync_shell_event_shadow, on \
                  every backend"
             );
@@ -5090,7 +5082,7 @@ mod issue_1062_shell_event_shadow_sync {
                 !driver.screen_has("Replace…"),
                 "clicking the Search icon again, while its own panel is \
                  already open, must close the sidebar -- \
-                 AppShellEvent::SidebarHidden synced onto the shadow via \
+                 ShellEvent::SidebarHidden synced onto the shadow via \
                  the same shared function, on every backend"
             );
         },
@@ -5130,7 +5122,7 @@ fn menu_terminal_activation_opens_terminal_pane<T: quadraui::AppLogic>(
 
     // Enter activates the first (already-selected) item, "New Terminal"
     // (action id "terminal" -> `EngineAction::OpenTerminal`).
-    // `MenuSystem::handle` closes the dropdown itself before returning
+    // `AppMenu::handle` closes the dropdown itself before returning
     // `Activated`, so nothing from the dropdown box can paint on the rows
     // checked below.
     driver.press_named(quadraui::NamedKey::Enter);
@@ -5653,16 +5645,16 @@ mod issue_1059_tab_bar_dispatch_routes_through_shared_click_fn {
 /// `quadraui::ShellApp::take_requested_panel` was unoverridden on `App` — the
 /// trait default always returns `None` — so an app-initiated panel switch
 /// (engine call with no runner click involved) never reached the runner's
-/// `AppShell`, leaving the sidebar-header title stuck on the previous panel.
+/// `ShellView`, leaving the sidebar-header title stuck on the previous panel.
 /// The sidebar's *content* paints from `engine.app_shell`/`engine.ext_panel_active`
 /// directly, so that part always painted correctly. But the runner's own chrome
-/// — the sidebar-header title `quadraui::AppShell::render` paints from its own
+/// — the sidebar-header title `quadraui::ShellView::render` paints from its own
 /// `active_panel()` — has no channel to learn about the switch other than this
 /// poll, so it silently kept showing the previous panel's title forever.
 /// `screen_has("EXPLORER")` is a safe proxy for that title: that literal
 /// all-caps string appears nowhere in either panel's own painted *content*,
 /// only in the `PanelDefinition::title` fields the shadow `app_shell` is seeded
-/// with, which `quadraui::AppShell::render` echoes into the header.
+/// with, which `quadraui::ShellView::render` echoes into the header.
 ///
 /// Both `gtk` and `tui` below drive the shared `crate::app::App` — on GTK and
 /// `quadraui::tui::TuiBackend` respectively — so both arms exercise the
@@ -5690,7 +5682,7 @@ mod issue_1064_take_requested_panel {
     ) where
         D: ConformanceDriver + DriverInput,
     {
-        // `Engine::new_for_test()`'s `AppShell` (and the runner's own,
+        // `Engine::new_for_test()`'s `ShellView` (and the runner's own,
         // built from the same panel list in `App::shell_config`) both
         // start with the sidebar already open on Explorer — the default
         // active panel (index 0) with `sidebar_visible() == true` — so
@@ -5698,7 +5690,7 @@ mod issue_1064_take_requested_panel {
         // switch below is the *only* variable under test. (Clicking the
         // Explorer icon here, as the other panel-open scenarios in this
         // file do for their own non-default target panel, would instead
-        // *close* it — `AppShell::handle_activity_click`'s own "click on
+        // *close* it — `ShellView::handle_activity_click`'s own "click on
         // the already-active, already-visible panel" branch.)
         assert!(
             driver.screen_has("EXPLORER"),
@@ -5710,7 +5702,7 @@ mod issue_1064_take_requested_panel {
         // the same shape `Engine::process_pending_sidebar`'s DAP
         // `dap_wants_sidebar` reveal and `App::toggle_focus_search`'s
         // keyboard accelerator both take — no runner click, so no chance
-        // for `AppShell::handle`'s own hit-testing to update the runner's
+        // for `ShellView::handle`'s own hit-testing to update the runner's
         // chrome on its own.
         engine.borrow_mut().focus_sidebar_panel(PANEL_SEARCH);
 
@@ -5741,7 +5733,7 @@ mod issue_1064_take_requested_panel {
     fn tui() {
         // `App::shell_config`'s `cell`-profile hamburger
         // `PanelDefinition` now occupies index 0 in the *runner's* fresh
-        // `AppShell` (`quadraui::AppShell::new` always activates index 0),
+        // `ShellView` (`quadraui::ShellView::new` always activates index 0),
         // so a bare `engine_fixture()` — whose shadow `engine.app_shell`
         // starts hidden, matching `Engine::new_for_test()`'s deterministic
         // default — paints "Menu" (the hamburger's own header) at frame
@@ -5785,7 +5777,7 @@ mod issue_1064_take_requested_panel {
 /// Does GTK compose the Settings/Extensions sidebar header and search chrome
 /// somewhere other than `App::paint_sidebar_panel_rung`, or is it missing?
 /// Originally answered by driving all three shells, finding that the shared
-/// `App` now paints the shell's own `AppShell` header (title from
+/// `App` now paints the shell's own `ShellView` header (title from
 /// `PanelDefinition.title`) and both panels paint a search/filter row through
 /// `SidebarPanelBody::render_with` with `SidebarPanelChrome::Search` chrome.
 #[cfg(test)]
@@ -5885,7 +5877,7 @@ mod issue_1256_sidebar_chrome {
     /// Once Settings — a bottom item — owns the sidebar header, clicking a *top*
     /// panel's icon must take the header back rather than leaving it stuck on
     /// Settings. Before the quadraui bump for quadraui#1055/#1056,
-    /// `AppShell::handle_activity_click`'s top-panel branch never cleared
+    /// `ShellView::handle_activity_click`'s top-panel branch never cleared
     /// `sidebar_bottom_owner`, so the header would have stayed on Settings even
     /// though Explorer's icon was clicked.
     fn settings_then_explorer_reclaims_header<D: ConformanceDriver>(driver: &mut D) {
@@ -6529,7 +6521,7 @@ mod issue_1427_menu_bar_reveal_shared {
     /// which would leave the File dropdown painting flush against the left edge and
     /// erasing an editor-offset-0 marker; and (2), specific to the hamburger tests
     /// below: `App::shell_config`'s `cell`-profile hamburger `PanelDefinition`
-    /// occupies index 0 in the *runner's* fresh `AppShell`, so the very first
+    /// occupies index 0 in the *runner's* fresh `ShellView`, so the very first
     /// hamburger click only produces the reveal needed — rather than a toggle-hide
     /// — once construction's initial `take_requested_panel` poll has somewhere real
     /// (Explorer) to reconcile the runner onto first.
@@ -6543,7 +6535,7 @@ mod issue_1427_menu_bar_reveal_shared {
     }
 
     /// Alt+F must reveal the (hidden by default) menu bar *and* hand the same
-    /// keystroke to the `MenuSystem` intercept, which activates the File menu — both
+    /// keystroke to the `AppMenu` intercept, which activates the File menu — both
     /// of which redraw, and the reveal reserves one more row above the editor
     /// content, shifting a marker down by exactly one line.
     ///
@@ -6679,7 +6671,7 @@ mod issue_1427_menu_bar_reveal_shared {
     /// position* the first (reveal) click used — the stale-position muscle
     /// memory a hamburger reveal leaves behind — must still hide the menu
     /// bar via `render::route_menu_bar_reveal`'s stale-corner-click guard,
-    /// rather than falling into the `MenuSystem` intercept and opening
+    /// rather than falling into the `AppMenu` intercept and opening
     /// whichever menu now paints at that column.
     #[test]
     fn hamburger_stale_click_position_after_reveal_still_hides_menu_bar_via_app_on_tui() {
@@ -7026,7 +7018,7 @@ mod issue_1266_scroll_router_convergence {
     /// proof that the convergence covers it too, not just the `scroll_surfaces`
     /// registered arms.
     ///
-    /// quadraui's own `SidebarSystem::handle_inner` scrolls its tree sections by
+    /// quadraui's own `Sidebar::handle_inner` scrolls its tree sections by
     /// `wheel_row_delta(delta.y, 1.0)` — the gesture's magnitude in rows, so one
     /// wheel notch moves as many rows as the backend's `conformance_line_height`:
     /// one row per notch on the TUI (a cell is one row high), `line_height` rows
@@ -7038,7 +7030,7 @@ mod issue_1266_scroll_router_convergence {
     /// Load-bearing for #554's convention: `try_route_sidebar_mouse_event` is called
     /// *before* the `UiEvent::Scroll` match arm that negates `delta.y` back to GTK-raw
     /// — so unlike the three `handle_mouse_scroll_msg` consumers (all written against
-    /// GTK-raw polarity), `SidebarSystem` receives the **un-negated, quadraui-native**
+    /// GTK-raw polarity), `Sidebar` receives the **un-negated, quadraui-native**
     /// delta straight off the `UiEvent`, matching `ScrollDelta`'s own documented
     /// convention directly.
     mod issue_1266_sidebar_scroll_router_convergence {
@@ -11054,7 +11046,7 @@ mod settings_number_enables_line_numbers_mod {
                 "precondition: the fixture buffer's third line must be painted"
             );
             // Settle the sidebar before asserting on the *absence* of a digit.
-            // The runner's own `AppShell` starts with the sidebar visible and
+            // The runner's own `ShellView` starts with the sidebar visible and
             // only learns the engine's hidden state on the first dispatch, so
             // frame 1 still paints the file explorer -- rooted at the process's
             // working directory, whose real file and directory names carry
@@ -11586,7 +11578,7 @@ mod welcome_panel_lists_recent_workspaces_most_recent_first_mod {
 // via Enter) must drive the real `EngineAction::OpenFolderDialog` dispatch
 // chain, not just update `welcome_focus`. On a backend without
 // `native_dialogs` (TUI), that chain ends at `App::open_folder_dialog`,
-// which seeds the in-app `FolderPickerController` from `engine.cwd` --
+// which seeds the in-app `FolderPicker` from `engine.cwd` --
 // this scenario proves the picker actually opens and lists `cwd`'s real
 // contents. GTK/macOS/Windows would instead block on a real OS dialog,
 // which a headless conformance run cannot drive, so this scenario is
@@ -11715,7 +11707,7 @@ mod welcome_panel_recent_entry_restores_workspace_mod {
 // fixture (already past `startup_into_no_workspace_for_test`) through
 // `App::new_headless_with_backend`, which only proves the *shadow*
 // `app_shell`'s sidebar bit agrees with `Engine::derived_sidebar_visible`
-// -- not that the real, painting runner `AppShell` agrees too. Before
+// -- not that the real, painting runner `ShellView` agrees too. Before
 // `App::shell_config()` seeded `quadraui::ShellConfig::with_sidebar_
 // visible`, the runner's own construction-time default (`sidebar_visible:
 // true`) always won the first frame regardless of what the shadow said,

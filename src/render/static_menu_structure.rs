@@ -608,7 +608,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
     ),
 ];
 
-/// Build `Vec<MenuDef>` from `MENU_STRUCTURE` for `quadraui::MenuSystem`.
+/// Build `Vec<MenuDef>` from `MENU_STRUCTURE` for `quadraui::AppMenu`.
 /// `is_vscode_mode` selects which shortcut variant to display.
 pub fn build_menu_defs(is_vscode_mode: bool) -> Vec<quadraui::MenuDef> {
     MENU_STRUCTURE
@@ -676,7 +676,7 @@ pub fn build_menu_defs(is_vscode_mode: bool) -> Vec<quadraui::MenuDef> {
 /// Pure and backend-neutral: any backend that declares
 /// `BackendCaps::native_menu` (macOS's `MacBackend` today) can hand its
 /// result straight to `install_menu_bar` instead of the app drawing its own
-/// in-window `MenuSystem` row. Each top-level `MenuDef` becomes a
+/// in-window `AppMenu` row. Each top-level `MenuDef` becomes a
 /// `MenuBarItem` whose `submenu` is the *same* `ContextMenuItem` list the
 /// drawn dropdown already uses — including the `key_equivalent` populated
 /// above — so the native menu and the in-window one can never drift apart
@@ -713,7 +713,7 @@ pub fn menu_defs_to_menu_bar(defs: &[quadraui::MenuDef]) -> quadraui::MenuBar {
 /// introduce an entirely new menu-bar menu, not just extend an existing one.
 ///
 /// Selecting a plugin menu item dispatches through the same
-/// `quadraui::MenuEvent::Activated(id)` → `Engine::dispatch_menu_action` →
+/// `quadraui::AppMenuEvent::Activated(id)` → `Engine::dispatch_menu_action` →
 /// `Engine::execute_command` path every built-in menu item already uses —
 /// `id` is just the registered command name, so no new dispatch code is
 /// needed.

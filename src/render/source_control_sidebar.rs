@@ -346,7 +346,7 @@ pub fn sc_sidebar_bands(
 /// A full click-driven sweep across a *painted row* (the more traditional
 /// black-box proof, `crate::harness::sweep_hit_band_integrity`) was tried
 /// here first and dropped: it lands on a pre-existing, focus-independent
-/// GTK hit-band inaccuracy in `quadraui::SidebarSystem`'s own section
+/// GTK hit-band inaccuracy in `quadraui::Sidebar`'s own section
 /// header (reproduced identically with `has_focus: false`, i.e. with no
 /// hint row reserved at all, so it predates and is unrelated to this
 /// fix) — a separate, out-of-scope defect for whoever picks it up next,
@@ -508,6 +508,7 @@ pub fn sc_branch_picker_to_palette(bp: &BranchPickerData) -> quadraui::Palette {
             create_label: None,
             preview: None,
             mode: PaletteMode::Input,
+            show_mode_badge: true,
         };
     }
 
@@ -543,6 +544,7 @@ pub fn sc_branch_picker_to_palette(bp: &BranchPickerData) -> quadraui::Palette {
         create_label: None,
         preview: None,
         mode: PaletteMode::List,
+        show_mode_badge: true,
     }
 }
 
@@ -659,7 +661,7 @@ pub fn ext_panel_help_tooltip_layout(
     (tooltip, layout, chrome)
 }
 
-/// Populate the `SidebarSystem` on `engine.dap_sidebar_system` with
+/// Populate the `Sidebar` on `engine.dap_sidebar` with
 /// current row data for all 4 debug sidebar sections. Call once per
 /// frame before `sidebar_system.render()` or `.handle()`.
 pub fn populate_dap_sidebar_system(engine: &Engine) {
@@ -674,10 +676,11 @@ pub fn populate_dap_sidebar_system(engine: &Engine) {
     // ── Breakpoints section ──
     let bp_rows = build_dap_bp_rows(engine, session_active);
 
-    let mut sidebar = engine.dap_sidebar_system.borrow_mut();
-    sidebar.set_has_focus(engine.dap_sidebar_has_focus);
-    if engine.dap_sidebar_has_focus && sidebar.active_section().is_none() {
-        sidebar.set_active_section(Some(0));
+    let mut host = engine.dap_sidebar.borrow_mut();
+    let sidebar = &mut host.sidebar;
+    sidebar.has_focus = engine.dap_sidebar_has_focus;
+    if engine.dap_sidebar_has_focus && sidebar.active_section.is_none() {
+        sidebar.active_section = Some(0);
     }
     sidebar.set_rows(0, var_rows);
     sidebar.set_rows(1, watch_rows);
@@ -687,32 +690,6 @@ pub fn populate_dap_sidebar_system(engine: &Engine) {
 
 pub fn populate_ext_sidebar_system(engine: &Engine) {
     engine.populate_ext_sidebar_system();
-}
-
-/// `MsvLayoutMetrics` for a pixel-unit GUI backend's `SidebarSystem`
-/// instances (Source Control, plugin ext panels).
-///
-/// Called fresh every frame from each GTK/macOS `paint_sidebar_panel_rung`
-/// call site, not once at startup — a pixel backend's `line_height` can change
-/// (zoom, font settings) where TUI's cell grid cannot, so metrics must be
-/// recomputed each frame rather than trusted from a stale snapshot.
-pub fn gui_sidebar_system_metrics(line_height: f32) -> quadraui::MsvLayoutMetrics {
-    quadraui::MsvLayoutMetrics {
-        // Matches `SidebarSystem::compute_tree_layout`'s own row-height
-        // formula (`(lh * 1.4).round()`) — headers paint at the same
-        // height as a content row, and the two must agree since
-        // `compute_layout`'s header band and `compute_tree_layout`'s row
-        // pitch are what stack to build the panel's total content height,
-        // both starting from the same `rect`.
-        header_size: (line_height * 1.4).round(),
-        divider_size: 0.0,
-        // Matches the picker's own GTK/macOS scrollbar gutter width
-        // (`gtk_picker_rows`'s `scrollbar_w`).
-        scrollbar_size: 6.0,
-        // Sub-pixel layout — quadraui's own doc on this field: "GTK leaves
-        // it 0.0" (`MsvLayoutMetrics::cell_quantum`).
-        cell_quantum: 0.0,
-    }
 }
 
 /// A plain leaf `TreeRow`: no icon, no badge, not expandable, no inline

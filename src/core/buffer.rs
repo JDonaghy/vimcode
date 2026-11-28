@@ -12,7 +12,7 @@ pub struct BufferId(pub usize);
 
 impl fmt::Display for BufferId {
     /// Renders as the bare numeric id — used as the opaque document id
-    /// handed to quadraui's `WorkspaceController` preview tier.
+    /// handed to quadraui's `Workspace` preview tier.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }

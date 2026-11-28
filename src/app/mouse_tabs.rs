@@ -10,14 +10,14 @@ impl App {
     /// mirroring `compute_editor_layout`'s `unit_h = line_height` convention.
     /// Extracted out of `render_content` so that function reads as the
     /// frame's *order* and nothing else. `main` is
-    /// `AppShellLayout::main_content_bounds`.
+    /// `ShellLayout::main_content_bounds`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn compose_bottom_band_rungs(
         &self,
         backend: &mut dyn quadraui::Backend,
         engine: &Engine,
         screen: &render::ScreenLayout,
-        layout: &quadraui::AppShellLayout,
+        layout: &quadraui::ShellLayout,
         theme: &Theme,
         main: quadraui::Rect,
         el: &render::EditorLayout,
@@ -318,6 +318,7 @@ impl App {
             true, // resolving the original tab-bar mouse-down; switching tabs is intended
             &mut drag_rc.borrow_mut(),
             false, // re-resolving a tab-bar press; the minimap rung cannot match here
+            None,  // only a tab hit matters here, never a text column
         );
         if !matches!(target, ClickTarget::TabBar) {
             return None;
@@ -537,7 +538,7 @@ impl App {
     /// recompute from the drawing area's raw `width`/`height`, which always
     /// assumes the editor area starts at `x = 0`. That only holds with the
     /// activity bar/sidebar at zero width; with either painted, the real
-    /// left edge is `AppShellLayout::main_content_bounds.x`.
+    /// left edge is `ShellLayout::main_content_bounds.x`.
     pub(crate) fn editor_scrollbar_press(
         &mut self,
         backend: &dyn quadraui::Backend,
@@ -644,7 +645,7 @@ impl App {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn handle_mouse_click_msg(
         &mut self,
-        backend: &dyn quadraui::Backend,
+        backend: &mut dyn quadraui::Backend,
         x: f64,
         y: f64,
         width: f64,
@@ -677,7 +678,7 @@ impl App {
 
         // ── Settings modal overlay ───────────────────────────────────────
         // When the settings panel is shown as a centred modal, clicks
-        // inside the painted form rect route to the FormController; clicks
+        // inside the painted form rect route to the ScrolledForm; clicks
         // outside dismiss the modal.  Checked before the general modal
         // ladder because the scrim covers the editor band.
         if self.engine.borrow().settings_modal_open {
@@ -691,6 +692,7 @@ impl App {
             if inside {
                 let event = quadraui::UiEvent::DoubleClick {
                     widget: None,
+                    button: quadraui::MouseButton::Left,
                     position: quadraui::Point::new(fx, fy),
                 };
                 render::handle_settings_form_ui_event(
@@ -1152,6 +1154,7 @@ impl App {
                                 &self.cached_group_tab_bar_layouts.borrow(),
                                 self.cached_editor_band_hits.borrow().as_ref(),
                                 &mut drag,
+                                backend.paint_surface(),
                             )
                         } else {
                             (None, None)
@@ -1470,7 +1473,7 @@ impl App {
     // `handle_mouse`. See the rung's banner in `render.rs`.
     pub(crate) fn handle_mouse_drag_msg(
         &mut self,
-        backend: &dyn quadraui::Backend,
+        backend: &mut dyn quadraui::Backend,
         x: f64,
         y: f64,
         viewport: quadraui::Rect,
@@ -1741,6 +1744,7 @@ impl App {
                         &self.cached_group_tab_bar_layouts.borrow(),
                         self.cached_editor_band_hits.borrow().as_ref(),
                         &mut drag_rc.borrow_mut(),
+                        backend.paint_surface(),
                     );
                 }
             }

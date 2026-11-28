@@ -5,10 +5,10 @@ use super::*;
 /// Build a `quadraui::ActivityBar` primitive from engine state.
 ///
 /// Not on either backend's render path: the activity bar itself is painted
-/// by `quadraui::compose::AppShell::render()` from `App`'s `ShellApp`
+/// by `quadraui::compose::ShellView::render()` from `App`'s `ShellApp`
 /// wiring, not from this struct. This builder exists for tests that want to
 /// assert on activity-bar item selection/order/icon state without driving a
-/// full `AppShell` frame (see `menu_bar_structure.rs`).
+/// full `ShellView` frame (see `menu_bar_structure.rs`).
 ///
 /// * `include_hamburger` — `true` for TUI (no native menu bar so the
 ///   hamburger item at keyboard-index 0 provides keyboard access to the
@@ -34,7 +34,7 @@ pub fn build_activity_bar(
     // The keyboard ring is matched by *panel id*, not by re-deriving each
     // item's numeric toolbar index at the paint site. `Engine` owns the single
     // index↔id table (`activity_bar_item_id`), and the stepping itself is
-    // quadraui's `AppShell` cursor — so the painted order and
+    // quadraui's `ShellView` cursor — so the painted order and
     // the navigable order cannot drift apart here.
     let kbd_sel_id = if engine.activity_bar_focused {
         engine.activity_bar_selected_item_id()
@@ -155,7 +155,7 @@ pub fn build_activity_bar(
         // next raw key into `UiEvent::ActivityBar(id, KeyPressed { .. })`,
         // which `App` (a `quadraui::ShellApp`) never reads — that event type
         // is fully consumed by `ShellAdapter::handle` against its own
-        // internal `AppShell`, which this bar's painted state (`kbd_sel`
+        // internal `ShellView`, which this bar's painted state (`kbd_sel`
         // above, driven by `Engine::activity_bar_focused`/
         // `activity_bar_selected_item_id`) never reads back from. Leaving
         // this `false` keeps every key arriving as a raw `KeyPressed`, so
@@ -318,6 +318,8 @@ pub fn ext_panel_to_tree_view(panel: &ExtPanelData, theme: &Theme) -> quadraui::
         scroll_offset: panel.scroll_top,
         style: TreeStyle::default(),
         has_focus: panel.has_focus,
+        items_window: None,
+        scroll_px: None,
     }
 }
 
@@ -326,7 +328,7 @@ pub fn ext_panel_to_tree_view(panel: &ExtPanelData, theme: &Theme) -> quadraui::
 // `quadraui::compose::sidebar_panel_body::SidebarPanelBody` composes
 // "background fill, optional header/search chrome, body, optional
 // scrollbar gutter". Its `render()` method requires `Self: Send + 'static`,
-// which stateful sidebar bodies (`TreeController`/`FormController`,
+// which stateful sidebar bodies (`TreeView`/`ScrolledForm`,
 // `Rc<RefCell<_>>`-backed on `!Send` `Engine`) can't satisfy. Use
 // `SidebarPanelBody::render_with`, which takes the body as `impl
 // FnOnce(&mut dyn Backend, Rect)` instead — no `Send`/`'static` bound.
@@ -337,7 +339,7 @@ pub use quadraui::compose::sidebar_panel_body::{
 };
 
 /// Build the search-only chrome (`SidebarPanelChrome::Search`) for a
-/// sidebar panel whose header `AppShell` already owns. Shared by GTK's
+/// sidebar panel whose header `ShellView` already owns. Shared by GTK's
 /// `App::paint_sidebar_panel_rung` and the TUI's `panels::render_settings_panel`/
 /// `render_ext_sidebar`, so the query/placeholder/active-tint look is
 /// consistent between them.
@@ -402,15 +404,13 @@ pub fn find_chrome(query: &str, placeholder: &str, theme: &Theme) -> SidebarPane
 /// for (the module note above), [`ext_panel_to_tree_view`]'s output is
 /// already a fresh, owned `quadraui::TreeView`, so it satisfies
 /// `BackendWidget: Send + 'static`. Public field so a caller can read the
-/// `TreeView` back out after the borrow ends (e.g. to feed
-/// `Backend::tree_layout`).
+/// `TreeView` back out after the borrow ends (e.g. to lay it out with
+/// `DrawsPrimitives::layout_primitive`).
 pub struct ExtPanelTreeBody(pub quadraui::TreeView);
 
 impl quadraui::BackendWidget for ExtPanelTreeBody {
-    // TODO(#2177): drop once `draw_tree` moves onto the widget contract.
-    #[allow(deprecated)]
     fn render(&self, backend: &mut dyn quadraui::Backend, rect: quadraui::Rect) {
-        backend.draw_tree(rect, &self.0);
+        quadraui::DrawsPrimitives::draw_primitive(backend, rect, &self.0);
     }
 }
 
@@ -537,6 +537,7 @@ pub fn picker_panel_to_palette(picker: &PickerPanel, theme: &Theme) -> quadraui:
         create_label: None,
         preview,
         mode: quadraui::PaletteMode::List,
+        show_mode_badge: true,
     }
 }
 
@@ -732,27 +733,25 @@ pub fn settings_to_form(engine: &Engine) -> quadraui::Form {
 }
 
 /// Populate the engine's `settings_form_controller` with current form
-/// data and scroll state. Call before `FormController::render()` or
-/// `FormController::handle()`.
+/// data and scroll state. Call before `ScrolledForm::render()` or
+/// `ScrolledForm::handle()`.
 pub fn populate_settings_form_controller(engine: &Engine) {
     let form = settings_to_form(engine);
     let mut fc = engine.settings_form_controller.borrow_mut();
-    fc.set_form(form);
-    fc.set_scroll_offset(engine.settings_scroll_top);
-    fc.set_has_focus(engine.settings_has_focus);
+    fc.set_form(form, engine.settings_scroll_top, engine.settings_has_focus);
 }
 
 /// Route a pointer event over the Settings panel through the shared
-/// `quadraui::FormController` and apply the result to engine state.
+/// `quadraui::ScrolledForm` and apply the result to engine state.
 ///
 /// `rect` is the panel's content area in the caller's own coordinate space —
 /// the *same* rect the last frame passed to
-/// `FormController::render_and_cache`, since `handle_cached` re-derives its
+/// `FormHost::paint`, since `handle_cached` re-derives its
 /// row layout from it. Returns `true` when the event was consumed.
 ///
 /// This is the click twin of [`populate_settings_form_controller`]. It
 /// exists so neither backend has to re-derive the panel's row geometry by
-/// hand; `FormController` owns all of that geometry and is the only thing
+/// hand; `ScrolledForm` owns all of that geometry and is the only thing
 /// that painted the rows.
 ///
 /// Activation policy: a `Toggle` field flips on a single click, a category
@@ -763,7 +762,7 @@ pub fn populate_settings_form_controller(engine: &Engine) {
 /// # Row geometry is not offset from the paint
 ///
 /// The `handle_cached` path re-derives its row layout from line height alone.
-/// Both `FormController`'s cached `row_height(lh)` and the backend's
+/// Both `ScrolledForm`'s cached `row_height(lh)` and the backend's
 /// `form_row_height(lh)` are `(lh * 1.4).round()`, so the two agree on
 /// vertical geometry. Do not add a vimcode-side offset to "fix" click
 /// positioning; it would break the agreement between painted and hit bands.
@@ -774,13 +773,17 @@ pub fn handle_settings_form_ui_event(
 ) -> bool {
     use crate::core::engine::SettingsRow;
 
-    // `FormController` has no `DoubleClick` arm — probe with the equivalent
+    // `ScrolledForm` has no `DoubleClick` arm — probe with the equivalent
     // press and remember that the caller asked for activation.
     let (probe, activate_row) = match event {
-        quadraui::UiEvent::DoubleClick { widget, position } => (
+        quadraui::UiEvent::DoubleClick {
+            widget,
+            button,
+            position,
+        } => (
             quadraui::UiEvent::MouseDown {
                 widget: *widget,
-                button: quadraui::MouseButton::Left,
+                button: *button,
                 position: *position,
                 modifiers: quadraui::Modifiers::default(),
             },
@@ -793,7 +796,7 @@ pub fn handle_settings_form_ui_event(
     let result = engine
         .settings_form_controller
         .borrow_mut()
-        .handle_cached_event(&probe, rect);
+        .handle_cached(&probe, rect);
 
     let sync_scroll = |engine: &mut Engine| {
         let offset = engine.settings_form_controller.borrow().scroll_offset();
@@ -802,12 +805,11 @@ pub fn handle_settings_form_ui_event(
 
     match result {
         quadraui::Handled::Ignored => false,
-        quadraui::Handled::Event(quadraui::FormControllerAction::ScrollChanged)
-        | quadraui::Handled::Consumed => {
+        quadraui::Handled::Consumed => {
             sync_scroll(engine);
             true
         }
-        quadraui::Handled::Event(quadraui::FormControllerAction::FormAction(action)) => {
+        quadraui::Handled::Event(action) => {
             let (id, activates) = match action {
                 quadraui::FormEvent::ToggleChanged { id, .. } => (id, true),
                 quadraui::FormEvent::ButtonClicked { id } => (id, true),
@@ -822,7 +824,9 @@ pub fn handle_settings_form_ui_event(
                 .settings_form_controller
                 .borrow()
                 .form()
-                .and_then(|f| f.fields.iter().position(|field| field.id == id));
+                .fields
+                .iter()
+                .position(|field| field.id == id);
             let Some(idx) = idx else {
                 return true;
             };

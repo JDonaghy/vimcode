@@ -377,7 +377,7 @@ pub const WINDOW_MAXIMIZE_ACTION: &str = "window:maximize";
 pub const WINDOW_CLOSE_ACTION: &str = "window:close";
 
 /// Width, in pixels, of the outer-window resize grip passed to
-/// [`quadraui::AppShell::window_edge`].
+/// [`quadraui::ShellView::window_edge`].
 ///
 /// A few pixels — VS Code/Electron frameless windows use a comparable
 /// margin — is still comfortably grabbable with a mouse, is thinner than one
@@ -497,6 +497,7 @@ pub fn debug_output_to_text_display(
         has_focus: false,
         title: None,
         show_scrollbar: true,
+        items_window: None,
     }
 }
 
@@ -526,6 +527,7 @@ pub fn bottom_panel_placeholder_to_text_display(
         has_focus: false,
         title: None,
         show_scrollbar: false,
+        items_window: None,
     }
 }
 
@@ -1100,7 +1102,7 @@ mod tests {
     ///
     /// Note: as of the pending quadraui hook, `render::build_activity_bar`
     /// itself has no production caller — `App` renders through
-    /// `quadraui::compose::app_shell::AppShell::build_activity_bar` instead,
+    /// `quadraui::compose::app_shell::ShellView::build_activity_bar` instead,
     /// which hardcodes `active_accent: None`. This test pins the adapter's own
     /// field-mapping correctness so it's ready the moment such a hook lands and
     /// this function (or its theme field) is wired back in; it does not claim

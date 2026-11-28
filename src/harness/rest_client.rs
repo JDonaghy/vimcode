@@ -131,7 +131,7 @@ fn load_extension(engine: &mut Engine) {
 
 /// Build a fresh engine with the extension loaded and the sidebar parked on
 /// a non-explorer panel (mirrors `crate::harness::plugin_view`'s fixtures —
-/// see that module's own doc for why: the Explorer panel's `TreeController`
+/// see that module's own doc for why: the Explorer panel's `TreeView`
 /// would otherwise intercept clicks via its stale cached rect).
 pub fn engine_with_extension() -> Engine {
     let mut engine = Engine::new_for_test();

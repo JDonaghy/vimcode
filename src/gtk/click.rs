@@ -43,98 +43,106 @@ use std::rc::Rc;
 mod emoji_click_column_tests {
     //! Click-to-column resolution with emoji (✅ 🟡 ❌ ⏭️) on a markdown
     //! line, through the production path (`render::editor_text_layout` +
-    //! `EditorLayout::col_at_x`). quadraui resolves editor click columns
-    //! monospace, so every glyph wider than one cell drifts the columns
-    //! after it; the gated test below fails until quadraui offers an exact,
-    //! shaped column inverse for pixel backends.
+    //! `EditorLayout::col_at_x` over the backend's text surface). The
+    //! column is measured by shaping the row in the editor font, so a glyph
+    //! wider than one cell must not drift the columns after it.
     use super::*;
     use crate::core::WindowRect;
     use crate::render::build_screen_layout;
     use ::pangocairo::cairo::{Context, Format, ImageSurface};
 
-    /// `crate::harness::KNOWN_BUGS` label for the test below.
-    const EMOJI_CLICK_COLUMN_BUG: &str = "gtk_click_column_after_wide_glyph";
-
-    fn headless_pango_layout() -> pango::Layout {
+    fn headless_pango_layout() -> (Context, pango::Layout) {
         let surface = ImageSurface::create(Format::ARgb32, 900, 60).expect("create ImageSurface");
         let cr = Context::new(&surface).expect("Context::new");
         let ctx = pangocairo::create_context(&cr);
         ctx.set_font_description(&pango::FontDescription::from_string("Monospace 12"));
-        pango::Layout::new(&ctx)
+        let layout = pango::Layout::new(&ctx);
+        (cr, layout)
     }
 
     #[test]
     fn click_resolves_exact_column_on_emoji_markdown_line() {
-        crate::harness::known_bug_gate(EMOJI_CLICK_COLUMN_BUG, || {
-            // Concurrent Pango/Cairo text work from two test threads segfaults
-            // inside FreeType — see `src/test_paint.rs`.
-            let _paint = crate::test_paint::PaintGuard::acquire();
-            let text = "Total: **58 commands**  \u{b7}  \u{2705} 36  \u{b7}  \u{1f7e1} 2  \u{b7}  \u{274c} 14  \u{b7}  \u{23ed}\u{fe0f} 6";
-            let mut engine = Engine::new();
-            engine.buffer_mut().insert(0, text);
-            let buf_id = engine.active_buffer_id();
-            engine.buffer_manager.get_mut(buf_id).unwrap().file_path =
-                Some(std::path::PathBuf::from("notes.md"));
+        // Concurrent Pango/Cairo text work from two test threads segfaults
+        // inside FreeType — see `src/test_paint.rs`.
+        let _paint = crate::test_paint::PaintGuard::acquire();
+        let text = "Total: **58 commands**  \u{b7}  \u{2705} 36  \u{b7}  \u{1f7e1} 2  \u{b7}  \u{274c} 14  \u{b7}  \u{23ed}\u{fe0f} 6";
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, text);
+        let buf_id = engine.active_buffer_id();
+        engine.buffer_manager.get_mut(buf_id).unwrap().file_path =
+            Some(std::path::PathBuf::from("notes.md"));
 
-            // Lay the editor out at the measuring font's own advance, so only a
-            // glyph wider than one cell can move a column.
-            let measure_layout = headless_pango_layout();
-            measure_layout.set_text("0");
-            let char_width = measure_layout.pixel_size().0 as f64;
-            let line_height = 18.0;
-            let theme = Theme::onedark();
-            let bounds = WindowRect::new(0.0, 0.0, 800.0, 600.0);
-            let (rects, _) = engine.calculate_group_window_rects(bounds, 24.0);
-            let layout = build_screen_layout(
-                &engine,
-                &theme,
-                &rects,
-                line_height,
-                char_width,
-                true,
-                8.0,
-                crate::render::gtk_minimap_sizing(),
-            );
-            let rw = &layout.windows[0];
-            assert_eq!(
-                rw.lines[0].raw_text, text,
-                "line should not wrap in an 800px window"
-            );
+        // Lay the editor out at the measuring font's own advance, so only a
+        // glyph wider than one cell can move a column.
+        let (cr, measure_layout) = headless_pango_layout();
+        measure_layout.set_text("0");
+        let char_width = measure_layout.pixel_size().0 as f64;
+        let line_height = 18.0;
+        let theme = Theme::onedark();
+        let bounds = WindowRect::new(0.0, 0.0, 800.0, 600.0);
+        let (rects, _) = engine.calculate_group_window_rects(bounds, 24.0);
+        let layout = build_screen_layout(
+            &engine,
+            &theme,
+            &rects,
+            line_height,
+            char_width,
+            true,
+            8.0,
+            crate::render::gtk_minimap_sizing(),
+        );
+        let rw = &layout.windows[0];
+        assert_eq!(
+            rw.lines[0].raw_text, text,
+            "line should not wrap in an 800px window"
+        );
 
-            let (editor, editor_layout) = render::editor_text_layout(rw, char_width, line_height);
-            measure_layout.set_text(text);
+        let (editor, editor_layout) = render::editor_text_layout(rw, char_width, line_height);
+        measure_layout.set_text(text);
 
-            let char_count = text.chars().count();
-            let mut prev_pos: Option<(i32, i32)> = None;
-            for (char_idx, (byte_idx, ch)) in text.char_indices().enumerate() {
-                let pos = measure_layout.index_to_pos(byte_idx as i32);
-                // A zero-width combining mark (e.g. the U+FE0F variation
-                // selector on "⏭️") shares its base character's glyph cluster
-                // — Pango reports the *identical* (x, width) rect for both
-                // byte offsets, since there is no distinct on-screen pixel
-                // region for the combining mark alone. A click can only ever
-                // land on the cluster as a whole, so such chars have no
-                // resolvable column of their own to assert against — skip
-                // them rather than asserting an unreachable identity.
-                if prev_pos == Some((pos.x(), pos.width())) {
-                    continue;
-                }
-                prev_pos = Some((pos.x(), pos.width()));
+        // The click resolves through the backend's text verbs, shaping the
+        // row in the same editor font the measuring layout uses.
+        let mut gtk_backend = backend::GtkBackend::new();
+        gtk_backend.set_pango_context(measure_layout.context());
+        quadraui::Backend::set_editor_font(&mut gtk_backend, "Monospace", 12.0);
 
-                let glyph_left_x =
-                    editor_layout.text_bounds.x as f64 + pos.x() as f64 / pango::SCALE as f64;
-                let glyph_width = (pos.width() as f64 / pango::SCALE as f64).max(2.0);
-                let click_x = glyph_left_x + glyph_width * 0.25;
-
-                let resolved = editor_layout.col_at_x(&editor, 0, click_x as f32);
-                assert_eq!(
-                    resolved, char_idx,
-                    "clicking char {char_idx} ({ch:?}) resolved to col {resolved}, not {char_idx} \
-                     — the paint↔click column inverse has drifted for this glyph"
-                );
+        let char_count = text.chars().count();
+        let mut prev_pos: Option<(i32, i32)> = None;
+        for (char_idx, (byte_idx, ch)) in text.char_indices().enumerate() {
+            let pos = measure_layout.index_to_pos(byte_idx as i32);
+            // A zero-width combining mark (e.g. the U+FE0F variation
+            // selector on "⏭️") shares its base character's glyph cluster
+            // — Pango reports the *identical* (x, width) rect for both
+            // byte offsets, since there is no distinct on-screen pixel
+            // region for the combining mark alone. A click can only ever
+            // land on the cluster as a whole, so such chars have no
+            // resolvable column of their own to assert against — skip
+            // them rather than asserting an unreachable identity.
+            if prev_pos == Some((pos.x(), pos.width())) {
+                continue;
             }
-            assert_eq!(char_count, text.chars().count());
-        });
+            prev_pos = Some((pos.x(), pos.width()));
+
+            let glyph_left_x =
+                editor_layout.text_bounds.x as f64 + pos.x() as f64 / pango::SCALE as f64;
+            let glyph_width = (pos.width() as f64 / pango::SCALE as f64).max(2.0);
+            let click_x = glyph_left_x + glyph_width * 0.25;
+
+            let resolved = gtk_backend.enter_frame_scope(&cr, &measure_layout, |b| {
+                editor_layout.col_at_x(
+                    &editor,
+                    0,
+                    click_x as f32,
+                    quadraui::Backend::paint_surface(b),
+                )
+            });
+            assert_eq!(
+                resolved, char_idx,
+                "clicking char {char_idx} ({ch:?}) resolved to col {resolved}, not {char_idx} \
+                 — the paint↔click column inverse has drifted for this glyph"
+            );
+        }
+        assert_eq!(char_count, text.chars().count());
     }
 }
 
@@ -223,6 +231,7 @@ mod cross_split_drag_focus_tests {
             false, // mutate_focus: drag continuation
             &mut quadraui::DragState::default(),
             false, // no Alt context in this test
+            None,
         );
         assert_eq!(
             engine.active_group, group_a,
@@ -265,6 +274,7 @@ mod cross_split_drag_focus_tests {
             true, // mutate_focus: genuine click
             &mut quadraui::DragState::default(),
             false, // no Alt context in this test
+            None,
         );
         assert_eq!(
             engine.active_group, group_b,
@@ -471,6 +481,7 @@ mod editor_band_hits_tests {
             true,
             &mut quadraui::DragState::default(),
             false,
+            None,
         );
         match target {
             ClickTarget::BufferPos(id, _, _) => assert_eq!(id, wid),
@@ -652,6 +663,7 @@ mod single_group_tab_click_dispatch_tests {
                 true, // a genuine click
                 &mut quadraui::DragState::default(),
                 false, // no Alt context in this test
+                None,
             )
         }
 
@@ -670,6 +682,7 @@ mod single_group_tab_click_dispatch_tests {
                 &self.tab_pixel_hits,
                 None,
                 &mut quadraui::DragState::default(),
+                None,
             )
         }
     }

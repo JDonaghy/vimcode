@@ -3,7 +3,7 @@
 //! A Lua plugin registers a *view* (`vimcode.ui.register_view`) whose `render`
 //! callback returns a declarative widget tree. Vimcode converts that tree into
 //! a `quadraui` primitive (`render::plugin_view_to_form`), paints it through the
-//! shared `quadraui::FormController` both backends already use for the Settings
+//! shared `quadraui::ScrolledForm` both backends already use for the Settings
 //! panel, and routes the resulting widget events back to the plugin's
 //! `on_event` callback.
 //!
@@ -19,7 +19,7 @@
 //! counterpart is usually just an allow-list entry here plus a matching arm
 //! in that one translation function — never a hand-invented representation
 //! — but is not guaranteed to be *only* that: a primitive quadraui's own
-//! `FormController` has no native interaction path for (as `Slider` turned
+//! `ScrolledForm` has no native interaction path for (as `Slider` turned
 //! out to be, see its doc below) also needs vimcode's own keyboard-handling
 //! arm in `core::engine::plugins`, plus the matching Lua parse/encode arms in
 //! `plugin.rs`. The ceiling is still small and enumerable, not open-ended.
@@ -360,7 +360,7 @@ pub enum ViewBody {
     /// Painted through `quadraui::ListView`/`ListItem` directly (see
     /// `crate::render::plugin_view_body`) — there is no composed quadraui
     /// controller for selection/scroll, so that part is hand-rolled in that
-    /// backend-neutral module rather than through `FormController`.
+    /// backend-neutral module rather than through `ScrolledForm`.
     List {
         #[serde(default)]
         title: Option<String>,
@@ -369,7 +369,7 @@ pub enum ViewBody {
     },
     /// Expandable nodes. Flattened to `quadraui::TreeRow`s and painted
     /// through `quadraui::TreeView`, with keyboard/expand-collapse handling
-    /// going through quadraui's own `TreeController`.
+    /// going through quadraui's own `TreeView`.
     Tree {
         #[serde(default)]
         nodes: Vec<ViewTreeNode>,
@@ -418,7 +418,7 @@ pub enum ViewBody {
     },
     /// One or more numeric series, rendered as a sparkline, line, bar, or
     /// grouped-bar chart. Painted through `quadraui::Chart`/`ChartLayout`
-    /// via `Backend::draw_chart`, which paints and returns a hit-testable
+    /// via `DrawsPrimitives::draw_primitive`, which paints and returns a hit-testable
     /// layout in a single call — there is no separate scroll/selection
     /// state to hand-roll, unlike `List`/`Table`.
     Chart {
@@ -1089,20 +1089,20 @@ pub enum ViewFieldKind {
     /// text: `value` need not be one of `options` verbatim — a plugin that
     /// wants strict validation checks it itself in `on_event`.
     ///
-    /// quadraui's own `FormController` drives the embedded `ComboBox`'s
+    /// quadraui's own `ScrolledForm` drives the embedded `ComboBox`'s
     /// keyboard handling (typing filters, Up/Down move the highlighted
     /// option, Enter commits, Escape cancels) — see
     /// `render::plugin_view_to_form`'s `ComboBox` arm and
     /// `Engine::handle_plugin_view_key`'s combo-box branch for where
     /// vimcode forwards keys into it and stores the resulting interaction
     /// state (`text`/`open`/`highlighted`) across renders, since quadraui's
-    /// `FormController` carries no shadow cache for this field kind the way
+    /// `ScrolledForm` carries no shadow cache for this field kind the way
     /// it does for [`Self::Date`]'s `DatePicker`.
     ///
     /// quadraui's own `Form` paints only the compact text row plus a
     /// chevron; the open filtered-option overlay is an app-painted popup,
     /// `render::paint_plugin_view_combo_box_dropdown` — anchored to the
-    /// field's own on-screen rect via `FormController::field_rect`, built
+    /// field's own on-screen rect via `ScrolledForm::field_rect`, built
     /// from vimcode's shadow `text`/`open`/`highlighted` state, and painted
     /// as the popup `quadraui::ComboBox`'s own `Interactive::popups`
     /// describes, the same widget every backend shares. A click on a filtered
@@ -1151,7 +1151,7 @@ pub enum ViewFieldKind {
     /// label is long enough, or there are enough of them, to want its
     /// own line.
     ///
-    /// `quadraui::FormController` drives this field's keyboard handling
+    /// `quadraui::ScrolledForm` drives this field's keyboard handling
     /// natively: `Up`/`Left` moves the selection to the previous enabled
     /// option, `Down`/`Right` to the next, wrapping at either end and
     /// skipping disabled options — see `Engine::handle_plugin_view_key`'s
@@ -1186,7 +1186,7 @@ pub enum ViewFieldKind {
     ///
     /// While this field has focus, `Left`/`Right`/`Up`/`Down`/`PageUp`/
     /// `PageDown` scrub a day/month that paints immediately but is held by
-    /// `quadraui::FormController`'s own cache, not by the plugin, until
+    /// `quadraui::ScrolledForm`'s own cache, not by the plugin, until
     /// `Enter` confirms it as a [`ViewEventKind::DateChanged`] event. That
     /// cache survives this field being re-declared with a different
     /// `value` while it stays focused — a plugin whose `on_event` ignores
@@ -1200,7 +1200,7 @@ pub enum ViewFieldKind {
     /// adjustment. Translated to `quadraui::FieldKind::Slider`; the field
     /// names below are exactly quadraui's own.
     ///
-    /// `quadraui::FormController` has no native keyboard *or* mouse/drag
+    /// `quadraui::ScrolledForm` has no native keyboard *or* mouse/drag
     /// path for sliders at all (unlike [`ViewFieldKind::Date`]'s own
     /// scrub-and-confirm keyboard path) — this variant is translated by
     /// `plugin_view_to_form`, but stepping it is vimcode's own hand-written
@@ -1220,7 +1220,7 @@ pub enum ViewFieldKind {
     /// plus typed entry, stepping by `step` and clamping to `[min, max]`.
     /// Translated to `quadraui::FieldKind::NumberInput`.
     ///
-    /// Unlike [`Self::Slider`], `quadraui::FormController` drives this
+    /// Unlike [`Self::Slider`], `quadraui::ScrolledForm` drives this
     /// field's keyboard handling natively — digits/`-`/`.` accumulate a
     /// typed draft, `Up`/`Down` step the committed value immediately,
     /// `Enter` parses/clamps/commits the draft, `Escape` discards it. See
@@ -1249,7 +1249,7 @@ pub enum ViewFieldKind {
     /// value falls back to a read-only row echoing the raw string, so the
     /// plugin author sees what they typed instead of a wrong swatch.
     ///
-    /// `quadraui::FormController` emits no `FormEvent::ColorChanged` from any
+    /// `quadraui::ScrolledForm` emits no `FormEvent::ColorChanged` from any
     /// click or key path — the popup/hex-input editor the kind's own doc
     /// describes is explicitly left to the app. This variant is therefore
     /// display-only for now: Enter/Space on a focused `color` field is a
@@ -1263,7 +1263,7 @@ pub enum ViewFieldKind {
     /// A horizontal strip of toolbar buttons (icons, key hints, separators).
     /// Translated to `quadraui::FieldKind::Toolbar`.
     ///
-    /// `quadraui::FormController` hit-tests clicks against each button's id
+    /// `quadraui::ScrolledForm` hit-tests clicks against each button's id
     /// natively, but — like [`Self::Buttons`]/[`Self::Toggles`] — has no
     /// keyboard path: `Enter`/`Space` on a focused `toolbar` field is
     /// vimcode's own handling in `core::engine::plugins`, activating the
@@ -1480,7 +1480,7 @@ pub enum ViewEventKind {
         value: String,
     },
     /// A `slider` field's value changed — currently only an Enter/Space
-    /// step; `quadraui::FormController` has no drag/click path for sliders
+    /// step; `quadraui::ScrolledForm` has no drag/click path for sliders
     /// to route through (see [`ViewFieldKind::Slider`]'s doc). `value` is
     /// already clamped to the field's declared `[min, max]`.
     SliderChanged {
@@ -1704,7 +1704,7 @@ impl PluginViewTextEditState {
 /// [`ViewEventKind::TextChanged`]) and the committed value (via
 /// [`ViewEventKind::ComboBoxChanged`]).
 ///
-/// This exists because quadraui's `FormController` keeps no shadow cache of
+/// This exists because quadraui's `ScrolledForm` keeps no shadow cache of
 /// its own for `FieldKind::ComboBox` the way it does for `FieldKind::
 /// DatePicker`'s scrub position — the embedded `quadraui::ComboBox`'s
 /// `text`/`open`/`highlighted` fields are documented as "supplied fresh by
@@ -1785,7 +1785,7 @@ impl ComboDropdownLayout {
 /// vimcode-owned interaction state for whichever `number_input` field
 /// currently has keyboard focus, in either the sidebar or an editor-area
 /// tab — the `number_input` twin of [`PluginViewComboBoxEditState`], same
-/// "quadraui's `FormController` keeps no shadow cache of its own" reasoning
+/// "quadraui's `ScrolledForm` keeps no shadow cache of its own" reasoning
 /// (see that struct's doc): the embedded `quadraui::NumberInput`'s `draft`
 /// field is documented as "supplied fresh by the app each frame", so
 /// vimcode is that app. Plugins never see this, only the committed value,

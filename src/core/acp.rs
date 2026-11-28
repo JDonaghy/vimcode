@@ -1134,7 +1134,7 @@ pub fn parse_at_mentions(text: &str) -> Vec<String> {
 /// Generalizes `ai_command_completions`' "only the word currently under
 /// construction" contract from "must be the *whole* input" (slash
 /// commands, which only ever open a message) to "must be the *trailing*
-/// word" (a mention can follow other typed text) — `ChatController`
+/// word" (a mention can follow other typed text) — `Chat`
 /// exposes `input_text()` but no cursor-position getter, so "trailing
 /// word" is the closest approximation reachable without a wider quadraui
 /// change; typing continues immediately after an accepted mention, which
@@ -2093,7 +2093,7 @@ pub fn parse_tool_call_update(update: &serde_json::Value) -> Option<AcpToolCallU
 /// The one-line `{glyph} {kind}: {title}` header every rendering of an
 /// [`AcpToolCall`] starts with — no locations, no content, just the
 /// status/kind/title triple. Split out of [`tool_call_summary_line`] so it
-/// can also serve as [`quadraui::ChatController::turn_summary_line`]'s
+/// can also serve as [`quadraui::Chat::turn_summary_line`]'s
 /// override for a *collapsed* card (`▸ [x] edit: Edit src/foo.rs`):
 /// `turn_summary_line` renders as a single `MessageRow`, so a multi-line
 /// string (locations included) would show an embedded `\n` verbatim

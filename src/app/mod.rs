@@ -184,10 +184,10 @@ pub(crate) struct App {
     /// hit-testing both read `DialogLayout::hit_test` off this instead of a
     /// hand-rolled per-backend rect cache.
     pub(crate) dialog_layout: Rc<RefCell<Option<quadraui::DialogLayout>>>,
-    /// Shared `quadraui::FolderPickerController` (adopted from TUI's local `FolderPickerState`/
+    /// Shared `quadraui::FolderPicker` (adopted from TUI's local `FolderPickerState`/
     /// native `gtk4::FileDialog` split). `render_content` (`&self`) reads it while
     /// `handle_key_press` (`&mut self`) mutates it, hence the `RefCell`.
-    pub(crate) folder_picker: RefCell<Option<quadraui::FolderPickerController>>,
+    pub(crate) folder_picker: RefCell<Option<quadraui::FolderPicker>>,
     /// Edge-trigger flag for native message dialogs: `true` once a native present
     /// has been queued or shown for the `engine.dialog` currently open. A native
     /// `AlertDialog` cannot be re-presented every frame like the in-canvas `Dialog`,
@@ -294,7 +294,7 @@ pub(crate) struct App {
     /// and may differ by click time, making the explorer hit-test resolve the wrong
     /// row. Re-applied before hit-testing so draw and hit agree.
     pub(crate) cached_explorer_metrics: Rc<Cell<(f64, f64)>>,
-    /// `(line_height, char_width)` the AI panel's `ChatController` was last
+    /// `(line_height, char_width)` the AI panel's `Chat` was last
     /// painted with — the same drift `cached_explorer_metrics` guards
     /// against. `Backend::line_height`/`char_width` on GTK
     /// read a mutable "current" field any widget's render pass can
@@ -302,7 +302,7 @@ pub(crate) struct App {
     /// event reaches `route_ai_chat_event`, whatever painted *last* this
     /// frame or the previous one may have left a different value there.
     /// Re-applied via `quadraui::Backend::set_current_line_height`/
-    /// `set_current_char_width` before `ChatController::handle` runs, so its
+    /// `set_current_char_width` before `Chat::handle` runs, so its
     /// row-wrap math (`total_rows`/`visible_rows`) matches what `render()`
     /// used rather than silently reading a smaller/larger viewport and
     /// throwing off the scrollbar clamp.
@@ -378,7 +378,7 @@ pub(crate) struct App {
     /// Editor content bounds + tab-bar height as used by the LAST `render_content` pass,
     /// in the same **absolute** DA coordinate frame that mouse events arrive in.
     ///
-    /// `render_content` derives `editor_bounds` from `AppShellLayout::main_content_bounds`,
+    /// `render_content` derives `editor_bounds` from `ShellLayout::main_content_bounds`,
     /// which is offset by the activity bar / sidebar (x) and the title-bar band (y).
     /// Caching what the renderer used makes hit-test-agrees-with-paint true *by construction*.
     pub(crate) cached_editor_bounds: Cell<Option<(core::WindowRect, f64)>>,
@@ -397,7 +397,7 @@ pub(crate) struct App {
     /// own pre-first-paint default.
     pub(crate) cached_main_content_height: Cell<f64>,
     /// Menu bar row rect (full content width, `lh` tall) computed in
-    /// `render_content` each frame. Reused by `handle()` so `MenuSystem`'s
+    /// `render_content` each frame. Reused by `handle()` so `AppMenu`'s
     /// click/key routing tests against the exact rect the bar was drawn
     /// into.
     ///
@@ -408,7 +408,7 @@ pub(crate) struct App {
     /// The sub-rect of [`Self::menu_row_rect`] the menu *items* were actually drawn into —
     /// `menu_row_rect` minus the app-icon slot at its leading edge.
     ///
-    /// `handle()` routes `MenuSystem` clicks against **this**: the icon shifts every
+    /// `handle()` routes `AppMenu` clicks against **this**: the icon shifts every
     /// item's x-origin right, so a hit-test run against the unshifted band would
     /// resolve a click on `File` to whatever item sits one slot to its left. Written
     /// by `render_content` from the same call that positions the paint, so they cannot disagree.
@@ -571,7 +571,7 @@ pub(crate) struct App {
     /// before #1426 exactly; `UnitProfile::cell()` makes the same `App` paint
     /// correctly on a cell grid.
     pub(crate) units: render::UnitProfile,
-    /// What this app believes the **runner's** `AppShell` currently has as its
+    /// What this app believes the **runner's** `ShellView` currently has as its
     /// active panel. Updated only from [`Self::on_shell_event`]'s `PanelChanged`
     /// notifications — the single channel through which the runner reports its own
     /// state — and compared against the shadow's `active_panel_id()`/`ext_panel_active`

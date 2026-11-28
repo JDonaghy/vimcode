@@ -509,7 +509,7 @@ fn to_quadraui_theme_chrome(theme: &Theme) -> quadraui::Theme {
         annotation_fg: theme.annotation_fg,
         ghost_text_fg: theme.ghost_text_fg,
 
-        // ── Board / kanban — vimcode's `PANEL_BOARD` / `Backend::draw_board`
+        // ── Board / kanban — vimcode's `PANEL_BOARD` / `DrawsPrimitives::draw_primitive`
         // have no vimcode-native theme mapping; reuse the closest existing
         // semantic colour rather than leaving them on quadraui's dark default.
         // Board's selected-card / column-header look like a ListView selection /

@@ -36,7 +36,7 @@ impl App {
         // backends where it's toggled), and the stale-hamburger-corner-click guard
         // manages spurious state. A no-op on backends that don't toggle the menu bar;
         // see `render::route_menu_bar_reveal`'s own doc. Must run before the
-        // `MenuSystem` intercept just below, since the reveal has to take effect in
+        // `AppMenu` intercept just below, since the reveal has to take effect in
         // the *same* dispatch that intercept reads `menu_bar_visible` from.
         let menu_bar_reveal_reaction = {
             let mut engine = self.engine.borrow_mut();
@@ -61,8 +61,8 @@ impl App {
         // ── Menu system intercept ────────────────────────────────────────────
         // GTK's menu bar is always visible (see `ShellApp::setup`) and its
         // dropdown overlay must intercept keys/clicks before the sidebar or
-        // editor sees them — same precedence TUI uses (mod.rs "MenuSystem
-        // intercept" block) via the identical shared `menu_system.handle()`.
+        // editor sees them — same precedence TUI uses (mod.rs "AppMenu
+        // intercept" block) via the identical shared `app_menu.handle()`.
         //
         // Also gated on the dropdown genuinely
         // being closed OR the change-review surface being closed. The menu
@@ -70,23 +70,24 @@ impl App {
         // starts right after the app icon, `bar_rect.width` spans the rest
         // of the window) — exactly where the change-review surface's first
         // diff rows paint, since that surface is genuinely full-viewport.
-        // Without this, `menu_system.handle` treated a click on those rows
+        // Without this, `app_menu.handle` treated a click on those rows
         // as landing on "File" (or whichever label happens to share that
         // band) and returned `StateChanged`/`Activated`, swallowing the
         // click into a menu open/highlight instead of ever reaching
         // `handle_mouse_click_msg`. An *already-open* dropdown still wins
-        // regardless (`menu_system.borrow().is_open()`), matching every
+        // regardless (`app_menu.borrow().is_open()`), matching every
         // other "topmost modal wins" precedent in this function — only the
         // idle bar itself yields.
-        let (menu_bar_visible, menu_bar_toggleable, menu_system) = {
+        let (menu_bar_visible, menu_bar_toggleable, app_menu, app_menu_state) = {
             let eng = self.engine.borrow();
             (
                 eng.menu_bar_visible,
                 eng.menu_bar_toggleable,
-                eng.menu_system.clone(),
+                eng.app_menu.clone(),
+                eng.app_menu_state.clone(),
             )
         };
-        let menu_open = menu_system.borrow().is_open();
+        let menu_open = app_menu.borrow().is_open();
         let change_review_open = self.engine.borrow().change_review.is_some();
         // A *closed* dropdown must not be opened by an Alt+<mnemonic>
         // `KeyPressed` while the engine is mid-text-entry (Insert/Replace) or
@@ -127,34 +128,42 @@ impl App {
             );
             // With no dropdown open, a pointer past the last label is
             // `Ignored` so the Command Center and window controls receive
-            // it; a hover leaving the labels is still cleared, and
-            // `view_changed` asks for the repaint that shows it.
-            let menu_event = menu_system.borrow_mut().handle(&event, backend, bar_rect);
-            if menu_event == quadraui::MenuEvent::Ignored && menu_system.borrow().view_changed() {
+            // it; a hover leaving the labels is still cleared, and a view
+            // that moved asks for the repaint that shows it.
+            let view_before = app_menu.borrow().view.clone();
+            let menu_event = app_menu.borrow_mut().handle_ui_event(
+                &mut app_menu_state.borrow_mut(),
+                &event,
+                backend,
+                bar_rect,
+            );
+            if matches!(menu_event, quadraui::Handled::Ignored)
+                && app_menu.borrow().view != view_before
+            {
                 self.draw_needed.set(true);
             }
             match menu_event {
-                quadraui::MenuEvent::Activated(id) => {
+                quadraui::Handled::Event(quadraui::AppMenuEvent::Activated(id)) => {
                     self.handle_menu_action(id.as_str().to_string());
                     self.draw_needed.set(true);
                     return quadraui::Reaction::Redraw;
                 }
-                quadraui::MenuEvent::StateChanged | quadraui::MenuEvent::Consumed => {
+                quadraui::Handled::Event(_) | quadraui::Handled::Consumed => {
                     self.draw_needed.set(true);
                     return quadraui::Reaction::Redraw;
                 }
                 // A dropdown that was genuinely open (`menu_open`, not just the bar revealed)
                 // and a `KeyPressed` it doesn't recognise (anything but Escape/arrows/Enter/
                 // a matching Alt+<letter>, all handled above) falls all the way through to
-                // `Ignored` — type-ahead is off, so `quadraui::MenuSystem::handle` reports the
+                // `Ignored` — type-ahead is off, so `quadraui::AppMenu::handle` reports the
                 // key unhandled and does not dismiss itself. Left alone, the dropdown stays `is_open()`
                 // and keeps painting every subsequent frame while this same event keeps
                 // flowing to the Vim/editor dispatch below and is applied there as normal —
                 // so a key sequence that happens to open a menu leaves every following
                 // keystroke editing the buffer correctly *underneath* a dropdown that
-                // visually never goes away. Closing here mirrors `MenuSystem::handle`'s own
+                // visually never goes away. Closing here mirrors `AppMenu::handle`'s own
                 // `handle_escape` for the one case that handler can't reach: the key wasn't
-                // Escape, so `MenuSystem::handle` never ran that arm itself.
+                // Escape, so `AppMenu::handle` never ran that arm itself.
                 //
                 // This lives in *shared* `handle_dispatch`, not TUI-side wiring, so the same
                 // dismiss-on-unrecognised-key behaviour lands on GTK and macOS too, where
@@ -169,13 +178,12 @@ impl App {
                 // worse failure mode. A plain Escape close already leaves the toggleable bar
                 // row itself visible too, so an unrecognised key closing only the dropdown —
                 // and letting the key fall through — is the narrower, consistent fix.
-                quadraui::MenuEvent::Ignored => {
+                quadraui::Handled::Ignored => {
                     if menu_open && matches!(event, UiEvent::KeyPressed { .. }) {
-                        menu_system.borrow_mut().close(backend);
+                        app_menu.borrow_mut().dismiss(backend);
                         self.draw_needed.set(true);
                     }
                 }
-                _ => {}
             }
         }
 
@@ -396,6 +404,7 @@ impl App {
                         // scratch: never touched under mutate_focus: false — see click.rs:233-320
                         &mut quadraui::DragState::default(),
                         false, // no Alt-fine-seek context for a plain mouse-move
+                        backend.paint_surface(),
                     );
                     let had_hover = engine.editor_hover.is_some();
                     // Popup keep-alive is geometry-independent on purpose:
@@ -538,84 +547,12 @@ impl App {
             _ => {}
         }
 
-        // Rescue a double-click that folded away an activity-bar panel switch.
-        // `quadraui::AppShell::handle` only matches a plain `UiEvent::MouseDown` for
-        // activity-bar hit-testing — every other event variant, `DoubleClick` included,
-        // falls through its own `_ => AppShellEvent::Ignored` arm. `quadraui::dispatch::
-        // DoubleClickDetector` folds a press into a `DoubleClick` whenever it lands
-        // within its radius of the previous press within `DOUBLE_CLICK_MS` (400ms).
-        // Only `TuiBackend` runs the *default* 1.5-*cell* radius (TUI's own character-
-        // grid unit, where adjacent activity-bar rows are exactly 1.0 cell apart);
-        // `MacBackend` uses 4.0 *points*, explicitly because the cell-tuned 1.5 is
-        // meaningless in AppKit's point-precision coordinates — so adjacent-row folding
-        // is a TUI-only failure mode. On TUI, two genuinely distinct, fast real clicks
-        // on *adjacent* icons land within that 1.5-cell radius and fold into one
-        // `DoubleClick`, which the activity bar has no handler for — the second click
-        // is silently dropped and the sidebar stays on whatever panel was already
-        // active. Re-synthesize the dropped click as the plain `MouseDown` it was
-        // always meant to be and feed it back through the shell's own *public*
-        // `handle()` — the exact dispatch a real single click takes — rather than
-        // hand-rolling an activity-bar hit-test here. That keeps this "thin event-to-
-        // engine wiring" against the existing public API, shared once in `App`, so both
-        // backends pick up the fix from one place.
-        //
-        // The synthetic is hard-coded to `MouseButton::Left` because `UiEvent::
-        // DoubleClick` carries no button — `DoubleClickDetector` folds same-button
-        // pairs of any button, so a fast double-*right*-click on the activity bar is
-        // replayed as a left click. Harmless in practice (it only switches panels),
-        // but worth flagging since it's not quite faithful replay.
-        //
-        // Note this also changes behaviour on every backend: a genuine fast double-
-        // click on an activity-bar icon that is *already active* used to be swallowed
-        // as `Ignored` (the first click already toggled the sidebar hidden); it is now
-        // replayed as a second plain `MouseDown`, which `AppShell::handle_activity_click`
-        // treats as a toggle and re-shows the sidebar. That is arguably more VS-Code-
-        // like, but it is a user-visible semantic change.
-        if let UiEvent::DoubleClick { position, .. } = &event {
-            let position = *position;
-            let viewport = backend.viewport();
-            let area = quadraui::Rect::new(0.0, 0.0, viewport.width, viewport.height);
-            // Recompute the layout fresh (not `ctx.layout`, the cached
-            // per-frame copy) so this gate agrees with the hit-test
-            // `handle()` performs two lines down, matching
-            // `render::route_menu_bar_reveal`'s own
-            // `ctx.shell().layout(area, backend.line_height())` pattern for
-            // the same "gate must match the hit-test" reason: both run
-            // inside `handle_dispatch`, which can have already mutated
-            // shell chrome earlier in this same dispatch.
-            let layout = ctx.shell().layout(area, backend.line_height());
-            if layout.activity_bar_bounds.contains(position) {
-                let synthetic = UiEvent::MouseDown {
-                    widget: None,
-                    button: MouseButton::Left,
-                    position,
-                    modifiers: quadraui::Modifiers::default(),
-                };
-                let shell_ev = ctx.shell_mut().handle(&synthetic, &*backend, area);
-                if !matches!(shell_ev, quadraui::AppShellEvent::Ignored) {
-                    quadraui::ShellApp::on_shell_event_ctx(self, &shell_ev, ctx);
-                    self.draw_needed.set(true);
-                    return if self.draw_needed.get() {
-                        self.draw_needed.set(false);
-                        quadraui::Reaction::Redraw
-                    } else {
-                        quadraui::Reaction::Continue
-                    };
-                }
-                // `shell_ev` was `Ignored` (e.g. the double-click landed in
-                // the activity bar's bounds but hit no zone) — fall through
-                // to the rest of the dispatch pipeline instead of
-                // unconditionally consuming it, same as every other arm in
-                // this function.
-            }
-        }
-
         // ── Plugin-view modal ────────────────────────────────────────────
         // `vimcode.ui.open_view(name, {location = "modal"})` owns every
         // pointer event while open, ahead of the sidebar/editor routers below
         // (the modal is centred, so it overlaps the sidebar too): a left
         // press (or double-click, which the modal treats as the press it
-        // contains — `handle_plugin_view_modal_ui_event` probes `FormController`
+        // contains — `handle_plugin_view_modal_ui_event` probes `ScrolledForm`
         // with exactly that translation) routes through
         // `render::route_plugin_view_modal_click`, a wheel notch scrolls the
         // modal's body, and every other pointer event is swallowed so nothing
@@ -682,7 +619,7 @@ impl App {
             } => {
                 // Kept alongside the decoded `key_name`/`unicode` below
                 // so the folder-picker rung in `handle_key_press` can feed
-                // `FolderPickerController::handle` the *original* event
+                // `FolderPicker::handle` the *original* event
                 // instead of a re-encoded one — mirrors TUI's `dap_event`
                 // (`shell_app.rs`).
                 let raw_event = UiEvent::KeyPressed {
@@ -805,7 +742,7 @@ impl App {
             UiEvent::CharTyped(c) => {
                 // Ctrl-modified characters arrive via KeyPressed; CharTyped is
                 // for IME-composed printable characters only. Per
-                // `FolderPickerController::handle`'s own contract this is
+                // `FolderPicker::handle`'s own contract this is
                 // never the folder picker's typing source either, so passing
                 // it through as the "raw event" is correct, not a stand-in.
                 self.handle_key_press(
@@ -843,8 +780,8 @@ impl App {
                 // Fired by a *native* OS menu bar (macOS `NSMenu` via
                 // `Backend::install_menu_bar`) — see the doc comment on
                 // `UiEvent::MenuActivated` distinguishing it from the drawn
-                // `MenuSystem`'s click path, which resolves to
-                // `quadraui::MenuEvent::Activated` further up in this same
+                // `AppMenu`'s click path, which resolves to
+                // `quadraui::AppMenuEvent::Activated` further up in this same
                 // method and calls this identical dispatcher. One action
                 // path for both, not two: `render::build_menu_defs` gave
                 // every leaf item's `WidgetId` the same string as its
@@ -893,14 +830,14 @@ impl App {
                 match button {
                     MouseButton::Left if modifiers.ctrl => {
                         self.handle_ctrl_mouse_click(
-                            &*backend,
+                            &mut *backend,
                             position.x as f64,
                             position.y as f64,
                         );
                     }
                     MouseButton::Left => {
                         self.handle_mouse_click_msg(
-                            &*backend,
+                            &mut *backend,
                             position.x as f64,
                             position.y as f64,
                             w,
@@ -971,7 +908,11 @@ impl App {
                 self.draw_needed.set(true);
             }
             UiEvent::DoubleClick { position, .. } => {
-                self.handle_mouse_double_click_msg(&*backend, position.x as f64, position.y as f64);
+                self.handle_mouse_double_click_msg(
+                    &mut *backend,
+                    position.x as f64,
+                    position.y as f64,
+                );
                 self.draw_needed.set(true);
             }
             UiEvent::MouseMoved { position, buttons } => {
@@ -1015,7 +956,7 @@ impl App {
                         render::main_content_true_height(ctx.layout),
                     );
                     self.handle_mouse_drag_msg(
-                        &*backend,
+                        &mut *backend,
                         position.x as f64,
                         position.y as f64,
                         viewport,
@@ -1260,8 +1201,8 @@ impl App {
     /// `ShellContext`-aware) hook the runner calls. This plain inherent method is
     /// called directly by `on_shell_event_ctx` instead of dispatching through the
     /// deprecated trait method — `App` no longer overrides `on_shell_event` at all.
-    pub(crate) fn dispatch_shell_event(&mut self, event: &quadraui::AppShellEvent) {
-        use quadraui::AppShellEvent;
+    pub(crate) fn dispatch_shell_event(&mut self, event: &quadraui::ShellEvent) {
+        use quadraui::ShellEvent;
         // The shadow-`engine.app_shell` sync, unconditionally and
         // first — see `render::sync_shell_event_shadow`'s rung comment for
         // why this call has to come before any of the id-specific branching
@@ -1271,7 +1212,7 @@ impl App {
             render::sync_shell_event_shadow(event, &mut engine);
         }
         match event {
-            AppShellEvent::PanelChanged { panel_id } => {
+            ShellEvent::PanelChanged { panel_id } => {
                 // The hamburger panel only exists on the `cell` profile (`Self::shell_config`) —
                 // reveal the menu bar instead of switching to a nonexistent shadow panel.
                 // Mirrors the pre-refactor TUI shell's own hamburger arm, now shared via
@@ -1281,7 +1222,7 @@ impl App {
                     self.last_shell_panel = Some(*panel_id);
                     return;
                 }
-                // Record what the runner's own `AppShell` now
+                // Record what the runner's own `ShellView` now
                 // believes is active, whether this notification came from
                 // a real click or from `take_requested_panel`'s own echo
                 // below — see `Self::last_shell_panel`'s doc.
@@ -1298,9 +1239,9 @@ impl App {
                     return;
                 }
                 // Plugin-provided panels are now real `PanelDefinition`s
-                // in the runner's `AppShell` (`build_shell_config`), so their
+                // in the runner's `ShellView` (`build_shell_config`), so their
                 // icon clicks arrive here like any built-in panel's. They are
-                // *not* engine-`AppShell` panels though — `render_content`
+                // *not* engine-`ShellView` panels though — `render_content`
                 // dispatches on `engine.ext_panel_active`, which
                 // `sync_shell_event_shadow` deliberately leaves untouched for
                 // an `ext:` id (see that function's doc) — so route them
@@ -1329,7 +1270,7 @@ impl App {
                     .focus_sidebar_panel(panel_id.as_str());
                 self.draw_needed.set(true);
             }
-            AppShellEvent::SidebarHidden => {
+            ShellEvent::SidebarHidden => {
                 // A real panel's own second click — the hamburger's
                 // is intercepted by `Self::on_shell_event_ctx` before it
                 // ever reaches this ctx-less method (see that method's own
@@ -1337,7 +1278,7 @@ impl App {
                 render::disarm_hamburger_stale_click_guard(&mut self.engine.borrow_mut());
                 // This is also how a *second* click on an open extension panel's icon arrives —
                 // `sync_shell_event_shadow` already dropped the plugin panel's claim. Re-opening
-                // still works: `AppShell::handle_activity_click` reports a click on the active
+                // still works: `ShellView::handle_activity_click` reports a click on the active
                 // panel as `PanelChanged`, not `SidebarHidden`, once the sidebar is hidden.
                 //
                 // `Engine::clear_sidebar_focus()` — a real second click must clear the sidebar's
@@ -1349,10 +1290,10 @@ impl App {
                 self.engine.borrow_mut().clear_sidebar_focus();
                 self.draw_needed.set(true);
             }
-            AppShellEvent::SidebarResized { .. } => {
+            ShellEvent::SidebarResized { .. } => {
                 render::disarm_hamburger_stale_click_guard(&mut self.engine.borrow_mut());
             }
-            AppShellEvent::BottomItemClicked { id } => {
+            ShellEvent::BottomItemClicked { id } => {
                 render::disarm_hamburger_stale_click_guard(&mut self.engine.borrow_mut());
                 // The runner treats bottom activity-bar items as action buttons (not sidebar
                 // panels), so it never toggles or hides on its own — it only ever reports the
@@ -1364,7 +1305,7 @@ impl App {
                 // decision from one place.
                 self.switch_panel(id.as_str().to_string());
             }
-            // Every remaining `AppShellEvent` variant is likewise a
+            // Every remaining `ShellEvent` variant is likewise a
             // shell-consumed user interaction — spend the guard and let any
             // variant quadraui adds later default to the safe direction
             // (mirrors TUI's identical catch-all).
@@ -1379,7 +1320,7 @@ impl App {
 /// backend) and be at least one full line tall.
 ///
 /// This should hold on *every* backend by construction: quadraui's
-/// `compose::app_shell::compute_layout` derives `AppShellLayout::main_content_bounds`
+/// `compose::app_shell::compute_layout` derives `ShellLayout::main_content_bounds`
 /// from this exact `viewport`. The `shell_config` opts into quadraui's own
 /// `with_command_line()`/`with_status_bar()` bands — but only so the reserved
 /// space is excluded from interactive area bounds; `h` here is

@@ -64,7 +64,7 @@ impl Engine {
     /// [`Self::derived_sidebar_visible`], regardless of which direction it
     /// currently disagrees in.
     ///
-    /// `self.app_shell` is a fully independent [`quadraui::AppShell`]
+    /// `self.app_shell` is a fully independent [`quadraui::ShellView`]
     /// instance from the one the TUI runner actually paints through. It only
     /// gets to the right answer at construction time (`Engine::new_from_state`
     /// derives it there, once, before anything else can touch it) — a
@@ -114,9 +114,9 @@ pub const PANEL_SETTINGS: &str = "bottom:settings";
 /// Activity-bar item id for the hamburger (menu) slot — keyboard index 0.
 ///
 /// This slot is the one activity-bar id shared across both the fixed panel
-/// id space and the [`quadraui::AppShell`] instance's own id space.
+/// id space and the [`quadraui::ShellView`] instance's own id space.
 /// `render::build_activity_bar` mints this id for its hamburger
-/// `ActivityItem`, and the engine's shadow `AppShell` registers it as a
+/// `ActivityItem`, and the engine's shadow `ShellView` registers it as a
 /// panel.
 ///
 /// GTK paints no hamburger (`include_hamburger = false`), but the slot still
@@ -153,7 +153,7 @@ pub fn ext_panel_name_from_id(id: &str) -> Option<&str> {
 
 /// The single source of truth for the fixed (non-hamburger, non-settings,
 /// non-dynamic-extension) activity-bar panel order. `render::build_activity_bar`
-/// and the engine's shadow `AppShell` construction both iterate this rather
+/// and the engine's shadow `ShellView` construction both iterate this rather
 /// than hand-transcribing the order twice — a reordering here is now a
 /// one-line change both call sites pick up.
 ///
@@ -170,7 +170,7 @@ pub const FIXED_ACTIVITY_PANEL_IDS: [&str; 7] = [
     PANEL_BOARD,
 ];
 
-/// Title/tooltip pair the engine's own "shadow" `AppShell` (see
+/// Title/tooltip pair the engine's own "shadow" `ShellView` (see
 /// [`Engine::sync_app_shell_sidebar_visibility`]'s doc for what that means)
 /// shows for a built-in panel id — one entry per id in
 /// [`FIXED_ACTIVITY_PANEL_IDS`] plus [`PANEL_SETTINGS`].
@@ -193,7 +193,7 @@ fn fixed_panel_title_tooltip(id: &str) -> (&'static str, &'static str) {
     }
 }
 
-/// The engine's shadow `AppShell`'s panel list: [`FIXED_ACTIVITY_PANEL_IDS`]
+/// The engine's shadow `ShellView`'s panel list: [`FIXED_ACTIVITY_PANEL_IDS`]
 /// in order, then [`PANEL_SETTINGS`] last, each with an empty icon (the
 /// engine is backend-agnostic — see `App::shell_config`'s doc for who fills
 /// icons in) and title/tooltip from [`fixed_panel_title_tooltip`].
@@ -223,8 +223,8 @@ pub fn engine_app_shell_panel_definitions() -> Vec<quadraui::PanelDefinition> {
 /// The activity bar's *painted* order is hamburger, the fixed panels, the
 /// dynamic extension panels, then Settings pinned to the bottom — but the
 /// legacy `activity_bar_selected` index space numbers Settings **before**
-/// the extension panels, a mismatch that predates the `AppShell` migration.
-/// Since the migration, stepping is done by `AppShell`'s cursor over the
+/// the extension panels, a mismatch that predates the `ShellView` migration.
+/// Since the migration, stepping is done by `ShellView`'s cursor over the
 /// *painted* order and these constants are a lookup table rather than a
 /// sequencing rule.
 pub const TOOLBAR_IDX_SETTINGS: u16 = FIXED_ACTIVITY_PANEL_IDS.len() as u16 + 1;
@@ -240,7 +240,7 @@ impl Engine {
     ///
     /// Both backends' `ShellConfig` builders append this to their static
     /// panel list, and the TUI additionally re-syncs it into the live
-    /// `AppShell` after every dispatch so a plugin that registers a panel
+    /// `ShellView` after every dispatch so a plugin that registers a panel
     /// *after* startup still gets an icon.
     ///
     /// Sorted by name to match the order both the legacy rendering path and
@@ -483,8 +483,8 @@ impl Engine {
         self.app_shell.set_activity_keyboard_focused(false);
     }
 
-    /// Sync the engine's toolbar index to the real `AppShell` cursor so the
-    /// TUI path (which reads `AppShell::build_activity_bar`) highlights the
+    /// Sync the engine's toolbar index to the real `ShellView` cursor so the
+    /// TUI path (which reads `ShellView::build_activity_bar`) highlights the
     /// correct row.
     fn sync_activity_cursor_to_app_shell(&mut self) {
         let Some(id) = self.activity_bar_selected_item_id() else {
@@ -509,12 +509,12 @@ impl Engine {
     }
 
     /// The activity bar's items **in painted order**, as a throwaway
-    /// [`quadraui::AppShell`] whose keyboard cursor does the stepping for
+    /// [`quadraui::ShellView`] whose keyboard cursor does the stepping for
     /// [`Self::activity_bar_move_down`] / [`Self::activity_bar_move_up`].
     ///
     /// Panel list and bottom-item list mirror the TUI's live `ShellConfig`:
     /// hamburger, the fixed panels, the dynamic extension panels sorted by
-    /// name, then Settings pinned to the bottom. `AppShell`'s cursor spans
+    /// name, then Settings pinned to the bottom. `ShellView`'s cursor spans
     /// `panels` then `bottom_items` as one sequence and saturates at both ends,
     /// which is vimcode's ordering — no vimcode-side arithmetic is needed.
     ///
@@ -524,7 +524,7 @@ impl Engine {
     ///
     /// Only ids matter here, so icon/tooltip/title are left empty — nothing
     /// paints this shell.
-    fn activity_nav_shell(&self) -> quadraui::AppShell {
+    fn activity_nav_shell(&self) -> quadraui::ShellView {
         fn def(id: &str) -> quadraui::PanelDefinition {
             quadraui::PanelDefinition {
                 id: quadraui::WidgetId::new(id),
@@ -539,7 +539,7 @@ impl Engine {
         // Same list, same sort order, that both backends' `ShellConfig`
         // builders and `render::build_activity_bar` use.
         panels.extend(self.ext_activity_panels());
-        quadraui::AppShell::new(panels, 0.0).with_bottom_items(vec![def(PANEL_SETTINGS)])
+        quadraui::ShellView::new(panels, 0.0).with_bottom_items(vec![def(PANEL_SETTINGS)])
     }
 
     /// The activity-bar item id at keyboard (toolbar) index `idx`, or `None`
@@ -611,7 +611,7 @@ impl Engine {
     }
 
     /// Step the activity-bar keyboard cursor by delegating to
-    /// [`quadraui::AppShell`]'s `activity_select_next`/`activity_select_prev`
+    /// [`quadraui::ShellView`]'s `activity_select_next`/`activity_select_prev`
     /// over [`Self::activity_nav_shell`].
     ///
     /// Translates the stored `activity_bar_selected` index into the shell's
@@ -620,7 +620,7 @@ impl Engine {
     ///
     /// A selection that names no item — a stale extension index left behind
     /// when `:PluginReload` dropped a panel — is clamped to the last item
-    /// before stepping, mirroring what `AppShell::remove_panel` does to its
+    /// before stepping, mirroring what `ShellView::remove_panel` does to its
     /// own cursor. Without that the cursor would be wedged: every subsequent
     /// `j`/`k` would find no id to start from and refuse to move.
     fn activity_bar_step(&mut self, forward: bool) {

@@ -15,7 +15,7 @@ use super::*;
 // different questions. What's shared is what happens once that geometry and
 // the event are in hand.
 
-/// Route an explorer-sidebar event through the shared `TreeController`
+/// Route an explorer-sidebar event through the shared `TreeView`
 /// widget and resolve the result against the engine.
 ///
 /// The tree hit-tests against `backend`'s current metrics, so a pixel
@@ -45,7 +45,7 @@ pub fn route_explorer_tree_event(
     anchor_metrics: (f64, f64),
     theme: &Theme,
     backend: &mut dyn quadraui::Backend,
-) -> Option<quadraui::TreeControllerEvent> {
+) -> Option<quadraui::Handled<quadraui::TreeEvent>> {
     if rect.width <= 0.0 {
         return None;
     }
@@ -54,9 +54,11 @@ pub fn route_explorer_tree_event(
     let tree_event = engine
         .explorer_tree
         .borrow_mut()
-        .handle(event, backend, rect);
+        .handle(event, &*backend, rect);
 
-    if let quadraui::TreeControllerEvent::ContextMenuRequested { path, position } = &tree_event {
+    if let quadraui::Handled::Event(quadraui::TreeEvent::ContextMenuRequested { path, position }) =
+        &tree_event
+    {
         if let Some(&row_idx) = path.first() {
             let idx = row_idx as usize;
             let target_info = engine
@@ -226,7 +228,7 @@ pub fn route_tree_empty_space_context_menu(
 
 /// Dispatch a mouse/scroll event to the debug ("run and debug") sidebar's
 /// *body* — everything below its title + action-button chrome — through the
-/// shared `SidebarSystem` widget. The chrome band itself is
+/// shared `Sidebar` widget. The chrome band itself is
 /// [`dap_sidebar_action_click_at`], a separate function because it needs
 /// only a local point, not a whole event.
 pub fn dispatch_dap_sidebar_body_event(
@@ -237,9 +239,9 @@ pub fn dispatch_dap_sidebar_body_event(
 ) {
     populate_dap_sidebar_system(engine);
     let sidebar_event = engine
-        .dap_sidebar_system
+        .dap_sidebar
         .borrow_mut()
-        .handle(event, backend, rect);
+        .handle(event, &*backend, rect);
     engine.dispatch_dap_sidebar_event(sidebar_event);
 }
 
@@ -324,16 +326,16 @@ pub fn route_sc_sidebar_click(
 }
 
 /// Dispatch a mouse/scroll/keyboard [`quadraui::UiEvent`] to the AI assistant
-/// sidebar's `ChatController`. Shared by GTK and TUI, mirroring
+/// sidebar's `Chat`. Shared by GTK and TUI, mirroring
 /// [`route_explorer_tree_event`] and [`dispatch_dap_sidebar_body_event`]:
 /// `rect` must be the same rect the caller's last `ai_chat.borrow().render(
 /// backend, rect)` used (both backends cache it in `Engine::ai_chat_rect`), so
-/// `ChatController::handle_event` re-derives the identical layout `render()`
+/// `Chat::handle_event` re-derives the identical layout `render()`
 /// painted rather than risking drift a second hand-rolled geometry pass invites.
 ///
 /// Returns whether the panel should keep keyboard focus — see
 /// [`Engine::dispatch_ai_chat_event`], which this delegates the semantic
-/// event to after `ChatController::handle_event` resolves it.
+/// event to after `Chat::handle_event` resolves it.
 ///
 /// On GTK, `backend`'s "current" `line_height`/`char_width` — what
 /// [`quadraui::Backend::line_height`]/`char_width` actually read — are
@@ -358,23 +360,23 @@ pub fn route_ai_chat_event(
 
     // Plain `Enter` while a transcript turn (not the input) has
     // keyboard focus is the "keyboard toggle without a mouse" the issue
-    // asks for — `quadraui::ChatController::handle` already implements
+    // asks for — `quadraui::Chat::handle` already implements
     // exactly this gesture (see its module doc's Enter arm), but it acts on
     // its own *internal* `turn_collapsed` map, which `populate_ai_chat_
     // controller` overwrites from `AcpSession::thought_expanded`/
     // `tool_call_expanded` every frame (that function's doc explains why
-    // those two, not `ChatController`'s own map, are the source of truth).
+    // those two, not `Chat`'s own map, are the source of truth).
     // Left alone, an internal-only toggle would be invisible: the very next
     // frame's populate call stomps it straight back to whatever the
-    // vimcode-side maps say. Intercepted here, ahead of `ChatController::
-    // handle`, with the identical guard `ChatController` itself uses, so
+    // vimcode-side maps say. Intercepted here, ahead of `Chat::
+    // handle`, with the identical guard `Chat` itself uses, so
     // `Engine::ai_chat_toggle_turn` flips the persistent state instead.
     if let quadraui::UiEvent::KeyPressed { key, modifiers, .. } = event {
         if matches!(key, quadraui::Key::Named(quadraui::NamedKey::Enter)) && !modifiers.ctrl {
             let focused = {
                 let chat = engine.ai_chat.borrow();
-                (!chat.input_has_focus())
-                    .then(|| chat.focused_turn())
+                (!chat.input_has_focus)
+                    .then_some(chat.focused_turn)
                     .flatten()
             };
             if let Some(turn_idx) = focused {
@@ -386,7 +388,7 @@ pub fn route_ai_chat_event(
 
     // The `<leader>ai` focus-toggle gesture (see
     // `Engine::ai_leader_toggle_key`'s doc for why this has to be
-    // intercepted here, ahead of the ordinary `ChatController::handle`
+    // intercepted here, ahead of the ordinary `Chat::handle`
     // call, rather than reusing `Engine::handle_leader_key`). Checked before
     // the completion-popup intercepts below: `ai_leader_toggle_key` only
     // ever engages while the input is empty, which is also the one state a
@@ -426,7 +428,7 @@ pub fn route_ai_chat_event(
 
     // While the slash-command completion popup is showing,
     // steal Tab (cycle selection) and Enter (accept) before handing the
-    // event to `ChatController::handle` — the same "intercept the
+    // event to `Chat::handle` — the same "intercept the
     // accept/cycle keys, let everything else fall through unchanged" shape
     // the editor's own word-completion popup uses
     // (`Engine::insert_completion_intercepts_key`). This one shared call
@@ -466,12 +468,42 @@ pub fn route_ai_chat_event(
         }
     }
 
-    let result = engine
-        .ai_chat
-        .borrow_mut()
-        .handle_event(event, backend, rect);
-    match result {
-        quadraui::Handled::Ignored | quadraui::Handled::Consumed => true,
-        quadraui::Handled::Event(action) => engine.dispatch_ai_chat_event(action),
+    let driven = {
+        let chat = engine.ai_chat.borrow();
+        let mut state = engine.ai_chat_state.borrow_mut();
+        quadraui::drive_ui_event(&*chat, &mut state, event, &*backend, rect)
+    };
+    let Some(driven) = driven else {
+        return true;
+    };
+    // The widget reports what changed as `ChatEvent`s — its answer plus any
+    // it emitted on the way — and the descriptor is the app's to update:
+    // every one is written back with `Chat::apply` before the semantic ones
+    // reach the engine.
+    let mut actions = Vec::new();
+    if let quadraui::Handled::Event(action) = driven.handled {
+        actions.push(action);
     }
+    for emitted in driven.emitted {
+        if let quadraui::UiEvent::Chat(_, action) = emitted {
+            actions.push(action);
+        }
+    }
+    let mut keep_focus = true;
+    for action in actions {
+        engine.ai_chat.borrow_mut().apply(&action);
+        keep_focus = engine.dispatch_ai_chat_event(action);
+    }
+    keep_focus
+}
+
+/// Paint the AI chat into `rect` through the widget contract, with the
+/// widget's own interaction state lent to it for the paint.
+pub fn paint_ai_chat(engine: &Engine, backend: &mut dyn quadraui::Backend, rect: quadraui::Rect) {
+    let chat = engine.ai_chat.borrow();
+    let state = std::mem::take(&mut *engine.ai_chat_state.borrow_mut());
+    let (state, ()) = quadraui::lend_widget_state(chat.id, state, || {
+        quadraui::DrawsPrimitives::draw_dyn(backend, rect, &*chat, &());
+    });
+    *engine.ai_chat_state.borrow_mut() = state;
 }

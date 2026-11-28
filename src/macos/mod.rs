@@ -1,7 +1,7 @@
 //! Native macOS (AppKit) backend — a **wrapper**, not a backend.
 //!
 //! quadraui already ships the whole macOS backend: `MacBackend` implements
-//! every `Backend` trait method `AppShell` renders through, and
+//! every `Backend` trait method `ShellView` renders through, and
 //! [`quadraui::macos::shell_runner::run_with_shell`] composes it with the
 //! shared `ShellAdapter` exactly the way `quadraui::gtk::shell_runner` and
 //! `quadraui::tui::shell_runner` do. So there is nothing to
@@ -432,7 +432,7 @@ mod mac_driver_tests {
 
     /// The sidebar header row must come from vimcode's own theme on macOS
     /// too — the same regression the TUI backend covers. Before quadraui
-    /// picked up a fix, `AppShell::render` painted a hard-coded
+    /// picked up a fix, `ShellView::render` painted a hard-coded
     /// `Color::rgb(37, 37, 38)` (`#252526`) regardless of theme; under
     /// `vscode-light` that read as a dark band behind a light sidebar.
     /// Samples a pixel inside the header row's own painted-run bounds, on
@@ -452,7 +452,7 @@ mod mac_driver_tests {
         let (_guards, mut driver) = driver(engine);
         // `App::sync_per_frame_backend_state` pushes vimcode's theme onto
         // the backend at the *start* of `render_content`, which quadraui's
-        // shell runs *after* `AppShell::render` paints the header chrome —
+        // shell runs *after* `ShellView::render` paints the header chrome —
         // so the header's very first frame still reads whatever
         // `Backend::theme()` returned before any `set_theme` call ever
         // landed (quadraui's own dark `Theme::default()`). A second frame
@@ -837,7 +837,7 @@ mod mac_driver_tests {
     }
 
     /// A backend declaring `BackendCaps::native_menu` (macOS's
-    /// `MacBackend`) must not *also* paint the in-window `MenuSystem` row.
+    /// `MacBackend`) must not *also* paint the in-window `AppMenu` row.
     /// `App::setup` installs the native bar and sets `menu_bar_visible =
     /// false` when this cap is set.
     #[test]
@@ -902,8 +902,8 @@ mod mac_driver_tests {
 
     /// `UiEvent::MenuActivated` (fired by the native NSMenu installed
     /// via `Backend::install_menu_bar`) must reach the exact same
-    /// `App::handle_menu_action` dispatch the drawn `MenuSystem` dropdown's
-    /// `MenuEvent::Activated` already uses — one action path, not two.
+    /// `App::handle_menu_action` dispatch the drawn `AppMenu` dropdown's
+    /// `AppMenuEvent::Activated` already uses — one action path, not two.
     ///
     /// Uses the View menu's "Command Palette" (`action: "palette"`,
     /// `MENU_STRUCTURE` in `render.rs`) because its effect is unmistakably
@@ -1438,14 +1438,14 @@ mod mac_driver_tests {
     /// anywhere inside its own painted glyphs, must always toggle *that*
     /// section — never the log row painted immediately below it.
     ///
-    /// The SC panel routes every press through the *cached* `SidebarSystem`
+    /// The SC panel routes every press through the *cached* `Sidebar`
     /// layout (`Engine::handle_sc_sidebar_ui_event` ->
-    /// `sc_sidebar_system.handle_cached`) — the "good" pattern.
+    /// `sc_sidebar.handle_cached`) — the "good" pattern.
     ///
     /// Uses `crate::harness::sweep_hit_band_integrity_resetting` rather than
-    /// `sweep_hit_band_integrity`: quadraui's `SidebarSystem` treats two
+    /// `sweep_hit_band_integrity`: quadraui's `Sidebar` treats two
     /// `MouseDown`s at the same point in quick succession as a `DoubleClick`,
-    /// and `SidebarSystem::double_click` has no header case, so a headless
+    /// and `Sidebar::double_click` has no header case, so a headless
     /// driver's back-to-back click-then-click-to-restore on a header gets
     /// coalesced into a double-click that silently does nothing. `setup`
     /// instead re-expands the section directly before every sample.
@@ -1478,11 +1478,9 @@ mod mac_driver_tests {
              hiding the log entry; painted text was {:?}",
             driver.painted_texts()
         );
-        engine
-            .borrow_mut()
-            .sc_sidebar_system
-            .borrow_mut()
-            .set_collapsed(crate::core::engine::SC_SECTION_LOG, false);
+        engine.borrow_mut().sc_sidebar.borrow_mut().sidebar.sections
+            [crate::core::engine::SC_SECTION_LOG]
+            .collapsed = false;
         driver.render();
         assert!(
             driver.screen_contains("ZQXW971SCLOG0"),
@@ -1501,15 +1499,13 @@ mod mac_driver_tests {
                 // radius (real double-click detection, the same a live
                 // click would trigger), so back-to-back probe clicks would
                 // otherwise fold into a `DoubleClick`, which
-                // `SidebarSystem::double_click` doesn't handle for headers
+                // `Sidebar::double_click` doesn't handle for headers
                 // (this test's own doc). A throwaway click far outside the
                 // panel breaks the position match before every real probe.
                 d.click(W as f32 - 20.0, H as f32 - 20.0);
-                engine
-                    .borrow_mut()
-                    .sc_sidebar_system
-                    .borrow_mut()
-                    .set_collapsed(crate::core::engine::SC_SECTION_LOG, false);
+                engine.borrow_mut().sc_sidebar.borrow_mut().sidebar.sections
+                    [crate::core::engine::SC_SECTION_LOG]
+                    .collapsed = false;
                 d.render();
             },
             |d| ConformanceDriver::inventory(d).screen_has("ZQXW971SCLOG0"),
@@ -1551,7 +1547,7 @@ mod mac_driver_tests {
     /// content, not tab-bar chrome. `b` is opened last (and so starts
     /// active).
     ///
-    /// Deliberately just two tabs, no filler: `AppShell`'s sidebar is
+    /// Deliberately just two tabs, no filler: `ShellView`'s sidebar is
     /// visible by default and paints at `x: 48..374`, squarely under
     /// where an *earlier* tab (`a`, at `x` ~145..297) would land at this
     /// window width — `App::try_route_sidebar_mouse_event` arbitrates the
@@ -2219,7 +2215,7 @@ mod mac_driver_tests {
     // ── #1877: activity bar must end above the status/command-line chrome ──
 
     /// Look up a `quadraui::testing::ZoneRec`'s bounds by its registered
-    /// `WidgetId` string, for the assertions below. `AppShell::render`
+    /// `WidgetId` string, for the assertions below. `ShellView::render`
     /// registers one zone per chrome region it lays out (`register_chrome_
     /// zones`) plus one per activity-bar item (keyed by the item's own
     /// panel id) — see `quadraui::testing::FrameInventory`'s own doc for
@@ -2312,7 +2308,7 @@ mod mac_driver_tests {
     /// **What this does and does not pin (review round 1, non-blocking
     /// finding 4).** The Settings button's registered zone sat inside
     /// `activity_bar_bounds` both before and after this issue's fix —
-    /// `AppShell::handle`'s `contains(activity_bar_bounds, p)` hit-test
+    /// `ShellView::handle`'s `contains(activity_bar_bounds, p)` hit-test
     /// resolved a click there either way, reservation or not, so this
     /// test would also have passed on the pre-fix tree. It pins the
     /// issue's acceptance text ("a click on it opens settings") as a
@@ -2360,7 +2356,7 @@ mod mac_driver_tests {
     /// fixture, real window or not, since `MacBackend::backend_caps()`
     /// declares `native_menu: true` unconditionally (`App::setup` reads
     /// that to suppress the drawn menu row, independent of any window) —
-    /// so it reaches `backend.draw_solid_fill(menu_row_rect,
+    /// so it reaches `render::fill_solid(backend, menu_row_rect,
     /// theme.tab_bar_bg)` on every `MacDriver` run. What this test
     /// **cannot** independently
     /// prove is that this fill is *visible* — `Backend::titlebar_control_

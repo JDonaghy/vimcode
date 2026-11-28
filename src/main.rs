@@ -676,7 +676,7 @@ mod file_argument_launch_tests {
     /// anywhere on screen — a content-area signal driven by `Engine`'s
     /// shadow `app_shell` (sidebar visibility + active panel), unlike the
     /// chrome header text `" EXPLORER "` which only paints after a genuine
-    /// click/dispatch lands on the runner's own separate `AppShell` and so
+    /// click/dispatch lands on the runner's own separate `ShellView` and so
     /// never appears on a bare first frame either way. Every directory row
     /// in the tree paints one of these chevrons regardless of expansion
     /// state, so this is a reliable "is the tree painted at all" oracle
@@ -783,12 +783,12 @@ mod file_argument_launch_tests {
             engine.session.explorer_visible = false;
             engine.sync_app_shell_sidebar_visibility();
         });
-        // The runner's own `AppShell` (what actually paints) only learns
+        // The runner's own `ShellView` (what actually paints) only learns
         // the shadow's sidebar visibility once an event has dispatched
         // through it (`App::handle`'s `sync_runner_sidebar_visibility`
         // call, gated on `menu_bar_toggleable` which TUI's `setup` always
         // sets) — a bare `driver.render()` with no prior dispatch paints
-        // `quadraui::AppShell::new`'s construction-time default
+        // `quadraui::ShellView::new`'s construction-time default
         // regardless of engine state, which would make this assertion
         // pass unconditionally and catch nothing. `Escape` is a no-op in
         // Normal mode, so this dispatch doesn't itself change what should
@@ -814,7 +814,7 @@ mod file_argument_launch_tests {
     /// built; `App::shell_config()` reads the same
     /// `Engine::derived_sidebar_visible` formula via
     /// `quadraui::ShellConfig::with_sidebar_visible`, so the real, painting
-    /// runner `AppShell` already starts collapsed on frame 1 — no dispatched
+    /// runner `ShellView` already starts collapsed on frame 1 — no dispatched
     /// `UiEvent` is needed to pick it up.
     #[test]
     fn file_argument_on_launch_collapses_explorer() {

@@ -890,7 +890,7 @@ pub struct ScrollApplyContext {
 /// is a few dead arms, and the cost of *not* unioning it was a silently
 /// non-scrolling scrollbar.
 ///
-/// Some ids are handled entirely inside quadraui's `SidebarSystem`
+/// Some ids are handled entirely inside quadraui's `Sidebar`
 /// (`tui:search_results`, `debug_sidebar:*`); they return `true` so the caller
 /// still consumes the event rather than letting it fall through to the editor.
 pub fn apply_scroll_offset(
@@ -939,7 +939,7 @@ pub fn apply_scroll_offset(
             engine.settings_scroll_top = new_offset;
             true
         }
-        // Owned by quadraui's `SidebarSystem` — consume without applying.
+        // Owned by quadraui's `Sidebar` — consume without applying.
         "tui:search_results" => true,
         other if other.starts_with("debug_sidebar:") => true,
         // Editor window scrollbars. TUI encodes both axes as
@@ -1428,7 +1428,7 @@ pub struct ActivityPanelSwitch {
 /// Activate the activity-bar item for `panel_id` — click-on-an-icon behaviour.
 ///
 /// `panel_id` is either a built-in `PANEL_*` id or an `ext:{name}` plugin panel.
-/// Plugin panels bypass `AppShell` entirely, creating asymmetry both backends had
+/// Plugin panels bypass `ShellView` entirely, creating asymmetry both backends had
 /// grown their own copy to handle. The two copies had drifted:
 ///
 ///   * **Focus clear was TUI-only.** A plugin panel taking over the sidebar must
@@ -1502,7 +1502,7 @@ impl SidebarBodyGeometry {
 /// is outside the painted body, on the chrome above it, or past the last
 /// row (`TreeViewHit::Empty`).
 ///
-/// Reads `Engine::ext_panel_tree_layout` — the `Backend::tree_layout` cached
+/// Reads `Engine::ext_panel_tree_layout` — the `DrawsPrimitives::layout_primitive` cached
 /// by whichever paint arm ran this frame — rather than re-deriving row
 /// geometry from a uniform `row_h`; see that field's own doc for why
 pub fn ext_panel_hit_flat_index(engine: &Engine, pos: quadraui::Point) -> Option<usize> {
@@ -1704,7 +1704,7 @@ pub fn route_sidebar_hover(
         }
         SidebarOwner::ExtPanel(name) if inside => {
             let name = name.clone();
-            // Route through the same `Backend::tree_layout`-cached hit-test
+            // Route through the same `DrawsPrimitives::layout_primitive`-cached hit-test
             // `route_ext_panel_click` uses, not `SidebarBodyGeometry::
             // content_row`'s uniform-row-height formula: a real multi-section
             // panel pitches header rows and item rows differently on

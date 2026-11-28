@@ -48,13 +48,13 @@ impl Engine {
     // ── Menu bar ─────────────────────────────────────────────────────────────
 
     /// Toggle menu bar visibility. Does NOT close any open dropdown —
-    /// callers with backend access should call `menu_system.close()` when hiding.
+    /// callers with backend access should call `app_menu.close()` when hiding.
     pub fn toggle_menu_bar(&mut self) {
         self.menu_bar_visible = !self.menu_bar_visible;
     }
 
     /// Dispatch a menu action by command string. Called when
-    /// `MenuEvent::Activated(id)` fires — `id.as_str()` is the action.
+    /// `AppMenuEvent::Activated(id)` fires — `id.as_str()` is the action.
     pub fn dispatch_menu_action(&mut self, action: &str) -> EngineAction {
         if !self.is_vscode_mode() {
             self.mode = Mode::Normal;

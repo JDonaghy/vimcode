@@ -119,7 +119,7 @@ impl quadraui::ShellApp for App {
         }
         self.engine
             .borrow()
-            .menu_system
+            .app_menu
             .borrow_mut()
             .set_menus(menu_defs);
 
@@ -136,11 +136,7 @@ impl quadraui::ShellApp for App {
         self.sync_per_frame_backend_state(backend, &engine, &theme);
     }
 
-    fn render_content(
-        &self,
-        backend: &mut dyn quadraui::Backend,
-        layout: &quadraui::AppShellLayout,
-    ) {
+    fn render_content(&self, backend: &mut dyn quadraui::Backend, layout: &quadraui::ShellLayout) {
         let engine = self.engine.borrow();
         let theme = Theme::from_name(&engine.settings.colorscheme);
 
@@ -196,7 +192,7 @@ impl quadraui::ShellApp for App {
         // reservation active, or a window too short for either dimension to be
         // positive.
         if let Some(fill_rect) = render::bottom_chrome_reservation_fill_rect(layout) {
-            backend.draw_solid_fill(fill_rect, theme.tab_bar_bg);
+            render::fill_solid(backend, fill_rect, theme.tab_bar_bg);
         }
 
         // ── Layout ────────────────────────────────────────────────────────────
@@ -245,10 +241,7 @@ impl quadraui::ShellApp for App {
             cw,
             false,
             (self.units.breadcrumb_row_h)(lh),
-            self.units
-                .editor_v_scrollbar_w
-                .unwrap_or(0.0)
-                .max(backend.scrollbar_reserve()) as f64,
+            self.units.editor_v_scrollbar_w.unwrap_or(0.0) as f64,
             self.units.minimap,
         );
 
@@ -456,7 +449,7 @@ impl quadraui::ShellApp for App {
                 // gated on `presence.menu_dropdown`, which stays coupled to
                 // `menu_bar_visible` and so is also always `false` on macOS.
                 app_icon_rect = real_icon_rect;
-                (real_items_rect, engine.menu_system.borrow().menu_bar())
+                (real_items_rect, engine.app_menu.borrow().build_menu_bar())
             } else {
                 (
                     inset_menu_row_rect,
@@ -523,7 +516,7 @@ impl quadraui::ShellApp for App {
                 // a real titlebar. This is layout-only (`menu_bar_layout`, no draw): the
                 // bar itself is painted from the `FrameOp::MenuDropdown` arm below.
                 // Drawing the controls or the Command Center *here* is pointless because
-                // that later `menu_system.render()` repaints the menu bar across the
+                // that later `app_menu.render()` repaints the menu bar across the
                 // entire band and erases them. The actual measurement moved above the walk
                 // into the `presence.command_center` block, because the Command Center
                 // rung now composes even when this one does not (native-menu backends).
@@ -532,7 +525,7 @@ impl quadraui::ShellApp for App {
                 }
 
                 // ── Sidebar panel body ──────────────────────────────────────────
-                // The quadraui AppShell chrome (activity bar, sidebar header,
+                // The quadraui ShellView chrome (activity bar, sidebar header,
                 // separator) is painted by the runner before `render_content` is
                 // entered; this fills only the content area it exposes. The backend holds
                 // the editor's VS Code row-pitch override for the rest of this frame —
@@ -637,15 +630,14 @@ impl quadraui::ShellApp for App {
                 }
 
                 // ── Folder / workspace picker modal ──────────────────────────
-                // `quadraui::FolderPickerController::render` paints through
-                // the shared `Palette` primitive — the identical method
-                // TUI's `FrameOp::FolderPicker` arm calls, just with this
-                // backend's own (pixel-unit) popup rect.
+                // `quadraui::FolderPicker` paints through the widget
+                // contract as the shared `Palette` primitive, in this
+                // backend's own popup rect.
                 render::FrameOp::FolderPicker => {
                     if let Some(ref picker) = *self.folder_picker.borrow() {
                         let popup_rect =
                             render::folder_picker_popup_rect(popup_viewport, lh as f32);
-                        picker.render(popup_rect, backend);
+                        render::draw_widget_plain(backend, popup_rect, picker);
                         // Cache the *painted* rect — key/mouse
                         // handling read this instead of re-deriving it.
                         self.folder_picker_popup_rect.set(Some(popup_rect));
@@ -654,7 +646,7 @@ impl quadraui::ShellApp for App {
                 }
 
                 // ── Menu dropdown overlay ───────────────────────────────────────
-                // First rung of the band: `MenuSystem::render` repaints the menu bar
+                // First rung of the band: `AppMenu::render` repaints the menu bar
                 // across the whole title-bar strip, so nothing that wants to survive may
                 // be drawn into that band before it. Modal rungs paint above it — a modal
                 // dialog now covers an open dropdown on both backends, matching
@@ -675,7 +667,7 @@ impl quadraui::ShellApp for App {
                 }
 
                 // ── Command Center: nav arrows + search box ────────────────────
-                // Painted *after* `menu_system.render()` above, which repaints
+                // Painted *after* `app_menu.render()` above, which repaints
                 // the menu bar across the entire `menu_row_rect` band and would erase
                 // anything drawn here first — the identical ordering hazard documented on
                 // the window controls. On a native-menu backend (macOS) `presence.
@@ -687,7 +679,7 @@ impl quadraui::ShellApp for App {
                 // row — inset included — with the theme's title-bar colour first, so the
                 // traffic-light strip is themed, matching VS Code's own macOS title bar.
                 //
-                // The fill is a plain `draw_solid_fill`, same as every other background
+                // The fill is a plain `fill_solid`, same as every other background
                 // band in this file (see `paint_title_bar_band` above), never an empty
                 // filler `MenuBar` widget: on a native-menu backend
                 // painting a `MenuBar` doubles as the install point for the platform's real
@@ -700,7 +692,7 @@ impl quadraui::ShellApp for App {
                 render::FrameOp::CommandCenter => {
                     let mut row_filled = false;
                     if !presence.menu_row {
-                        backend.draw_solid_fill(menu_row_rect, theme.tab_bar_bg);
+                        render::fill_solid(backend, menu_row_rect, theme.tab_bar_bg);
                         row_filled = true;
                     }
                     let mut cc_painted = false;
@@ -735,7 +727,7 @@ impl quadraui::ShellApp for App {
                 // Confirmed to open in engine state with nothing painting on GTK.
                 // Unlike quickfix/panel_hover there was a dead painter to port —
                 // `draw.rs::draw_find_replace_popup` — but it routed through a rect the
-                // rasteriser ignores; calling `Backend::draw_find_replace` directly
+                // rasteriser ignores; calling `DrawsPrimitives::draw_primitive` directly
                 // (same trait method TUI calls) is simpler and identical in effect.
                 render::FrameOp::FindReplace => {
                     if let Some(ref find_replace) = screen.find_replace {
@@ -872,17 +864,17 @@ impl quadraui::ShellApp for App {
                 // ── Settings modal overlay ──────────────────────────────────────
                 // When the settings panel is open, paint it as a centred modal
                 // covering ~80 % of the viewport instead of inside the narrow
-                // sidebar.  Scrim → centred SidebarPanelBody + FormController,
+                // sidebar.  Scrim → centred SidebarPanelBody + ScrolledForm,
                 // exactly like the sidebar `PANEL_SETTINGS` arm in paint.rs but
                 // with a wider, self-contained rect.
                 render::FrameOp::SettingsModal => {
                     let scrim_rect =
                         render::modal_scrim_rect(&engine, &el, popup_viewport.width, y as f32, lh);
-                    // `draw_solid_fill` alpha-blends `MODAL_SCRIM_COLOR` into the
+                    // `fill_solid` alpha-blends `MODAL_SCRIM_COLOR` into the
                     // existing background on every backend (TUI included), so the
                     // dimmed editor/sidebar content stays visible behind the modal
                     // — the same unconditional scrim every other picker rung paints.
-                    backend.draw_solid_fill(scrim_rect, render::MODAL_SCRIM_COLOR);
+                    render::fill_solid(backend, scrim_rect, render::MODAL_SCRIM_COLOR);
 
                     // 80 % of the popup viewport, centred.
                     let modal_w = (popup_viewport.width * 0.8).round();
@@ -908,7 +900,7 @@ impl quadraui::ShellApp for App {
                         engine
                             .settings_form_controller
                             .borrow_mut()
-                            .render_and_cache(backend, body_rect);
+                            .paint(backend, body_rect);
                     });
                     if let Some(px) =
                         resolve_editor_line_height_px(&engine.settings, backend, editor_size_pt)
@@ -925,7 +917,7 @@ impl quadraui::ShellApp for App {
                 render::FrameOp::PluginViewModal => {
                     let scrim_rect =
                         render::modal_scrim_rect(&engine, &el, popup_viewport.width, y as f32, lh);
-                    backend.draw_solid_fill(scrim_rect, render::MODAL_SCRIM_COLOR);
+                    render::fill_solid(backend, scrim_rect, render::MODAL_SCRIM_COLOR);
                     let modal_rect = render::plugin_view_modal_rect(popup_viewport, cw as f32);
                     backend.set_editor_font(&editor_family, editor_size_pt);
                     render::paint_plugin_view_modal(&engine, modal_rect, &theme, backend);
@@ -1002,7 +994,7 @@ impl quadraui::ShellApp for App {
         if !had_context_menu_before {
             self.open_context_menu_now_if_native(backend);
         }
-        // Keep the runner's `AppShell` title-bar reservation in sync with
+        // Keep the runner's `ShellView` title-bar reservation in sync with
         // `engine.menu_bar_visible` — that flag can flip from several places
         // inside `handle_dispatch`, each with its own early `return`, so this
         // single choke point is what makes the sync unconditional. Gated on
@@ -1015,9 +1007,9 @@ impl quadraui::ShellApp for App {
         if self.engine.borrow().menu_bar_toggleable {
             render::sync_menu_bar_title_row(ctx, &self.engine.borrow());
         }
-        // Keep the runner's `AppShell` sidebar *visibility* in sync with the
+        // Keep the runner's `ShellView` sidebar *visibility* in sync with the
         // shadow's too, unconditionally on the toggleable-menu-bar profile
-        // (`menu_bar_toggleable`), where it corrects `AppShell::new`'s
+        // (`menu_bar_toggleable`), where it corrects `ShellView::new`'s
         // "active + visible" construction-time default away from the hamburger
         // *before* the very first hamburger click, so that click resolves as a
         // reveal rather than a toggle-hide. GTK/macOS/Win's existing call sites
@@ -1049,9 +1041,9 @@ impl quadraui::ShellApp for App {
     /// `engine.app_shell`/`engine.ext_panel_active` directly (the shadow),
     /// so a panel switch the engine makes on its own always painted the
     /// *right* content. But the runner's own chrome (the activity-bar
-    /// highlight, and the sidebar-header title `quadraui::AppShell::render`
+    /// highlight, and the sidebar-header title `quadraui::ShellView::render`
     /// paints) has no other channel to learn about the change — it only ever
-    /// moves in response to `AppShell::handle`'s own click hit-testing or
+    /// moves in response to `ShellView::handle`'s own click hit-testing or
     /// this poll. This override mirrors the pre-#1434 TUI shell's
     /// `take_requested_panel` with the same mechanics.
     fn take_requested_panel(&mut self) -> Option<quadraui::WidgetId> {
@@ -1082,28 +1074,28 @@ impl quadraui::ShellApp for App {
 
     /// Ctx-aware override: implements the context-aware shell event handling
     /// that the pre-existing ctx-less [`Self::on_shell_event`] cannot provide.
-    /// Some `AppShellEvent` arms (like `BottomItemClicked`) make decisions
+    /// Some `ShellEvent` arms (like `BottomItemClicked`) make decisions
     /// entirely within `engine.app_shell` that must be reflected back into
-    /// the runner's own `AppShell` on the same frame, so the runner knows
+    /// the runner's own `ShellView` on the same frame, so the runner knows
     /// what to render. `BottomItemClicked` is one such case: the runner never
     /// toggles a bottom item itself, so the toggle-to-hide decision is 100%
     /// made inside `on_shell_event`. Without this, `engine.app_shell.sidebar_visible()`
-    /// correctly flips, but the runner's `AppShell` — which determines whether
+    /// correctly flips, but the runner's `ShellView` — which determines whether
     /// `render_content`'s sidebar column exists — never learns.
     /// Push the shadow's new state through [`Self::sync_runner_sidebar_visibility`]
     /// so the runner stays in sync.
     fn on_shell_event_ctx(
         &mut self,
-        event: &quadraui::AppShellEvent,
+        event: &quadraui::ShellEvent,
         ctx: &quadraui::ShellContext<'_>,
     ) {
         // Special-case `SidebarHidden` for the hamburger panel: only `ctx`
-        // (the runner's own `AppShell`) can tell it from a real panel's second
+        // (the runner's own `ShellView`) can tell it from a real panel's second
         // click, because the shadow `engine.app_shell` has no hamburger
         // `PanelDefinition` at all (see `render::route_hamburger_panel_changed`'s
         // doc). This check is routed through `render::route_hamburger_sidebar_hidden`.
         // A no-op check on GTK/macOS/Win, which never register this panel id.
-        if matches!(event, quadraui::AppShellEvent::SidebarHidden)
+        if matches!(event, quadraui::ShellEvent::SidebarHidden)
             && ctx
                 .shell()
                 .active_panel_id()
@@ -1114,11 +1106,11 @@ impl quadraui::ShellApp for App {
             return;
         }
         self.dispatch_shell_event(event);
-        // A bottom item's click never moves the runner's real `AppShell` on its own.
+        // A bottom item's click never moves the runner's real `ShellView` on its own.
         // The `BottomItemClicked` arm only toggles the engine-side shadow via
         // `switch_panel`. Call `show_panel` or `hide_sidebar` on the runner's
-        // `AppShell` to keep it in sync with the shadow, so `render` knows what to title.
-        if let quadraui::AppShellEvent::BottomItemClicked { id } = event {
+        // `ShellView` to keep it in sync with the shadow, so `render` knows what to title.
+        if let quadraui::ShellEvent::BottomItemClicked { id } = event {
             if self.engine.borrow().app_shell.sidebar_visible() {
                 ctx.shell_mut().show_panel(id);
             } else {
@@ -1153,7 +1145,7 @@ impl App {
     /// Called from both [`quadraui::ShellApp::handle`] and
     /// [`quadraui::ShellApp::on_shell_event_ctx`]: `ShellAdapter::handle`
     /// (quadraui) consumes a mouse click that switches the active panel
-    /// entirely inside `AppShell::handle` and returns early through
+    /// entirely inside `ShellView::handle` and returns early through
     /// `notify_shell_event` — which calls `on_shell_event_ctx`, never
     /// `handle` — so a mouse-driven panel switch would otherwise never
     /// repaint the accent onto its new panel until some unrelated later

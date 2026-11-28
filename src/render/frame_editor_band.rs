@@ -27,7 +27,7 @@ use crate::core::engine::PluginViewHost;
 //
 // **Why here and not in quadraui** (`CLAUDE.md`'s "check quadraui first"):
 // the same verdict applies to this band as to slices 1 and 2. quadraui's
-// `compose::app_shell::AppShell` hands both backends the *shell's* zones and
+// `compose::app_shell::ShellView` hands both backends the *shell's* zones and
 // stops at `main_content_bounds`; what vimcode stacks inside that rect —
 // which of N editor groups gets a tab bar, where the breadcrumb row sits
 // relative to it, whether a group boundary gets a line — is vimcode's own
@@ -39,7 +39,7 @@ use crate::core::engine::PluginViewHost;
 // only per-backend *sequencing*, which is what this slice deletes.
 
 /// One rung of the shared **editor band** — the surfaces vimcode stacks
-/// inside `AppShellLayout::main_content_bounds`.
+/// inside `ShellLayout::main_content_bounds`.
 ///
 /// Deliberately unit-agnostic, exactly like [`FrameOp`]:
 /// the rung says *what* is painted and *in what order*, never where or how
@@ -483,7 +483,7 @@ pub(crate) fn paint_editor_band_rungs<'screen>(
 // vimcode, not a missing quadraui capability.
 
 /// One rung of the shared **bottom band** — the stack of chrome vimcode carves
-/// out of the bottom of `AppShellLayout::main_content_bounds`.
+/// out of the bottom of `ShellLayout::main_content_bounds`.
 ///
 /// Deliberately unit-agnostic, exactly like [`FrameOp`] and
 /// [`EditorOp`]: the rung says *what* is painted and *in what order*, never
@@ -695,7 +695,7 @@ pub fn paint_separated_status_rung(
 /// `App::compose_bottom_band_rungs`'s `SeparatedStatus` arm.
 ///
 /// Deliberately a *separate* paint rather than widening the real bar's own
-/// rect: AppShell's activity-bar/sidebar click hit-test runs before
+/// rect: ShellView's activity-bar/sidebar click hit-test runs before
 /// `App::handle` ever sees the event, so widening the real bar would move its
 /// segments' hit zones into screen positions a click can never actually reach.
 /// This backdrop carries no segments of its own, just the real bar's own fill
@@ -1050,7 +1050,7 @@ pub fn paint_bottom_panel_rung(
                         engine
                             .plugin_view_dock_form_controller
                             .borrow_mut()
-                            .render_and_cache(b, body);
+                            .paint(b, body);
                         paint_plugin_view_combo_box_dropdown(
                             engine,
                             name.as_str(),
@@ -1065,7 +1065,7 @@ pub fn paint_bottom_panel_rung(
                     // (`plugin_view_body.rs`'s `paint_plugin_view_list`'s
                     // `Dock => return false` arm) — see the comment above.
                     "list" => {}
-                    // Tree-kind bodies have no dock-hosted `TreeController`
+                    // Tree-kind bodies have no dock-hosted `TreeView`
                     // (deferred, like List/Table above).
                     "tree" => {}
                     // Table-kind bodies have no dock-hosted layout cache yet
@@ -1180,7 +1180,7 @@ pub fn draw_dividers_as_splits<D: DividerGeometry>(
 ) {
     for div in dividers {
         let (split, rect) = divider_to_split(div, id_for(div));
-        backend.draw_split(rect, &split);
+        quadraui::DrawsPrimitives::draw_primitive(backend, rect, &split);
     }
 }
 
@@ -1314,7 +1314,7 @@ pub(crate) mod tests {
         );
         assert!(
             pos(FrameOp::CommandCenter) > pos(FrameOp::MenuDropdown),
-            "`MenuSystem::render` repaints the menu bar across the whole \
+            "`AppMenu::render` repaints the menu bar across the whole \
              band, erasing a command centre drawn first (#676 on GTK, #712 on \
              TUI)"
         );
@@ -1353,7 +1353,7 @@ pub(crate) mod tests {
         // rung missing from the router falls through to the editor beneath it.
         for op in FRAME_Z_ORDER.into_iter().filter(|op| op.is_overlay()) {
             let arbitrated = MOUSE_ARBITRATION_ORDER.contains(&op);
-            // `MenuDropdown` / `CommandCenter`: routed through `MenuSystem::handle`
+            // `MenuDropdown` / `CommandCenter`: routed through `AppMenu::handle`
             // before this router runs. `FolderPicker` / `ChangeReview`: routed
             // directly at their own call sites instead.
             let routed_elsewhere = matches!(
@@ -1374,7 +1374,7 @@ pub(crate) mod tests {
         }
 
         // Chrome rungs are never arbitrated here: they route through
-        // `route_chrome_click` / `MenuSystem::handle`, not the modal ladder.
+        // `route_chrome_click` / `AppMenu::handle`, not the modal ladder.
         for op in FRAME_Z_ORDER.into_iter().filter(|op| !op.is_overlay()) {
             assert!(
                 !MOUSE_ARBITRATION_ORDER.contains(&op),
@@ -1490,10 +1490,10 @@ pub(crate) mod tests {
         )
     }
 
-    /// An `AppShellLayout` with every optional band absent — the shape a shell
+    /// An `ShellLayout` with every optional band absent — the shape a shell
     /// that reserved nothing hands back.
-    fn bare_shell_layout() -> quadraui::AppShellLayout {
-        quadraui::AppShellLayout {
+    fn bare_shell_layout() -> quadraui::ShellLayout {
+        quadraui::ShellLayout {
             window_bounds: quadraui::Rect::new(0.0, 0.0, 1400.0, 900.0),
             title_bar_bounds: None,
             activity_bar_bounds: quadraui::Rect::default(),
@@ -1511,7 +1511,7 @@ pub(crate) mod tests {
     /// degenerate shapes the driver-level tests cannot construct.
     #[test]
     fn compose_frame_gates_degenerate_bands_in_the_callers_units() {
-        let compose = |screen: &ScreenLayout, layout: &quadraui::AppShellLayout, m| {
+        let compose = |screen: &ScreenLayout, layout: &quadraui::ShellLayout, m| {
             compose_frame(&FramePresence::from_screen(screen, layout, m))
         };
         let mut screen = bare_screen_layout();

@@ -681,9 +681,9 @@ impl Engine {
         self.project_search_status = status;
         self.project_search_results = results;
         self.search_collapsed_files.borrow_mut().clear();
-        self.search_sidebar_system
-            .borrow_mut()
-            .set_selected_path(1, None);
+        if let Some(tree) = self.search_sidebar.borrow_mut().sidebar.tree_mut(1) {
+            tree.selected_path = None;
+        }
     }
 
     /// Toggle case-sensitive project search and re-run if a query exists.
@@ -982,9 +982,7 @@ impl Engine {
             }
             self.search_panel_form_focus
                 .replace(Some("search:query".to_string()));
-            self.search_sidebar_system
-                .borrow_mut()
-                .set_active_section(Some(0));
+            self.search_sidebar.borrow_mut().sidebar.active_section = Some(0);
         }
     }
 
@@ -993,9 +991,7 @@ impl Engine {
     pub fn search_switch_to_results(&mut self) {
         if self.search_has_focus && !self.project_search_results.is_empty() {
             self.search_panel_form_focus.replace(None);
-            self.search_sidebar_system
-                .borrow_mut()
-                .set_active_section(Some(1));
+            self.search_sidebar.borrow_mut().sidebar.active_section = Some(1);
         }
     }
 
@@ -1012,7 +1008,7 @@ impl Engine {
     }
 
     // =======================================================================
-    // SidebarSystem unified dispatch
+    // Sidebar unified dispatch
     // =======================================================================
 
     pub fn dispatch_search_sidebar_key_unified(
@@ -1051,16 +1047,14 @@ impl Engine {
             return SearchKeyResult::Unfocused;
         }
 
-        let active = self.search_sidebar_system.borrow().active_section();
+        let active = self.search_sidebar.borrow().sidebar.active_section;
         let form_active = active == Some(0);
 
         if form_active {
             let action = self.handle_search_input_key(key, unicode);
             if let SearchInputAction::Unfocused = action {
                 self.search_panel_form_focus.replace(None);
-                self.search_sidebar_system
-                    .borrow_mut()
-                    .set_active_section(Some(1));
+                self.search_sidebar.borrow_mut().sidebar.active_section = Some(1);
             }
             return SearchKeyResult::Consumed;
         }
@@ -1093,9 +1087,7 @@ impl Engine {
             "Tab" => {
                 self.search_panel_form_focus
                     .replace(Some("search:query".to_string()));
-                self.search_sidebar_system
-                    .borrow_mut()
-                    .set_active_section(Some(0));
+                self.search_sidebar.borrow_mut().sidebar.active_section = Some(0);
                 SearchKeyResult::Consumed
             }
             "Escape" | "q" => {
@@ -1112,9 +1104,7 @@ impl Engine {
                         self.search_panel_form_focus
                             .replace(Some("search:query".to_string()));
                         self.search_input_insert_char(false, ch);
-                        self.search_sidebar_system
-                            .borrow_mut()
-                            .set_active_section(Some(0));
+                        self.search_sidebar.borrow_mut().sidebar.active_section = Some(0);
                         return SearchKeyResult::Consumed;
                     }
                 }
@@ -1130,23 +1120,35 @@ impl Engine {
             modifiers: quadraui::Modifiers::default(),
             repeat: false,
         };
-        let sidebar_event = self
-            .search_sidebar_system
-            .borrow_mut()
-            .handle_cached(&ev, rect);
-        self.dispatch_search_sidebar_event(sidebar_event);
+        let handled = self.search_sidebar.borrow_mut().handle_cached(&ev, rect);
+        self.dispatch_search_sidebar_event(handled);
     }
 
-    pub fn dispatch_search_sidebar_event(&mut self, event: quadraui::SidebarEvent) -> bool {
-        match event {
-            quadraui::SidebarEvent::RowActivated { .. } => {
+    pub fn dispatch_search_sidebar_event(
+        &mut self,
+        handled: quadraui::Handled<Vec<quadraui::SidebarAction>>,
+    ) -> bool {
+        let actions = match handled {
+            quadraui::Handled::Event(actions) => actions,
+            quadraui::Handled::Consumed => return true,
+            quadraui::Handled::Ignored => return false,
+        };
+        for action in actions {
+            self.dispatch_search_sidebar_action(action);
+        }
+        true
+    }
+
+    fn dispatch_search_sidebar_action(&mut self, action: quadraui::SidebarAction) {
+        use quadraui::SidebarAction;
+        match action {
+            SidebarAction::RowActivated { .. } => {
                 if let Some(idx) = self.search_selected_result_idx() {
                     self.open_search_result(idx);
                     self.search_has_focus = false;
                 }
-                true
             }
-            quadraui::SidebarEvent::FormEvent { event, .. } => {
+            SidebarAction::Form { event, .. } => {
                 use quadraui::FormEvent;
                 match event {
                     FormEvent::ButtonClicked { id } => {
@@ -1157,9 +1159,7 @@ impl Engine {
                         if id_str == "search:query" || id_str == "search:replace" {
                             self.search_panel_form_focus
                                 .replace(Some(id_str.to_string()));
-                            self.search_sidebar_system
-                                .borrow_mut()
-                                .set_active_section(Some(0));
+                            self.search_sidebar.borrow_mut().sidebar.active_section = Some(0);
                         }
                     }
                     FormEvent::ToggleChanged { id, .. } => {
@@ -1167,9 +1167,8 @@ impl Engine {
                     }
                     _ => {}
                 }
-                true
             }
-            quadraui::SidebarEvent::RowSelected { section, path } => {
+            SidebarAction::RowSelected { section, path } => {
                 self.search_panel_form_focus.replace(None);
                 if section == 1 && path.len() == 1 {
                     let fi = path[0] as usize;
@@ -1180,31 +1179,26 @@ impl Engine {
                         collapsed.insert(fi);
                     }
                 }
-                true
             }
-            quadraui::SidebarEvent::HeaderActivated { section } => {
-                let mut sys = self.search_sidebar_system.borrow_mut();
-                let collapsed = sys.is_collapsed(section);
-                sys.set_collapsed(section, !collapsed);
-                true
+            SidebarAction::HeaderActivated { section } => {
+                let mut host = self.search_sidebar.borrow_mut();
+                if let Some(s) = host.sidebar.sections.get_mut(section) {
+                    s.collapsed = !s.collapsed;
+                }
             }
-            quadraui::SidebarEvent::Ignored => false,
-            _ => true,
+            _ => {}
         }
     }
 
     pub fn handle_search_sidebar_ui_event(&mut self, event: quadraui::UiEvent) -> bool {
         let rect = self.search_sidebar_body_rect.get();
-        let sidebar_event = self
-            .search_sidebar_system
-            .borrow_mut()
-            .handle_cached(&event, rect);
-        self.dispatch_search_sidebar_event(sidebar_event)
+        let handled = self.search_sidebar.borrow_mut().handle_cached(&event, rect);
+        self.dispatch_search_sidebar_event(handled)
     }
 
     pub fn search_selected_result_idx(&self) -> Option<usize> {
-        let sidebar = self.search_sidebar_system.borrow();
-        let path = sidebar.selected_path(1)?;
+        let host = self.search_sidebar.borrow();
+        let path = host.sidebar.tree(1)?.selected_path.as_ref()?;
         if path.len() >= 2 {
             self.tree_path_to_result_idx(path[0] as usize, path[1] as usize)
         } else {
@@ -1348,9 +1342,9 @@ impl Engine {
 
         // Clear stale search results since files have changed.
         self.project_search_results.clear();
-        self.search_sidebar_system
-            .borrow_mut()
-            .set_selected_path(1, None);
+        if let Some(tree) = self.search_sidebar.borrow_mut().sidebar.tree_mut(1) {
+            tree.selected_path = None;
+        }
     }
 }
 

@@ -29,7 +29,7 @@ mod tests {
     //!   pins a fix in `App::handle_dispatch` that rescues folded double-clicks.
     //! - `alt_g_dropdown_does_not_survive_a_vim_dw_1763` and
     //!   `escape_closes_the_dropdown_but_leaves_the_toggleable_bar_row_visible_1763`
-    //!   cover a genuine new `src/app.rs` change (the `MenuEvent::Ignored` arm).
+    //!   cover a genuine new `src/app.rs` change (the `AppMenuEvent::Ignored` arm).
     //! - `colon_opens_the_command_line_after_an_alt_chord_swallows_escape_1764`
     //!   covers new `src/app.rs` and `src/render.rs` code for Alt-chord handling.
     //! - All tests under `editor_hover_dwell_1750` cover new `src/app.rs` code
@@ -142,14 +142,14 @@ mod tests {
     ///
     /// Two clicks, not one: `App::shell_config`'s `cell`-profile
     /// hamburger `PanelDefinition` now occupies index 0 in the *runner's*
-    /// fresh `AppShell` (`quadraui::AppShell::new` always activates index
+    /// fresh `ShellView` (`quadraui::ShellView::new` always activates index
     /// 0), so a fixture built from [`plain_engine`] no longer starts with
     /// Explorer as the runner's already-active panel the way it did before
     /// hamburger existed — the first click on Explorer's icon *activates*
     /// it (a fresh `PanelChanged`, different panel than the hamburger
     /// default) rather than collapsing it. The second click, now that
     /// Explorer genuinely is the active + visible panel, hits
-    /// `AppShell::handle_activity_click`'s toggle-closed branch as
+    /// `ShellView::handle_activity_click`'s toggle-closed branch as
     /// originally intended. Re-locates the icon between clicks (cheap,
     /// and the row it paints on is unaffected either way) rather than
     /// assuming its position is stable, matching every other zone lookup
@@ -157,10 +157,10 @@ mod tests {
     ///
     /// Mutating `engine.app_shell` directly (`hide_sidebar()`) does **not**
     /// achieve this, and is deliberately not used here: `App`'s own
-    /// runner-side `AppShell` (the actual layout/column reservation) starts
+    /// runner-side `ShellView` (the actual layout/column reservation) starts
     /// from `ShellConfig`'s own default and is never synced from the engine's
     /// shadow copy at startup — only a real click through
-    /// `AppShell::handle_activity_click`'s toggle-closed branch flips it.
+    /// `ShellView::handle_activity_click`'s toggle-closed branch flips it.
     fn collapse_sidebar(driver: &mut quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>) {
         // Two real, independent clicks: without disabling folding, two
         // `driver.click()` calls with no simulated time between them fold
@@ -1100,10 +1100,10 @@ mod tests {
         /// limitation `TuiDriver` structurally cannot reach), so that collapse
         /// is not reproduced here. What *is* reachable and fixable: once the
         /// dropdown is open, an unrecognised `KeyPressed` fell through to
-        /// `MenuEvent::Ignored`, and pre-fix `App::handle_dispatch` left the
+        /// `AppMenuEvent::Ignored`, and pre-fix `App::handle_dispatch` left the
         /// dropdown open while the keystroke kept flowing to Vim underneath,
         /// so the buffer was edited while the dropdown painted on top of it.
-        /// RED-verified by reverting the new `MenuEvent::Ignored` arm.
+        /// RED-verified by reverting the new `AppMenuEvent::Ignored` arm.
         #[test]
         fn alt_g_dropdown_does_not_survive_a_vim_dw_1763() {
             let mut engine = plain_engine();
@@ -1257,7 +1257,7 @@ mod tests {
             );
         }
 
-        /// Backs up the `MenuEvent::Ignored` arm's own comment claim: a plain
+        /// Backs up the `AppMenuEvent::Ignored` arm's own comment claim: a plain
         /// Escape close leaves the toggleable menu bar's row itself on screen —
         /// only the dropdown's items go away.
         #[test]
@@ -1446,7 +1446,7 @@ mod tests {
 
                     let after_plain = driver.screen();
                     // Either casing: unlike the click path (title-case
-                    // `"Settings"`, from `AppShell`'s own `PanelDefinition`
+                    // `"Settings"`, from `ShellView`'s own `PanelDefinition`
                     // tooltip — see `render.rs:19074`), the keyboard-
                     // activation path paints the settings panel's own
                     // all-caps `"SETTINGS"` header. Not a functional gap —
@@ -1756,7 +1756,7 @@ mod tests {
         /// from vimcode's own theme (`theme.activity_active_accent`), not
         /// quadraui's unset `None` default (`ActivityBar::active_accent`'s
         /// own doc: "`None` paints zero accent-line pixels"). `App::handle`
-        /// (`src/app/shell.rs`) sets the runner's own `AppShell` accent on
+        /// (`src/app/shell.rs`) sets the runner's own `ShellView` accent on
         /// every real dispatch, so clicking the Explorer icon below both
         /// activates Explorer and is itself the real dispatch that leaves
         /// the accent painted.
@@ -1987,9 +1987,9 @@ mod tests {
         /// quadraui's `DOUBLE_CLICK_RADIUS = 1.5` TUI cells, so two genuinely
         /// distinct real clicks on *adjacent* icons landing within
         /// `DOUBLE_CLICK_MS = 400` of each other fold into one synthesized
-        /// `UiEvent::DoubleClick`. `quadraui::AppShell::handle` only matches a
+        /// `UiEvent::DoubleClick`. `quadraui::ShellView::handle` only matches a
         /// plain `MouseDown` for activity-bar hit-testing, so that `DoubleClick`
-        /// resolves as `AppShellEvent::Ignored` and the second click is silently
+        /// resolves as `ShellEvent::Ignored` and the second click is silently
         /// dropped. The sidebar then stays on whatever panel was already active
         /// until the *next* real click. This test fixes that.
         ///
@@ -2077,7 +2077,7 @@ mod tests {
         ///
         /// Uses [`harness_no_sidebar`], not the bare [`harness`] the
         /// mirrored `shell_app.rs` test uses: `App`'s fresh runner
-        /// `AppShell` boots with the hamburger (index 0) already active
+        /// `ShellView` boots with the hamburger (index 0) already active
         /// (this module's own `collapse_sidebar` doc), so a hamburger
         /// click against an *un*collapsed fixture lands on
         /// `handle_activity_click`'s "already active" branch and never
@@ -2388,11 +2388,11 @@ mod tests {
         }
 
         /// The sidebar header row (the `" EXPLORER "` strip above the
-        /// tree, painted by quadraui's `AppShell::render`) must come from
+        /// tree, painted by quadraui's `ShellView::render`) must come from
         /// vimcode's own theme, not quadraui's hard-coded literal.
         /// `to_quadraui_theme_chrome` (`src/render.rs`) has mapped
         /// `header_bg`/`header_fg` from `theme.status_bg`/`theme.status_fg`,
-        /// but until quadraui#1180 `AppShell::render` never read those fields
+        /// but until quadraui#1180 `ShellView::render` never read those fields
         /// — it painted the literal directly. Confirmed RED against the pre-
         /// quadraui#1180 pin: the painted header is quadraui's literal, not
         /// the theme's value.
@@ -2407,8 +2407,8 @@ mod tests {
             // panel to Explorer (so the tree content paints from the very
             // first frame — see this module's `driver_click_on_every_
             // activity_bar_icon_opens_its_panel_via_shell_app` for the same
-            // precondition), but the *runner's own*, separate `AppShell`
-            // (what `quadraui::AppShell::render` actually paints the header
+            // precondition), but the *runner's own*, separate `ShellView`
+            // (what `quadraui::ShellView::render` actually paints the header
             // chrome from) starts on the hamburger panel until a real click
             // lands — `App::take_requested_panel`'s own doc explains the
             // shadow/runner split. Click the Explorer activity-bar icon
@@ -2568,7 +2568,7 @@ mod tests {
         // No TUI driver test covers the `PANEL_SETTINGS` arm's
         // `background: Some(theme.tab_bar_bg)` fix — confirmed empirically
         // while writing this issue's fix that it can't: on this module's TUI
-        // harness, `FormController` already paints an opaque per-row
+        // harness, `ScrolledForm` already paints an opaque per-row
         // background across the full sidebar width regardless of what
         // `SidebarPanelBody.background` is set to (verified by probing a
         // blank cell past an ordinary row's text with `background: None` vs
@@ -3274,7 +3274,7 @@ mod tests {
             // leaves room for the Commit button -- Push/Pull/Sync get no
             // painted bounds at all, so the sync click below would have
             // nothing to find. Widen it the real way: `Engine::app_shell`
-            // is only a shadow copy the runner's own `AppShell` is never
+            // is only a shadow copy the runner's own `ShellView` is never
             // synced from at startup (see `collapse_sidebar`'s own doc),
             // so mutating it directly has no effect here -- the actual
             // production gesture is repeated plain `Alt+Right`
@@ -4540,7 +4540,7 @@ mod tests {
         /// collapsed-sidebar tab bar paints) must switch to its background
         /// alpha-blended with the scrim color once the picker opens, and
         /// switch back once it's dismissed. Without `paint_picker_rung`'s
-        /// `draw_solid_fill` call this cell's background never changes, so
+        /// `fill_solid` call this cell's background never changes, so
         /// this test is red against unfixed `develop`.
         #[test]
         fn picker_open_paints_a_backdrop_scrim_behind_it_via_shell_app() {
@@ -5632,8 +5632,8 @@ mod tests {
 
         /// Mirrors `shell_app.rs`'s test of the same name: the shared
         /// folder/workspace picker must actually paint its entries through
-        /// `FolderPickerController::render`, typing must reach
-        /// `FolderPickerController::handle` and filter the list, and Esc
+        /// `FolderPicker::render`, typing must reach
+        /// `FolderPicker::handle` and filter the list, and Esc
         /// must dismiss it.
         ///
         /// Needs [`harness_with_folder_picker`] rather than [`harness`]: the
@@ -5677,7 +5677,7 @@ mod tests {
                     assert!(
                         driver.screen_contains("distinctive_child_dir_1431"),
                         "the open picker must paint its entries via \
-                         `FolderPickerController::render`; screen:\n{}",
+                         `FolderPicker::render`; screen:\n{}",
                         driver.screen()
                     );
                     assert!(
@@ -5691,7 +5691,7 @@ mod tests {
                     }
                     assert!(
                         driver.screen_contains("distinctive_child_dir_1431"),
-                        "typing must reach `FolderPickerController::handle` \
+                        "typing must reach `FolderPicker::handle` \
                          and keep matching entries visible; screen:\n{}",
                         driver.screen()
                     );
@@ -7031,7 +7031,7 @@ mod tests {
         ///
         /// Drives the real gesture: a `driver.click` on the Explorer
         /// activity-bar icon's chrome zone (same lookup as
-        /// [`collapse_sidebar`]), through `AppShell::handle_activity_click`
+        /// [`collapse_sidebar`]), through `ShellView::handle_activity_click`
         /// and the backend-neutral `render::apply_activity_panel_switch`
         /// rung, then reads the painted sidebar row's background back with
         /// `style_at`.
@@ -7073,7 +7073,7 @@ mod tests {
                 h.driver.screen()
             );
 
-            // One click: the runner's fresh `AppShell` starts with the
+            // One click: the runner's fresh `ShellView` starts with the
             // hamburger panel active (see [`collapse_sidebar`]), so the
             // first click on Explorer's icon activates + shows it.
             let zone = h
@@ -14902,7 +14902,7 @@ mod tests {
 
         /// The send/stop/leave hint
         /// `render::populate_ai_chat_controller` pins to
-        /// `ChatController::set_hint` must (a) actually reach the painted
+        /// `Chat::set_hint` must (a) actually reach the painted
         /// screen once the panel has keyboard focus and (b) stay on screen
         /// once the user starts typing a message — unlike the `TextInput`
         /// placeholder, which vanishes the moment the input buffer is
@@ -15238,7 +15238,7 @@ mod tests {
             // the tests" must actually move on the *rendered surface* —
             // not just some internal engine counter (that was this
             // review's finding: an `Engine::ai_spinner_frame` assertion
-            // can stay green even if `ChatController::render`/the TUI
+            // can stay green even if `Chat::render`/the TUI
             // rasteriser stops repainting the glyph, e.g. a stale
             // `set_spinner_frame` call or a layout cache suppressing the
             // repaint). Extract the literal glyph character painted on
@@ -15431,7 +15431,7 @@ mod tests {
             );
 
             // `Ctrl+S` still sends in both `submit_on_enter` modes
-            // (`ChatController::handle`'s own doc).
+            // (`Chat::handle`'s own doc).
             h.driver.dispatch(quadraui::UiEvent::KeyPressed {
                 key: quadraui::Key::Char('s'),
                 modifiers: quadraui::Modifiers {
@@ -16286,7 +16286,7 @@ mod tests {
         /// Routing transcript turns through the markdown
         /// renderer must NOT cost plain replies their word wrapping.
         ///
-        /// `ChatController::build_transcript_rows` picks its wrap policy
+        /// `Chat::build_transcript_rows` picks its wrap policy
         /// off `ChatTurn::line_scales`: turns that carry per-line scales
         /// wrap with `WrapPolicy::Char` (mid-word, exactly at the
         /// display-width budget), turns without them word-wrap via
@@ -16488,7 +16488,7 @@ mod tests {
         /// `with_command_line()`/`with_status_bar()` bands so the activity
         /// bar's bottom-pinned Settings button stops above vimcode's own
         /// status/command-line rows instead of being painted underneath
-        /// them — and `AppShell::compute_layout` carves those same two
+        /// them — and `ShellView::compute_layout` carves those same two
         /// rows out of `sidebar_content_bounds` too, which is where the AI
         /// panel (and so the tool-call card) paints. Two extra terminal
         /// rows give the panel back the exact viewport height it had
@@ -19299,7 +19299,7 @@ mod tests {
         /// A `vimcode.command(name, fn, { menu = "File" })` registration
         /// appears as an item in the "File" menu-bar dropdown, and
         /// selecting it there actually runs the Lua callback — the same
-        /// `MenuEvent::Activated` -> `Engine::execute_command` dispatch
+        /// `AppMenuEvent::Activated` -> `Engine::execute_command` dispatch
         /// chain every built-in menu item and the command palette use.
         #[test]
         fn plugin_registered_command_appears_in_and_runs_from_the_menu_bar_via_shell_app() {
@@ -20505,7 +20505,7 @@ mod tests {
     // the real focus-routed key path, not by calling engine functions
     // directly. Fixes for two root causes and a regression:
     //
-    // 1. `quadraui::SidebarSystem::move_selection_by` only ever moves the
+    // 1. `quadraui::Sidebar::move_selection_by` only ever moves the
     //    selection *within* the already-active section. A fresh install
     //    starts with an empty INSTALLED section, so navigation was stuck
     //    at section 0 and could never reach AVAILABLE.
@@ -21042,14 +21042,14 @@ mod tests {
             engine.plugin_init();
 
             engine.focus_sidebar_panel(PANEL_EXTENSIONS);
+            engine.ext_sidebar.borrow_mut().sidebar.active_section = Some(0);
             engine
-                .ext_sidebar_system
+                .ext_sidebar
                 .borrow_mut()
-                .set_active_section(Some(0));
-            engine
-                .ext_sidebar_system
-                .borrow_mut()
-                .set_selected_path(0, Some(vec![0]));
+                .sidebar
+                .tree_mut(0)
+                .unwrap()
+                .selected_path = Some(vec![0]);
 
             let h = harness(engine);
             (h, guard)

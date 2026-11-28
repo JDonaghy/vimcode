@@ -96,7 +96,7 @@ pub const ROW_DATE_LABEL: &str = "DtZ";
 pub const ROW_DATE_INITIAL: &str = "2024-01-01";
 /// The value painted after one `Right` keypress scrubs the focused day
 /// forward without yet confirming it
-/// (`FormController::handle_date_picker_key`'s `FocusMoved` arm — a
+/// (`ScrolledForm::handle_date_picker_key`'s `FocusMoved` arm — a
 /// `Consumed` navigation event that never reaches the plugin). Confirms the
 /// live scrub repaints the field even though [`COUNT_0`] must not have
 /// bumped yet.
@@ -125,7 +125,7 @@ pub const ROW_SLIDER_INITIAL: &str = "6.00";
 /// The value painted after one `Enter`/`Space` steps the slider by its
 /// declared `step` (3.0), clamped to `[min, max]` — there is no separate
 /// scrub-then-confirm step like [`ROW_DATE_SCRUBBED`]'s, since
-/// `quadraui::FormController` has no native keyboard path for a slider and
+/// `quadraui::ScrolledForm` has no native keyboard path for a slider and
 /// vimcode reaches the plugin directly.
 pub const ROW_SLIDER_STEPPED: &str = "9.00";
 /// A `color`-kind row's label. `tui::form::draw_field_color_picker` paints a
@@ -171,7 +171,7 @@ pub const ROW_NUMBER_LABEL: &str = "NbZ";
 /// paints no decimal point at all.
 pub const ROW_NUMBER_INITIAL: &str = "42";
 /// The value painted after one `Up` arrow-key step — `quadraui::
-/// FormController` drives this natively (unlike the `slider` field, which
+/// ScrolledForm` drives this natively (unlike the `slider` field, which
 /// has no native keyboard path at all), stepping by the declared `step`
 /// (17) and clamping to `[min, max]`.
 pub const ROW_NUMBER_STEPPED: &str = "59";
@@ -1338,24 +1338,24 @@ pub fn engine_with_named_plugin_view(view: &str) -> (Engine, PathBuf) {
     // first `render` + selection parked on something `Enter` can act on).
     engine.on_ext_panel_focused(view);
 
-    // Raw `AppShell::toggle_sidebar`, never `Engine::toggle_sidebar` — the
+    // Raw `ShellView::toggle_sidebar`, never `Engine::toggle_sidebar` — the
     // latter persists to the developer's real session file (same reason
     // `crate::harness::plugin_panel`'s fixture avoids it).
     //
-    // This is not optional decoration: without it the shadow `AppShell` reports
+    // This is not optional decoration: without it the shadow `ShellView` reports
     // `sidebar_visible() == false`. The *first* frame still paints the panel
     // (`App::paint_sidebar_panel_rung` resolves the active panel through
-    // `render::sidebar_owner`, where `ext_panel_active` outranks `AppShell`), but
-    // the shell's own mouse routing and post-event layout use `AppShell`, so any
+    // `render::sidebar_owner`, where `ext_panel_active` outranks `ShellView`), but
+    // the shell's own mouse routing and post-event layout use `ShellView`, so any
     // click collapses the sidebar to zero width and every later frame paints
     // nothing there.
     if !engine.app_shell.sidebar_visible() {
         engine.app_shell.toggle_sidebar();
     }
-    // Start the shadow `AppShell` on a panel that is not the explorer:
-    // `AppShell::show_panel` silently ignores an `ext:` id (plugin panels bypass
-    // `AppShell` registration), and leaving the explorer active lets the TUI
-    // shell's `TreeController` intercept claim clicks inside the stale cached
+    // Start the shadow `ShellView` on a panel that is not the explorer:
+    // `ShellView::show_panel` silently ignores an `ext:` id (plugin panels bypass
+    // `ShellView` registration), and leaving the explorer active lets the TUI
+    // shell's `TreeView` intercept claim clicks inside the stale cached
     // `explorer_tree_rect`. Mirrors `plugin_panel`'s fixture, which documents the
     // same trap at length.
     engine.app_shell.show_panel(&quadraui::WidgetId::new(
@@ -1375,7 +1375,7 @@ pub fn engine_with_plugin_view_tab() -> (Engine, PathBuf) {
     let mut engine = Engine::new_for_test();
     load_fixture_plugin(&mut engine, &dir);
 
-    // `quadraui::AppShell::new` defaults `sidebar_visible: true` with the
+    // `quadraui::ShellView::new` defaults `sidebar_visible: true` with the
     // Explorer panel active, which on a narrow test viewport leaves no room
     // for the editor column at all. Not part of what #1627 is testing — move
     // the active panel to Settings instead (mirrors `engine_with_plugin_
@@ -1754,7 +1754,7 @@ fn assert_paints(driver: &impl ConformanceDriver, needles: &[&str], what: &str) 
 
 /// Scenario — `sidebar = false` suppresses the activity-bar zone.
 ///
-/// Reads the real `quadraui::compose::app_shell::AppShell` render path's zone
+/// Reads the real `quadraui::compose::app_shell::ShellView` render path's zone
 /// registry rather than `Engine` state: [`VIEW`] (`sidebar` defaults to
 /// `true`) must still register an `ext:`-prefixed activity-bar zone;
 /// [`VIEW_NO_SIDEBAR`] (`sidebar = false`) must not — it is only reachable
@@ -1875,7 +1875,7 @@ pub fn declared_toolbar_row_is_painted(driver: &impl ConformanceDriver) {
 /// toolbar field's), and the effect shows up in the next painted frame.
 ///
 /// Currently red on every backend: both `#[test]`s calling this are
-/// `#[ignore]`d. `quadraui::FormController::handle_cached` (the only entry
+/// `#[ignore]`d. `quadraui::ScrolledForm::handle_cached` (the only entry
 /// point vimcode calls for plugin-view clicks) always measures fields with
 /// its generic, backend-free `form_field_measure` fallback, and that
 /// fallback has no `FieldKind::Toolbar` arm (unlike `ButtonRow`,
@@ -2135,7 +2135,7 @@ pub fn typing_edits_the_focused_text_field(driver: &mut impl ConformanceDriver) 
 /// keystroke, but only hands the plugin a
 /// [`crate::core::plugin_ui::ViewEventKind::DateChanged`] once `Enter`
 /// confirms the scrubbed day — `quadraui`'s
-/// `FormController::handle_date_picker_key` returns a plain `Consumed`
+/// `ScrolledForm::handle_date_picker_key` returns a plain `Consumed`
 /// (not a `FormAction`) for the scrub keys themselves, per its own "Date
 /// picker fields" doc.
 ///
@@ -2240,7 +2240,7 @@ pub fn scrubbing_and_confirming_a_date_field_reaches_the_plugin_handler(
 /// Scenario 4c — a focused `slider` field's `Enter`/`Space` steps its value by
 /// one `step` (clamped to `[min, max]`) and reaches the plugin's `on_event`
 /// handler as a `SliderChanged` — unlike the date field above,
-/// `quadraui::FormController` has no native keyboard path for a slider, so
+/// `quadraui::ScrolledForm` has no native keyboard path for a slider, so
 /// vimcode computes the next value directly and there is no separate
 /// scrub-then-confirm step.
 ///
@@ -2404,7 +2404,7 @@ pub fn combo_box_dropdown_is_painted_and_click_commits_the_option(
         driver.screen_has(ROW_COMBO_LABEL),
         "the field's own row label ({ROW_COMBO_LABEL:?}) must stay painted \
          while the dropdown is open — the dropdown overlay must not \
-         repaint over the compact row FormController::render_and_cache \
+         repaint over the compact row ScrolledForm::paint \
          already drew; painted runs were {:?}",
         painted(driver)
     );
@@ -2456,7 +2456,7 @@ pub fn combo_box_dropdown_outside_click_closes_it_with_no_event(
 
     // A different field's own row, well above the combo box's and the
     // dropdown painted under it — inside the panel's form (so the click
-    // reaches `FormController`-based routing at all, unlike a click on the
+    // reaches `ScrolledForm`-based routing at all, unlike a click on the
     // global status bar outside the panel entirely) but outside both the
     // field and the dropdown, so `ComboBoxLayout::hit_test` resolves it to
     // `Outside`.
@@ -2538,7 +2538,7 @@ pub fn combo_box_dropdown_survives_an_unrelated_sidebar_form_paint(
 /// Scenario 4e — a focused `number_input` field: `Up` steps its committed
 /// value by `step` (clamped to `[min, max]`) immediately, reaching the
 /// plugin's `on_event` handler as `NumberChanged` — unlike the `slider`
-/// field above, `quadraui::FormController` drives this natively. Typing
+/// field above, `quadraui::ScrolledForm` drives this natively. Typing
 /// digits then confirming with `Enter` instead reaches it as
 /// `NumberCommitted`, with the in-progress typed draft visible but not yet
 /// reported to the plugin.
@@ -3740,13 +3740,15 @@ pub fn table_body_click_reports_the_clicked_column_even_when_read_only<D>(
     );
 }
 
-/// Scenario 10f — a column's declared `width` is honored as a `Fixed`
+/// Scenario 10f — a column's declared `width` is honored as a `Native`
 /// quadraui column width rather than the even `Flex` split every column got
 /// before this field existed. [`WIDTH_VIEW`]'s column 0 declares a `width`
 /// far below what an even `Flex` split of the same sidebar body would give
 /// it, so column 1's painted header must land further left than it does in
 /// [`TABLE_VIEW`]'s undeclared, purely proportional fixture — same viewport,
 /// same column count, differing only in whether column 0 names a `width`.
+/// Column 0's own header is not asserted: a column narrower than its title
+/// clips it (eight pixels on a pixel backend shows none of it).
 pub fn table_declared_width_narrows_the_column<D>(
     narrow: &mut crate::harness::ConformanceHarness<D>,
     baseline: &mut crate::harness::ConformanceHarness<D>,
@@ -3755,7 +3757,7 @@ pub fn table_declared_width_narrows_the_column<D>(
 {
     assert_paints(
         &narrow.driver,
-        &[WIDTH_COL0, WIDTH_COL1],
+        &[WIDTH_COL1],
         "the declared-width fixture's initial paint",
     );
     assert_paints(
@@ -3764,8 +3766,7 @@ pub fn table_declared_width_narrows_the_column<D>(
         "the undeclared-width fixture's initial paint",
     );
 
-    let col0_run_narrow = painted_run(&narrow.driver, WIDTH_COL0);
-    let col1_x_narrow = next_header_run_x(&narrow.driver, col0_run_narrow);
+    let col1_x_narrow = painted_run(&narrow.driver, WIDTH_COL1).x;
 
     let col0_run_baseline = painted_run(&baseline.driver, TABLE_COL_KEY);
     let col1_x_baseline = next_header_run_x(&baseline.driver, col0_run_baseline);

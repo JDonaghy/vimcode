@@ -682,7 +682,7 @@ pub struct Settings {
     /// Whether plain `Enter` submits the AI panel's input (Zed-style), or
     /// inserts a newline.
     /// Plumbed straight through to
-    /// [`quadraui::ChatController::set_submit_on_enter`] every
+    /// [`quadraui::Chat::set_submit_on_enter`] every
     /// `populate_ai_chat_controller` call (`crate::render`) — see that
     /// method's own doc for the full keybinding table in each mode.
     /// Default: true (Zed parity).

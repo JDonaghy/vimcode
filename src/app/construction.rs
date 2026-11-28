@@ -521,7 +521,7 @@ impl App {
     /// state — the backend-neutral core of what every GUI entry point needs
     /// before calling `run_with_shell`.
     ///
-    /// The engine's `AppShell` initialises every `PanelDefinition.icon` to
+    /// The engine's `ShellView` initialises every `PanelDefinition.icon` to
     /// `""` because the engine is backend-agnostic, so the panel-icon
     /// mapping happens here — a product decision, not a platform one.
     ///
@@ -559,7 +559,7 @@ impl App {
             .into_iter()
             .partition(|p| !p.id.as_str().starts_with("bottom:"));
         // Plugin-provided panels (e.g. the Git Insights extension) live
-        // in `engine.ext_panels`, not in the engine's `AppShell` — nothing
+        // in `engine.ext_panels`, not in the engine's `ShellView` — nothing
         // registers them there — so they have to be appended explicitly or
         // the runner's activity bar renders no icon for them at all.
         // `ext_activity_panels` already carries each panel's resolved icon,
@@ -677,7 +677,7 @@ impl App {
             resolve_editor_font(&self.engine.borrow().settings, &**self.backend.borrow());
         cfg = cfg.with_editor_font(editor_family, editor_size_pt);
         // The width the sidebar *opens* at is a line-height
-        // **multiple** (quadraui's `AppShell::compute_layout` multiplies it
+        // **multiple** (quadraui's `ShellView::compute_layout` multiplies it
         // by `line_height`), so leaving it at `ShellConfig::new`'s generic
         // `20.0` meant a 20-column strip on TUI but a ~460px slab on a GUI
         // backend — which left an 800px-wide window no room to paint a
@@ -705,11 +705,11 @@ impl App {
         cfg.max_sidebar_width = render::ALT_SIDEBAR_WIDTH_MAX as f32;
         // Reserve one line-height each for the always-present
         // command line and the (near-always-present) status line at the
-        // *shell* level.  With `AppShell::with_status_bar_under_main_column`
+        // *shell* level.  With `ShellView::with_status_bar_under_main_column`
         // the activity bar and sidebar now run the full window
         // height and these bands are carved from the main column only,
         // matching VS Code's layout.  The reservations themselves are
-        // still needed: they tell `AppShell::compute_layout` how much
+        // still needed: they tell `ShellView::compute_layout` how much
         // vertical space to subtract from `main_content_bounds` for the
         // status bar and command line — the new mode only changes
         // *where* that subtraction is applied (main-column width, not
@@ -719,7 +719,7 @@ impl App {
         // `line_height.round()` row — not vimcode's own dynamic
         // `render::status_bar_height_px`/wildmenu/quickfix bottom-chrome
         // total, which quadraui's `ShellConfig` has no knob for (`#[cfg]`-
-        // gating a dynamic per-frame height onto `AppShellLayout` would be
+        // gating a dynamic per-frame height onto `ShellLayout` would be
         // new backend-shaped decision logic, not thin wiring — see
         // `CLAUDE.md`'s Platform-Neutrality Rule). Two static rows exactly
         // matches the common case (one status row + the always-present
@@ -748,7 +748,7 @@ impl App {
             .with_status_bar_under_main_column()
             .with_command_line()
             .with_status_bar();
-        // Seed the runner's *real* `AppShell` sidebar bit from the shadow
+        // Seed the runner's *real* `ShellView` sidebar bit from the shadow
         // `app_shell`'s own current `sidebar_visible()`, but only for the
         // two launch kinds `Engine::sidebar_forced_hidden_by_launch` names
         // (no-workspace, file-argument) — `quadraui::ShellConfig::new`'s
@@ -915,7 +915,7 @@ impl App {
             backend,
             units,
             // Seeded to `None` rather than the active panel — GTK
-            // has no hamburger `PanelDefinition` (unlike TUI's `AppShell`,
+            // has no hamburger `PanelDefinition` (unlike TUI's `ShellView`,
             // which activates index 0 = hamburger at construction while
             // the shadow starts on Explorer), so the runner's initial
             // active panel already matches the shadow's default

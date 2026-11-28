@@ -31,6 +31,7 @@ mod build_screen_layout;
 mod chrome_mouse_rung;
 mod decoration_and_markdown;
 mod editor_hover_rung;
+mod form_host;
 mod frame_chrome_band;
 mod frame_editor_band;
 mod hit_test_geometry;
@@ -50,6 +51,7 @@ mod screen_layout_type;
 mod scrollbar_reserve_tests;
 mod sidebar_data_types;
 mod sidebar_dispatch;
+mod sidebar_host;
 mod sidebar_tree_population;
 mod skin;
 mod source_control_sidebar;
@@ -60,6 +62,7 @@ mod test_support;
 #[cfg(test)]
 mod tests_behavioral;
 mod theme;
+mod tree_host;
 mod welcome;
 mod widget_paint;
 mod window_and_popups;
@@ -94,6 +97,9 @@ pub use tab_bar::*;
 pub use theme::*;
 // `welcome` exposes only `pub(crate)` items (same reasoning as
 // `plugin_view_body`/`window_builder` below).
+pub use form_host::FormHost;
+pub use sidebar_host::SidebarHost;
+pub use tree_host::TreeHost;
 #[allow(unused_imports)]
 pub use welcome::*;
 pub(crate) use widget_paint::*;

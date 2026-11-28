@@ -357,7 +357,7 @@ pub fn build_screen_layout_with_breadcrumb_row(
     // Build the debug sidebar data (always present). The item lists
     // themselves (variables/watch/frames/breakpoints) are painted by
     // `populate_dap_sidebar_system`'s `build_dap_*_rows` helpers directly
-    // into `engine.dap_sidebar_system`, not through this struct —
+    // into `engine.dap_sidebar`, not through this struct —
     // only the chrome fields and the Debug Output tab's lines live here.
     let debug_sidebar = {
         // Output lines for the Debug Output tab (up to 200, oldest-first).
@@ -832,6 +832,8 @@ pub fn build_screen_layout_with_breadcrumb_row(
                 replace_one_glyph: crate::icons::FIND_REPLACE.s().to_string(),
                 replace_all_glyph: crate::icons::FIND_REPLACE_ALL.s().to_string(),
                 hit_regions,
+                id: quadraui::WidgetId::new("find_replace"),
+                hidden_toggles: Vec::new(),
             })
         } else {
             None
