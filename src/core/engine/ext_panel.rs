@@ -4659,6 +4659,7 @@ impl Engine {
             swap_path,
             recovered_content: content,
             buffer_id: buf_id,
+            orphan: false,
         });
         self.show_dialog(
             "swap_recovery",
@@ -4716,7 +4717,16 @@ impl Engine {
                 self.message = "Swap file deleted".to_string();
             }
             "abort" | "cancel" => {
-                crate::core::swap::delete_swap(&recovery.swap_path);
+                // For an orphaned swap (original file already gone), the
+                // swap is the only remaining copy of the content — Abort
+                // must leave it on disk for the next session to offer
+                // recovery again, matching Vim's own "Abort" semantics.
+                // For an ordinary stale swap the file on disk is still the
+                // authoritative copy, so deleting the now-handled swap is
+                // safe.
+                if !recovery.orphan {
+                    crate::core::swap::delete_swap(&recovery.swap_path);
+                }
                 self.close_tab();
                 self.message.clear();
             }

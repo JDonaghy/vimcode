@@ -418,6 +418,27 @@ impl Engine {
                                         })
                                 })
                                 .collect();
+                            // If every remaining buffer is under `path`,
+                            // deleting them all would leave `BufferManager`
+                            // empty while windows still exist --
+                            // `active_buffer_state()` and friends unwrap the
+                            // active window's buffer, so that panics on the
+                            // next paint. Create a fresh scratch buffer and
+                            // re-point any window showing one of the
+                            // about-to-vanish buffers at it first, exactly
+                            // like a session restore clears its initial
+                            // scratch buffer only once real content exists.
+                            if affected.len() >= self.buffer_manager.list().len() {
+                                let scratch_id = self.buffer_manager.create();
+                                let affected_set: std::collections::HashSet<BufferId> =
+                                    affected.iter().copied().collect();
+                                for window in self.windows.values_mut() {
+                                    if affected_set.contains(&window.buffer_id) {
+                                        window.buffer_id = scratch_id;
+                                        window.view = View::new();
+                                    }
+                                }
+                            }
                             for buffer_id in affected {
                                 let _ = self.delete_buffer(buffer_id, true);
                             }
@@ -933,6 +954,7 @@ impl Engine {
                     swap_path: swap_path.clone(),
                     recovered_content: content,
                     buffer_id,
+                    orphan: true,
                 });
                 self.show_dialog(
                     "swap_recovery",
@@ -2753,5 +2775,111 @@ mod swap_scan_stale_orphan_tests {
         );
 
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Abort/cancel on an orphaned swap's recovery dialog must leave the
+    /// swap file on disk — it is the only remaining copy of the file's
+    /// last saved content, so a reflexive Escape (which maps straight to
+    /// `"cancel"`) must not be able to discard it. This is the same
+    /// "Abort" semantics Vim itself gives an orphaned swap.
+    #[test]
+    fn aborting_an_orphaned_swap_recovery_keeps_the_swap_file() {
+        let home = std::env::temp_dir().join(format!(
+            "vimcode_test_orphan_swap_abort_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let _guard = crate::core::paths::set_test_home(&home);
+
+        let missing_file = home.join("deleted_project").join("gone.txt");
+        let swap_path = crate::core::swap::swap_path_for(&missing_file);
+        std::fs::create_dir_all(swap_path.parent().unwrap()).unwrap();
+
+        let mut f = std::fs::File::create(&swap_path).unwrap();
+        writeln!(f, "VIMCODE_SWAP_V1").unwrap();
+        writeln!(f, "path: {}", missing_file.display()).unwrap();
+        writeln!(f, "pid: 999999999").unwrap();
+        writeln!(f, "modified: 2026-01-01T00:00:00Z").unwrap();
+        writeln!(f, "---").unwrap();
+        f.write_all(b"recovered content\n").unwrap();
+        drop(f);
+
+        let mut e = Engine::new_for_test();
+        e.settings.swap_file = true;
+        e.swap_scan_stale();
+        assert!(e.pending_swap_recovery.is_some());
+
+        let result = e.process_swap_dialog_action("abort");
+        assert!(matches!(result, EngineAction::None));
+        assert!(
+            e.pending_swap_recovery.is_none(),
+            "the dialog must still be dismissed"
+        );
+        assert!(
+            swap_path.exists(),
+            "Abort on an orphaned swap must leave the swap file on disk \
+             instead of deleting the only remaining copy of its content"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+#[cfg(test)]
+mod confirm_delete_folder_buffer_guard_tests {
+    use super::*;
+
+    /// Deleting a folder that holds the *only* open buffer must not leave
+    /// `BufferManager` empty — `active_buffer_state()` and friends unwrap
+    /// the active window's buffer, so an empty manager panics on the very
+    /// next paint. This is exactly the state a restored session is in
+    /// once `restore_session`/`restore_session_from_tree` drop the
+    /// startup scratch buffer in favor of the one real file that was open.
+    #[test]
+    fn deleting_folder_with_only_open_buffer_leaves_a_usable_buffer() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_2207_delete_only_buffer_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let inner = dir.join("note.txt");
+        std::fs::write(&inner, "hello\n").unwrap();
+
+        let mut e = Engine::new_for_test();
+        let scratch_id = e.active_buffer_id();
+        e.open_file_in_tab(&inner);
+        // Simulate a restored session, which has already dropped its
+        // startup scratch buffer once the real file was open -- leaving
+        // exactly one buffer, shown in one window, before the delete.
+        let _ = e.delete_buffer(scratch_id, true);
+        assert_eq!(
+            e.buffer_manager.list().len(),
+            1,
+            "test setup sanity: exactly one buffer must be open"
+        );
+
+        e.pending_delete = Some(dir.clone());
+        let result = e.process_dialog_result("confirm_delete", "delete", None);
+        assert!(matches!(result, EngineAction::None));
+
+        assert!(
+            !e.buffer_manager.list().is_empty(),
+            "deleting the folder holding the only open buffer must leave \
+             a fresh buffer behind, never an empty BufferManager"
+        );
+        // Every window must reference a buffer that still exists --
+        // otherwise the very next paint unwraps a dangling id and panics.
+        for window in e.windows.values() {
+            assert!(
+                e.buffer_manager.get(window.buffer_id).is_some(),
+                "window {:?} still points at a deleted buffer",
+                window.buffer_id
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
