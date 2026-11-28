@@ -362,8 +362,8 @@ fn fold_msg_show(last: &mut String, parts: &[Value]) {
 /// worse failure mode on a CI lane than "this case reports broken".
 struct NvimRpc {
     child: Child,
-    /// Private `$XDG_RUNTIME_DIR` for this process's server socket. Held for
-    /// its lifetime so the directory — and the `nvim.<pid>.0` socket inside
+    /// Private `$XDG_RUNTIME_DIR` for the child's server socket. Held for
+    /// the child's lifetime so the directory — and the `nvim.<pid>.0` socket inside
     /// it — is removed on drop regardless of how `child` exits; see
     /// [`common::IsolatedNvimRuntimeDir`].
     _runtime_dir: common::IsolatedNvimRuntimeDir,
@@ -443,9 +443,9 @@ impl NvimRpc {
             // every deferred API call until it is answered. The `-l` oracle
             // never hit this because it never redrew.
             .arg("-n")
-            // Isolates this process's `nvim.<pid>.0` server socket to a
+            // Isolates the child's `nvim.<pid>.0` server socket to a
             // directory this harness owns and removes — see
-            // `IsolatedNvimRuntimeDir`. Every case below kills this process
+            // `IsolatedNvimRuntimeDir`. Every case below kills the child
             // rather than quitting it cleanly, which otherwise leaves that
             // socket behind in the real `$XDG_RUNTIME_DIR`.
             .env("XDG_RUNTIME_DIR", runtime_dir.path())
