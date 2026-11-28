@@ -466,6 +466,12 @@ pub struct SwapRecovery {
     pub swap_path: PathBuf,
     pub recovered_content: String,
     pub buffer_id: BufferId,
+    /// `true` when the swap is orphaned — its original file is absent
+    /// from disk, so `swap_path` is the *only* remaining copy of the
+    /// content. Abort/cancel must leave the swap file in place for this
+    /// case instead of deleting it, unlike the ordinary stale-swap dialog
+    /// where the still-present file is the authoritative copy.
+    pub orphan: bool,
 }
 
 /// A button in a modal dialog.
