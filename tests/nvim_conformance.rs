@@ -362,6 +362,11 @@ fn fold_msg_show(last: &mut String, parts: &[Value]) {
 /// worse failure mode on a CI lane than "this case reports broken".
 struct NvimRpc {
     child: Child,
+    /// Private `$XDG_RUNTIME_DIR` for this process's server socket. Held for
+    /// its lifetime so the directory — and the `nvim.<pid>.0` socket inside
+    /// it — is removed on drop regardless of how `child` exits; see
+    /// [`common::IsolatedNvimRuntimeDir`].
+    _runtime_dir: common::IsolatedNvimRuntimeDir,
     stdin: ChildStdin,
     frames: std::sync::mpsc::Receiver<Result<Value, String>>,
     next_id: u64,
@@ -420,6 +425,7 @@ impl NvimRpc {
     /// buffer — so they pass `None` and inherit the test binary's own cwd,
     /// unchanged from before this parameter existed.
     fn spawn(capture_messages: bool, cwd: Option<&Path>) -> Option<Self> {
+        let runtime_dir = common::IsolatedNvimRuntimeDir::new("embed");
         let mut command = Command::new("nvim");
         command
             .arg("--headless")
@@ -437,6 +443,12 @@ impl NvimRpc {
             // every deferred API call until it is answered. The `-l` oracle
             // never hit this because it never redrew.
             .arg("-n")
+            // Isolates this process's `nvim.<pid>.0` server socket to a
+            // directory this harness owns and removes — see
+            // `IsolatedNvimRuntimeDir`. Every case below kills this process
+            // rather than quitting it cleanly, which otherwise leaves that
+            // socket behind in the real `$XDG_RUNTIME_DIR`.
+            .env("XDG_RUNTIME_DIR", runtime_dir.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // Deliberately discarded rather than piped-and-ignored: an unread
@@ -465,6 +477,7 @@ impl NvimRpc {
         });
         let mut rpc = NvimRpc {
             child,
+            _runtime_dir: runtime_dir,
             stdin,
             frames,
             next_id: 0,
@@ -795,10 +808,95 @@ impl Drop for NvimRpc {
         // Not `:qa!` over RPC: a case can leave nvim mid-command, mid-prompt
         // or in Insert mode, where that would need its own escaping dance for
         // no benefit. The process is disposable — and killing it closes the
-        // pipe, which is what retires the reader thread.
+        // pipe, which is what retires the reader thread. Killing it rather
+        // than quitting it cleanly is also exactly why every spawn in this
+        // file points `XDG_RUNTIME_DIR` at a private `IsolatedNvimRuntimeDir`
+        // instead of the real one: a killed nvim never removes its own
+        // `nvim.<pid>.0` server socket, so without that redirection this
+        // would leak one into the real `$XDG_RUNTIME_DIR` on every case.
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// Regression test for the fleet's `/run/user/<uid>` tmpfs filling up with
+/// leaked `nvim.<pid>.0` server sockets: every nvim this file spawns is
+/// pointed at its own [`common::IsolatedNvimRuntimeDir`] instead of the real
+/// `$XDG_RUNTIME_DIR`, so running the suite — however many cases pass, fail
+/// or get killed mid-case — must leave the real one exactly as it was found.
+///
+/// Skips (rather than failing) when `$XDG_RUNTIME_DIR` is unset: nvim then
+/// falls back to a platform-specific directory this test has no portable way
+/// to name, and the leak this guards against is specific to a tmpfs-backed
+/// `$XDG_RUNTIME_DIR` with a fixed inode budget in the first place (the
+/// WSL/Linux fleet hosts this was found on).
+#[test]
+fn nvim_spawns_do_not_leak_sockets_into_the_real_xdg_runtime_dir() {
+    let Ok(real_runtime_dir) = std::env::var("XDG_RUNTIME_DIR") else {
+        eprintln!("SKIP: $XDG_RUNTIME_DIR is not set in this environment");
+        return;
+    };
+    let real_runtime_dir = std::path::PathBuf::from(real_runtime_dir);
+    let count_nvim_sockets = || -> usize {
+        std::fs::read_dir(&real_runtime_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("nvim.") && name.ends_with(".0"))
+            })
+            .count()
+    };
+
+    let before = count_nvim_sockets();
+
+    // Exercise both transports this file uses to talk to a real nvim: the
+    // attached-UI RPC session (`NvimRpc`, killed rather than quit — see its
+    // own `Drop` above) and the `-l script.lua` one-shot the multi-file,
+    // disk and jumps probes use.
+    for _ in 0..3 {
+        let Some(_nvim) = NvimRpc::spawn(false, None) else {
+            eprintln!("SKIP: nvim is not available on PATH");
+            return;
+        };
+        // Dropped here: killed without ever sending `:qa!`, same as every
+        // real case in this suite.
+    }
+    {
+        let runtime_dir = common::IsolatedNvimRuntimeDir::new("leak-regression");
+        let lua_path = std::env::temp_dir().join(format!(
+            "vimcode_leak_regression_probe_{}.lua",
+            std::process::id()
+        ));
+        std::fs::write(&lua_path, "vim.cmd(\"qa!\")\n").expect("write probe script");
+        let output = std::process::Command::new("nvim")
+            .arg("--headless")
+            .arg("-u")
+            .arg("NONE")
+            .arg("-i")
+            .arg("NONE")
+            .arg("-l")
+            .arg(&lua_path)
+            .env("XDG_RUNTIME_DIR", runtime_dir.path())
+            .output();
+        let _ = std::fs::remove_file(&lua_path);
+        if output.is_err() {
+            eprintln!("SKIP: nvim is not available on PATH");
+            return;
+        }
+    }
+
+    assert_eq!(
+        count_nvim_sockets(),
+        before,
+        "nvim spawns must not leave `nvim.<pid>.0` sockets behind in the \
+         real $XDG_RUNTIME_DIR ({}); every spawn in this file is supposed \
+         to redirect XDG_RUNTIME_DIR to its own IsolatedNvimRuntimeDir",
+        real_runtime_dir.display()
+    );
 }
 
 /// Run one case through the oracle, reporting *why* it failed rather than
@@ -2331,6 +2429,7 @@ fn run_multi_in_neovim(
         f.write_all(lua.as_bytes()).ok()?;
     }
     let _ = std::fs::remove_file(&result_path);
+    let runtime_dir = common::IsolatedNvimRuntimeDir::new("multi");
     let output = std::process::Command::new("nvim")
         .arg("--headless")
         .arg("-u")
@@ -2340,6 +2439,7 @@ fn run_multi_in_neovim(
         .arg("-l")
         .arg(script_path.to_string_lossy().as_ref())
         .current_dir(cwd)
+        .env("XDG_RUNTIME_DIR", runtime_dir.path())
         .output()
         .ok();
     let raw: Option<Raw> = match &output {
@@ -2511,6 +2611,7 @@ fn run_disk_in_neovim(
         f.write_all(lua.as_bytes()).ok()?;
     }
     let _ = std::fs::remove_file(&result_path);
+    let runtime_dir = common::IsolatedNvimRuntimeDir::new("disk");
     let output = std::process::Command::new("nvim")
         .arg("--headless")
         .arg("-u")
@@ -2520,6 +2621,7 @@ fn run_disk_in_neovim(
         .arg("-l")
         .arg(script_path.to_string_lossy().as_ref())
         .current_dir(cwd)
+        .env("XDG_RUNTIME_DIR", runtime_dir.path())
         .output()
         .ok();
     let raw: Option<Raw> = match &output {
@@ -2817,6 +2919,7 @@ fn run_jumps_in_neovim(
         f.write_all(lua.as_bytes()).ok()?;
     }
     let _ = std::fs::remove_file(&result_path);
+    let runtime_dir = common::IsolatedNvimRuntimeDir::new("jumps");
     let output = std::process::Command::new("nvim")
         .arg("--headless")
         .arg("-u")
@@ -2826,6 +2929,7 @@ fn run_jumps_in_neovim(
         .arg("-l")
         .arg(script_path.to_string_lossy().as_ref())
         .current_dir(cwd)
+        .env("XDG_RUNTIME_DIR", runtime_dir.path())
         .output()
         .ok();
     let raw: Option<Raw> = match &output {
