@@ -182,12 +182,23 @@ impl TreeHost {
             selected_path: self.nav.selected_path().cloned(),
             scroll_offset: self.nav.scroll_offset(),
             items_window: None,
-            scroll_px: self.nav.scroll_px(),
+            scroll_px: self.scroll_px(),
             style: quadraui::TreeStyle {
                 vim_keys: true,
                 ..Default::default()
             },
             has_focus: self.has_focus,
+        }
+    }
+
+    /// The pixel-precise scroll position to paint at: the one the widget's
+    /// own wheel handling accumulated, while it still sits on the row the
+    /// host stored; otherwise whatever the host's navigation set.
+    fn scroll_px(&self) -> Option<f32> {
+        if self.state.nav.scroll_offset() == self.nav.scroll_offset() {
+            self.state.nav.scroll_px().or(self.nav.scroll_px())
+        } else {
+            self.nav.scroll_px()
         }
     }
 
